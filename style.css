@@ -158,7 +158,10 @@ body.specimen-mode #stage {
   background: #000 !important;
 }
 
-/* Composite container — exactly 1920×1080 */
+/* Composite container — exactly 1920×1080. Transparent: body provides the
+ * #0a0a0a background; if this container were opaque it would cover the
+ * (lower-z-index) canvas underneath. Children (panel, line, caption) stack
+ * on top of canvas where they overlap. */
 body.specimen-mode #specimen-composite {
   display: block;
   position: fixed;
@@ -166,7 +169,7 @@ body.specimen-mode #specimen-composite {
   top: 0;
   width: 1920px;
   height: 1080px;
-  background: #0a0a0a;
+  background: transparent;
   pointer-events: none;
   z-index: 5;
 }
