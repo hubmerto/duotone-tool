@@ -54,12 +54,38 @@ boil and creep across the frame.
 |               | speed                | 0 = static, 1 = full per-frame reseed                               |
 |               | amp                  | How strongly the boil warps the threshold                           |
 | Edge          | softness             | Smoothstep half-width — keep tiny (0..0.05) for crisp edges         |
+| Modulation    | mode                 | none (manual) / audio file / webcam motion                          |
+|               | bass→slow            | Audio bass band drives `slowAmp` (ink blob swelling on kicks)       |
+|               | mid→thresh           | Mid band darkens `thresholdBase` (more black on dense mids)         |
+|               | tre→warp             | Treble nudges `warpAmp` (hi-hats add ripple)                        |
+|               | rms→boil             | Overall loudness drives `ditherAmp`                                 |
+|               | mot→warp / mot→lfo   | Webcam motion drives `warpAmp` and the LFO breathing depth          |
+|               | bass / mid / treble / motion graphs | Live monitors of the active signal(s)                |
 | Export        | engine               | mediarecorder (fast) / ccapture (frame-locked)                      |
 |               | format               | webm / png-sequence (ccapture only)                                 |
 |               | seconds              | Recording duration                                                  |
 |               | fps                  | Frame rate                                                          |
 |               | record / stop        | Start/stop recording                                                |
 |               | save / load preset   | JSON download / upload                                              |
+
+## Modulation (automatic param control)
+
+By default all parameters are manual sliders. Two optional sources can drive
+them automatically, *additively* on top of your manual values:
+
+- **Audio file**: pick any audio file (drag-drop also works). Three FFT
+  bands (bass 40–160 Hz, mid 500 Hz–2 kHz, treble 4–10 kHz) plus an RMS
+  loudness signal are routed to `slowAmp`, `thresholdBase`, `warpAmp`,
+  `ditherAmp` respectively. Per-routing depth sliders let you dial in how
+  strongly each band moves things.
+- **Webcam motion**: enables `getUserMedia`, downsamples the camera to
+  64×36, and computes a smoothed frame-difference magnitude. That single
+  motion signal drives `warpAmp` and `thresholdLFOAmp` — wave a hand and
+  the ink ripples and breathes harder.
+
+Both modes show live signal graphs in the panel so you can see what's
+driving things. Manual sliders keep working underneath: modulation just
+adds offset, never replaces.
 
 ## Recording & post-processing
 

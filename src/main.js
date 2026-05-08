@@ -10,6 +10,7 @@ import {
   PRESETS, DEFAULT_PRESET, applyPreset, downloadPreset, readPresetFile,
 } from './presets.js';
 import { MediaRecorderPath, CCapturePath } from './recorder.js';
+import { AudioModulator, CameraModulator } from './modulators.js';
 
 // -----------------------------------------------------------------------------
 // state
@@ -27,6 +28,28 @@ const sourceState = {
   playing: true,
 };
 
+// Modulation: drives params automatically from audio/camera signals.
+// All offsets are additive on top of the user's manual values, so the
+// manual sliders still set the baseline.
+const modulation = {
+  mode: 'none',     // 'none' | 'audio' | 'camera'
+  audio: {
+    volume:      0.6,
+    bassDepth:   0.20,    // bass (40-160 Hz)   -> slowAmp           (+)
+    midDepth:    0.12,    // mid  (500-2k Hz)   -> thresholdBase     (-)
+    trebleDepth: 0.025,   // hi   (4-10 kHz)    -> warpAmp           (+)
+    rmsDepth:    0.06,    // overall loudness   -> ditherAmp         (+)
+  },
+  camera: {
+    warpDepth:   0.04,    // motion -> warpAmp           (+)
+    lfoDepth:    0.06,    // motion -> thresholdLFOAmp   (+)
+  },
+};
+
+// Live signal values (updated each frame). Bound to Tweakpane graph monitors
+// so you can SEE what's driving things.
+const monitor = { bass: 0, mid: 0, treble: 0, rms: 0, motion: 0 };
+
 // effect time is separate from wallclock — "Replay intro" resets this
 let effectStart = performance.now();
 let frameCount = 0;
@@ -42,6 +65,7 @@ const hint        = document.getElementById('hint');
 // hidden file pickers (Tweakpane has no native file input)
 const videoPicker  = makeHiddenInput('file', 'video/*');
 const presetPicker = makeHiddenInput('file', 'application/json,.json');
+const audioPicker  = makeHiddenInput('file', 'audio/*');
 
 function makeHiddenInput(type, accept) {
   const i = document.createElement('input');
@@ -219,10 +243,53 @@ function loadStateFromLocalStorage() {
 }
 
 // -----------------------------------------------------------------------------
-// recording instances
+// recording + modulation instances
 // -----------------------------------------------------------------------------
 const mediaPath  = new MediaRecorderPath(canvas);
 const ccapPath   = new CCapturePath(canvas);
+const audioMod   = new AudioModulator();
+const cameraMod  = new CameraModulator();
+
+// Compute "live" params: base params + modulation offsets. main.js never
+// mutates `params` itself, so the UI sliders keep their meaning.
+function computeLiveParams() {
+  const lp = { ...params };
+  if (modulation.mode === 'audio') {
+    const m = audioMod.update();
+    monitor.bass = m.bass; monitor.mid = m.mid;
+    monitor.treble = m.treble; monitor.rms = m.rms;
+    lp.slowAmp        = clamp(lp.slowAmp        + m.bass   * modulation.audio.bassDepth,   0,  0.6);
+    lp.thresholdBase  = clamp(lp.thresholdBase  - m.mid    * modulation.audio.midDepth,    0,  1.0);
+    lp.warpAmp        = clamp((lp.warpAmp ?? 0) + m.treble * modulation.audio.trebleDepth, 0,  0.06);
+    lp.ditherAmp      = clamp(lp.ditherAmp      + m.rms    * modulation.audio.rmsDepth,    0,  0.3);
+  } else if (modulation.mode === 'camera') {
+    const m = cameraMod.update();
+    monitor.motion = m.motion;
+    lp.warpAmp         = clamp((lp.warpAmp ?? 0) + m.motion * modulation.camera.warpDepth, 0, 0.06);
+    lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.motion * modulation.camera.lfoDepth, 0, 0.3);
+  } else {
+    monitor.bass = monitor.mid = monitor.treble = monitor.rms = monitor.motion = 0;
+  }
+  return lp;
+}
+
+function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+
+async function setModulationMode(next) {
+  // teardown current
+  if (modulation.mode === 'audio')  audioMod.pause();
+  if (modulation.mode === 'camera') cameraMod.stop();
+  modulation.mode = next;
+  if (next === 'audio')  audioMod.resume();
+  if (next === 'camera') {
+    try { await cameraMod.start(); }
+    catch (e) {
+      console.warn('Camera permission denied or unavailable:', e);
+      modulation.mode = 'none';
+      pane.refresh();
+    }
+  }
+}
 
 // -----------------------------------------------------------------------------
 // render loop
@@ -246,6 +313,7 @@ function frameTick() {
 
   const t = (performance.now() - effectStart) / 1000;
   const c = hexToRgb(params.spotColor);
+  const lp = computeLiveParams();   // base params + modulation offsets
 
   gl.uniform1i(U.u_video, 0);
   gl.uniform2f(U.u_resolution, canvas.width, canvas.height);
@@ -253,23 +321,23 @@ function frameTick() {
   gl.uniform1i(U.u_frame, frameCount);
   gl.uniform3f(U.u_spotColor, c[0], c[1], c[2]);
 
-  gl.uniform1f(U.u_thresholdBase,    params.thresholdBase);
-  gl.uniform1f(U.u_thresholdLFOAmp,  params.thresholdLFOAmp);
-  gl.uniform1f(U.u_thresholdLFOFreq, params.thresholdLFOFreq);
+  gl.uniform1f(U.u_thresholdBase,    lp.thresholdBase);
+  gl.uniform1f(U.u_thresholdLFOAmp,  lp.thresholdLFOAmp);
+  gl.uniform1f(U.u_thresholdLFOFreq, lp.thresholdLFOFreq);
 
-  gl.uniform1f(U.u_introDuration, params.introDuration);
-  gl.uniform1i(U.u_introCurve,    params.introCurve | 0);
+  gl.uniform1f(U.u_introDuration, lp.introDuration);
+  gl.uniform1i(U.u_introCurve,    lp.introCurve | 0);
 
-  gl.uniform1f(U.u_slowNoiseScale, params.slowNoiseScale);
-  gl.uniform1f(U.u_slowNoiseSpeed, params.slowNoiseSpeed);
-  gl.uniform1f(U.u_slowAmp,        params.slowAmp);
-  gl.uniform1f(U.u_warpAmp,        params.warpAmp ?? 0.0);
+  gl.uniform1f(U.u_slowNoiseScale, lp.slowNoiseScale);
+  gl.uniform1f(U.u_slowNoiseSpeed, lp.slowNoiseSpeed);
+  gl.uniform1f(U.u_slowAmp,        lp.slowAmp);
+  gl.uniform1f(U.u_warpAmp,        lp.warpAmp ?? 0.0);
 
-  gl.uniform1f(U.u_ditherScale, params.ditherScale);
-  gl.uniform1f(U.u_ditherSpeed, params.ditherSpeed);
-  gl.uniform1f(U.u_ditherAmp,   params.ditherAmp);
+  gl.uniform1f(U.u_ditherScale, lp.ditherScale);
+  gl.uniform1f(U.u_ditherSpeed, lp.ditherSpeed);
+  gl.uniform1f(U.u_ditherAmp,   lp.ditherAmp);
 
-  gl.uniform1f(U.u_softness, params.softness);
+  gl.uniform1f(U.u_softness, lp.softness);
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -370,6 +438,51 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
   f.addBinding(params, 'softness', { label: 'softness', min: 0, max: 0.05, step: 0.001 });
 }
 
+// --- Modulation ---
+{
+  const f = pane.addFolder({ title: 'Modulation', expanded: false });
+
+  f.addBlade({
+    view: 'list',
+    label: 'mode',
+    options: [
+      { text: 'none (manual)', value: 'none'   },
+      { text: 'audio file',    value: 'audio'  },
+      { text: 'webcam motion', value: 'camera' },
+    ],
+    value: modulation.mode,
+  }).on('change', (ev) => { setModulationMode(ev.value); });
+
+  // ---- audio sub-section
+  f.addButton({ title: 'Pick audio file…' }).on('click', () => audioPicker.click());
+  f.addBinding(modulation.audio, 'volume',      { label: 'audio vol',  min: 0, max: 1,    step: 0.01 })
+    .on('change', (ev) => audioMod.setVolume(ev.value));
+  f.addBinding(modulation.audio, 'bassDepth',   { label: 'bass→slow',  min: 0, max: 0.5,  step: 0.005 });
+  f.addBinding(modulation.audio, 'midDepth',    { label: 'mid→thresh', min: 0, max: 0.4,  step: 0.005 });
+  f.addBinding(modulation.audio, 'trebleDepth', { label: 'tre→warp',   min: 0, max: 0.06, step: 0.001 });
+  f.addBinding(modulation.audio, 'rmsDepth',    { label: 'rms→boil',   min: 0, max: 0.2,  step: 0.005 });
+
+  // ---- camera sub-section
+  f.addButton({ title: 'Start / stop webcam' }).on('click', async () => {
+    if (cameraMod.isActive()) {
+      cameraMod.stop();
+      if (modulation.mode === 'camera') setModulationMode('none');
+    } else {
+      try { await cameraMod.start(); modulation.mode = 'camera'; pane.refresh(); }
+      catch (e) { console.warn('camera failed', e); }
+    }
+  });
+  f.addBinding(modulation.camera, 'warpDepth', { label: 'mot→warp', min: 0, max: 0.1, step: 0.001 });
+  f.addBinding(modulation.camera, 'lfoDepth',  { label: 'mot→lfo',  min: 0, max: 0.2, step: 0.005 });
+
+  // ---- live monitors (graphs)
+  const gOpts = { view: 'graph', readonly: true, min: 0, max: 1, interval: 30 };
+  f.addBinding(monitor, 'bass',   { ...gOpts, label: 'bass'   });
+  f.addBinding(monitor, 'mid',    { ...gOpts, label: 'mid'    });
+  f.addBinding(monitor, 'treble', { ...gOpts, label: 'treble' });
+  f.addBinding(monitor, 'motion', { ...gOpts, label: 'motion' });
+}
+
 // --- Export ---
 {
   const f = pane.addFolder({ title: 'Export', expanded: false });
@@ -438,6 +551,20 @@ videoPicker.addEventListener('change', () => {
   const f = videoPicker.files?.[0];
   if (f) loadVideoFromFile(f);
 });
+audioPicker.addEventListener('change', async () => {
+  const f = audioPicker.files?.[0];
+  if (!f) return;
+  try {
+    await audioMod.loadFile(f);
+    audioMod.setVolume(modulation.audio.volume);
+    if (modulation.mode !== 'audio') {
+      modulation.mode = 'audio';
+      pane.refresh();
+    }
+  } catch (e) {
+    console.warn('Audio load failed', e);
+  }
+});
 presetPicker.addEventListener('change', async () => {
   const f = presetPicker.files?.[0];
   if (!f) return;
@@ -474,6 +601,12 @@ window.addEventListener('drop', (e) => {
   if (!file) return;
   if (file.type.startsWith('video/')) {
     loadVideoFromFile(file);
+  } else if (file.type.startsWith('audio/')) {
+    audioMod.loadFile(file).then(() => {
+      audioMod.setVolume(modulation.audio.volume);
+      modulation.mode = 'audio';
+      pane.refresh();
+    });
   } else if (file.name.endsWith('.json')) {
     readPresetFile(file).then((obj) => {
       applyPreset(params, obj);
