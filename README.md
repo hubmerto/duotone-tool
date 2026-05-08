@@ -55,11 +55,14 @@ boil and creep across the frame.
 |               | amp                  | How strongly the boil warps the threshold                           |
 | Edge          | softness             | Smoothstep half-width — keep tiny (0..0.05) for crisp edges         |
 | Modulation    | mode                 | none (manual) / audio file / webcam motion                          |
-|               | bass→slow            | Audio bass band drives `slowAmp` (ink blob swelling on kicks)       |
-|               | mid→thresh           | Mid band darkens `thresholdBase` (more black on dense mids)         |
-|               | tre→warp             | Treble nudges `warpAmp` (hi-hats add ripple)                        |
-|               | rms→boil             | Overall loudness drives `ditherAmp`                                 |
-|               | mot→warp / mot→lfo   | Webcam motion drives `warpAmp` and the LFO breathing depth          |
+|               | INTENSITY            | Master multiplier (0..3) on every audio routing — turn up for chaos |
+|               | bass→swell           | Bass kick swells the ink-blob amp (`slowAmp`)                       |
+|               | bass→warp            | Bass kick punches the UV warp                                       |
+|               | bass→flash           | Bass kick drops the threshold — frame flashes color on each hit     |
+|               | mid→speed            | Mids accelerate the slow-field drift (`slowNoiseSpeed`)             |
+|               | tre→warp             | Treble adds high-frequency ripple to the UV warp                    |
+|               | rms→boil             | Overall loudness drives the dither amp (grainier when loud)         |
+|               | mot→warp / mot→lfo / mot→flash | Webcam motion drives warp, LFO breathing, and flash       |
 |               | bass / mid / treble / motion graphs | Live monitors of the active signal(s)                |
 | Export        | engine               | mediarecorder (fast) / ccapture (frame-locked)                      |
 |               | format               | webm / png-sequence (ccapture only)                                 |
@@ -75,9 +78,13 @@ them automatically, *additively* on top of your manual values:
 
 - **Audio file**: pick any audio file (drag-drop also works). Three FFT
   bands (bass 40–160 Hz, mid 500 Hz–2 kHz, treble 4–10 kHz) plus an RMS
-  loudness signal are routed to `slowAmp`, `thresholdBase`, `warpAmp`,
-  `ditherAmp` respectively. Per-routing depth sliders let you dial in how
-  strongly each band moves things.
+  loudness signal feed an asymmetric envelope follower (fast attack, slow
+  release — kicks punch instead of averaging into mush). Six routings
+  feed the shader: bass→swell + warp + flash, mid→speed, treble→warp,
+  rms→boil. The **INTENSITY** master slider scales all six together —
+  turn it up to 3 for "music video" energy. Modulation peaks are allowed
+  to overshoot the manual slider maxes (transients should hit values
+  you wouldn't dial in by hand).
 - **Webcam motion**: enables `getUserMedia`, downsamples the camera to
   64×36, and computes a smoothed frame-difference magnitude. That single
   motion signal drives `warpAmp` and `thresholdLFOAmp` — wave a hand and

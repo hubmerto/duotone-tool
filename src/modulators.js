@@ -19,10 +19,13 @@ export class AudioModulator {
     this.bandIndices = null;
     this.audioEl = null;
     this.lastBands = { bass: 0, mid: 0, treble: 0, rms: 0 };
-    // smoothing (one-pole low-pass)
-    this.alpha = 0.4;
-    // sensitivity: maps raw 0..1 to a curved 0..1 to give more dynamic feel
-    this.gamma = 0.6;
+    // Asymmetric envelope follower: fast attack so kicks punch, slow release
+    // so they bleed out naturally instead of averaging into mush.
+    this.attackAlpha  = 0.85;
+    this.releaseAlpha = 0.10;
+    // gamma > 1 expands dynamics — silent stays silent, peaks pop. (gamma < 1
+    // would compress, which was the bug in the previous version.)
+    this.gamma = 1.4;
   }
 
   // Lazy-create the AudioContext on first user gesture (file pick).
@@ -81,11 +84,15 @@ export class AudioModulator {
     const rawMid    = curve(avg(...this.bandIndices.mid));
     const rawTreble = curve(avg(...this.bandIndices.treble));
     const rawRms    = curve((rawBass + rawMid + rawTreble) / 3);
-    const a = this.alpha;
-    this.lastBands.bass   = (1 - a) * this.lastBands.bass   + a * rawBass;
-    this.lastBands.mid    = (1 - a) * this.lastBands.mid    + a * rawMid;
-    this.lastBands.treble = (1 - a) * this.lastBands.treble + a * rawTreble;
-    this.lastBands.rms    = (1 - a) * this.lastBands.rms    + a * rawRms;
+    // asymmetric envelope follower
+    const env = (prev, raw) => {
+      const a = raw > prev ? this.attackAlpha : this.releaseAlpha;
+      return (1 - a) * prev + a * raw;
+    };
+    this.lastBands.bass   = env(this.lastBands.bass,   rawBass);
+    this.lastBands.mid    = env(this.lastBands.mid,    rawMid);
+    this.lastBands.treble = env(this.lastBands.treble, rawTreble);
+    this.lastBands.rms    = env(this.lastBands.rms,    rawRms);
     return this.lastBands;
   }
 }

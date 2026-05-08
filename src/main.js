@@ -29,20 +29,27 @@ const sourceState = {
 };
 
 // Modulation: drives params automatically from audio/camera signals.
-// All offsets are additive on top of the user's manual values, so the
-// manual sliders still set the baseline.
+// All offsets are additive on top of the user's manual values; manual
+// sliders still set the baseline. Modulation is allowed to push past
+// the slider's upper bound so transients can hit values you wouldn't
+// dial in manually (kicks should over-shoot).
 const modulation = {
   mode: 'none',     // 'none' | 'audio' | 'camera'
   audio: {
     volume:      0.6,
-    bassDepth:   0.20,    // bass (40-160 Hz)   -> slowAmp           (+)
-    midDepth:    0.12,    // mid  (500-2k Hz)   -> thresholdBase     (-)
-    trebleDepth: 0.025,   // hi   (4-10 kHz)    -> warpAmp           (+)
-    rmsDepth:    0.06,    // overall loudness   -> ditherAmp         (+)
+    intensity:   1.0,     // master multiplier on every audio routing (0..3)
+    // each value is the max effect at signal=1 with intensity=1
+    bassToSlow:   0.45,   // bass kick -> slowAmp (ink blob swell)
+    bassToWarp:   0.05,   // bass kick -> warpAmp (image punches sideways)
+    bassToFlash:  0.22,   // bass kick -> threshold drops -> frame flashes color
+    midToSpeed:   0.45,   // mids      -> slowNoiseSpeed (field accelerates)
+    trebleToWarp: 0.04,   // hi-hat    -> warpAmp (ripple)
+    rmsToBoil:    0.14,   // loudness  -> ditherAmp (grainier when loud)
   },
   camera: {
-    warpDepth:   0.04,    // motion -> warpAmp           (+)
-    lfoDepth:    0.06,    // motion -> thresholdLFOAmp   (+)
+    warpDepth:   0.05,    // motion -> warpAmp           (+)
+    lfoDepth:    0.08,    // motion -> thresholdLFOAmp   (+)
+    flashDepth:  0.15,    // motion -> threshold flash   (-)
   },
 };
 
@@ -252,21 +259,35 @@ const cameraMod  = new CameraModulator();
 
 // Compute "live" params: base params + modulation offsets. main.js never
 // mutates `params` itself, so the UI sliders keep their meaning.
+//
+// Upper clamps here are *higher than the slider maxes* on purpose —
+// modulation peaks should be allowed to overshoot the values you'd
+// reasonably dial in manually. That's where the drama comes from.
 function computeLiveParams() {
   const lp = { ...params };
   if (modulation.mode === 'audio') {
     const m = audioMod.update();
     monitor.bass = m.bass; monitor.mid = m.mid;
     monitor.treble = m.treble; monitor.rms = m.rms;
-    lp.slowAmp        = clamp(lp.slowAmp        + m.bass   * modulation.audio.bassDepth,   0,  0.6);
-    lp.thresholdBase  = clamp(lp.thresholdBase  - m.mid    * modulation.audio.midDepth,    0,  1.0);
-    lp.warpAmp        = clamp((lp.warpAmp ?? 0) + m.treble * modulation.audio.trebleDepth, 0,  0.06);
-    lp.ditherAmp      = clamp(lp.ditherAmp      + m.rms    * modulation.audio.rmsDepth,    0,  0.3);
+    const A = modulation.audio;
+    const k = A.intensity;
+    // bass: fattest routing — swell + punch + flash
+    lp.slowAmp        = clamp(lp.slowAmp        + m.bass   * A.bassToSlow   * k, 0, 1.20);
+    lp.warpAmp        = clamp((lp.warpAmp ?? 0)
+                              + m.bass   * A.bassToWarp   * k
+                              + m.treble * A.trebleToWarp * k,                  0, 0.15);
+    lp.thresholdBase  = clamp(lp.thresholdBase  - m.bass   * A.bassToFlash  * k, 0, 1.0 );
+    // mid: blob field accelerates
+    lp.slowNoiseSpeed = clamp(lp.slowNoiseSpeed + m.mid    * A.midToSpeed   * k, 0, 2.0 );
+    // rms: grainier when loud
+    lp.ditherAmp      = clamp(lp.ditherAmp      + m.rms    * A.rmsToBoil    * k, 0, 0.50);
   } else if (modulation.mode === 'camera') {
     const m = cameraMod.update();
     monitor.motion = m.motion;
-    lp.warpAmp         = clamp((lp.warpAmp ?? 0) + m.motion * modulation.camera.warpDepth, 0, 0.06);
-    lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.motion * modulation.camera.lfoDepth, 0, 0.3);
+    const C = modulation.camera;
+    lp.warpAmp         = clamp((lp.warpAmp ?? 0) + m.motion * C.warpDepth,   0, 0.15);
+    lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.motion * C.lfoDepth,   0, 0.30);
+    lp.thresholdBase   = clamp(lp.thresholdBase   - m.motion * C.flashDepth, 0, 1.0 );
   } else {
     monitor.bass = monitor.mid = monitor.treble = monitor.rms = monitor.motion = 0;
   }
@@ -455,12 +476,16 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 
   // ---- audio sub-section
   f.addButton({ title: 'Pick audio file…' }).on('click', () => audioPicker.click());
-  f.addBinding(modulation.audio, 'volume',      { label: 'audio vol',  min: 0, max: 1,    step: 0.01 })
+  f.addBinding(modulation.audio, 'volume',       { label: 'audio vol',   min: 0, max: 1,    step: 0.01  })
     .on('change', (ev) => audioMod.setVolume(ev.value));
-  f.addBinding(modulation.audio, 'bassDepth',   { label: 'bass→slow',  min: 0, max: 0.5,  step: 0.005 });
-  f.addBinding(modulation.audio, 'midDepth',    { label: 'mid→thresh', min: 0, max: 0.4,  step: 0.005 });
-  f.addBinding(modulation.audio, 'trebleDepth', { label: 'tre→warp',   min: 0, max: 0.06, step: 0.001 });
-  f.addBinding(modulation.audio, 'rmsDepth',    { label: 'rms→boil',   min: 0, max: 0.2,  step: 0.005 });
+  // master intensity — turn this up to make EVERYTHING crazier at once
+  f.addBinding(modulation.audio, 'intensity',    { label: 'INTENSITY',   min: 0, max: 3,    step: 0.05  });
+  f.addBinding(modulation.audio, 'bassToSlow',   { label: 'bass→swell',  min: 0, max: 1.0,  step: 0.01  });
+  f.addBinding(modulation.audio, 'bassToWarp',   { label: 'bass→warp',   min: 0, max: 0.12, step: 0.002 });
+  f.addBinding(modulation.audio, 'bassToFlash',  { label: 'bass→flash',  min: 0, max: 0.50, step: 0.01  });
+  f.addBinding(modulation.audio, 'midToSpeed',   { label: 'mid→speed',   min: 0, max: 1.0,  step: 0.01  });
+  f.addBinding(modulation.audio, 'trebleToWarp', { label: 'tre→warp',    min: 0, max: 0.10, step: 0.001 });
+  f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
 
   // ---- camera sub-section
   f.addButton({ title: 'Start / stop webcam' }).on('click', async () => {
@@ -472,8 +497,9 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
       catch (e) { console.warn('camera failed', e); }
     }
   });
-  f.addBinding(modulation.camera, 'warpDepth', { label: 'mot→warp', min: 0, max: 0.1, step: 0.001 });
-  f.addBinding(modulation.camera, 'lfoDepth',  { label: 'mot→lfo',  min: 0, max: 0.2, step: 0.005 });
+  f.addBinding(modulation.camera, 'warpDepth',  { label: 'mot→warp',  min: 0, max: 0.15, step: 0.001 });
+  f.addBinding(modulation.camera, 'lfoDepth',   { label: 'mot→lfo',   min: 0, max: 0.30, step: 0.005 });
+  f.addBinding(modulation.camera, 'flashDepth', { label: 'mot→flash', min: 0, max: 0.40, step: 0.005 });
 
   // ---- live monitors (graphs)
   const gOpts = { view: 'graph', readonly: true, min: 0, max: 1, interval: 30 };
