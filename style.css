@@ -141,14 +141,20 @@ body.specimen-mode .tp-dfwv,
 body.specimen-mode #hint,
 body.specimen-mode #dropzone-overlay { display: none !important; }
 
-/* Reposition canvas into the result-image slot */
+/* Reposition canvas into the result-image slot.
+ * Note: do NOT use `inset: auto` here — Vite's CSS minifier will merge it
+ * with adjacent left/top declarations and drop the position values. Setting
+ * width + height + explicit left + top gives the browser enough info; the
+ * inherited `inset: 0` from the base #stage rule is over-ridden by the
+ * explicit top/left and ignored on the over-constrained right/bottom. */
 body.specimen-mode #stage {
   position: absolute !important;
-  left: 900px !important;
   top: 160px !important;
+  left: 900px !important;
+  right: auto !important;
+  bottom: auto !important;
   width: 900px !important;
   height: 760px !important;
-  inset: auto !important;
   background: #000 !important;
 }
 
