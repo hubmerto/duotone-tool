@@ -64,10 +64,10 @@ boil and creep across the frame.
 |               | rms→boil             | Overall loudness drives the dither amp (grainier when loud)         |
 |               | mot→warp / mot→lfo / mot→flash | Webcam motion drives warp, LFO breathing, and flash       |
 |               | bass / mid / treble / motion graphs | Live monitors of the active signal(s)                |
-| Export        | engine               | mediarecorder (fast) / ccapture (frame-locked)                      |
-|               | format               | webm / png-sequence (ccapture only)                                 |
+| Export        | format               | mp4 (h.264) / webm real-time / webm frame-locked / png sequence     |
 |               | seconds              | Recording duration                                                  |
 |               | fps                  | Frame rate                                                          |
+|               | mp4 mbps             | Bitrate for mp4 export (12 Mbps default at 1080p is plenty)         |
 |               | record / stop        | Start/stop recording                                                |
 |               | save / load preset   | JSON download / upload                                              |
 
@@ -94,17 +94,30 @@ Both modes show live signal graphs in the panel so you can see what's
 driving things. Manual sliders keep working underneath: modulation just
 adds offset, never replaces.
 
-## Recording & post-processing
+## Recording
 
-Recording outputs **.webm** in-browser. For mp4 (e.g. social platforms), do this in a terminal:
+Four output formats, picked from the **Export → format** dropdown:
+
+| Format               | Engine                              | Notes                                              |
+| -------------------- | ----------------------------------- | -------------------------------------------------- |
+| **mp4 (h.264)**      | `VideoEncoder` + `mp4-muxer`        | In-browser H.264 / mp4. **Default when supported.** Chrome / Edge / Firefox 113+. **Not Safari** (no `VideoEncoder` yet). Frame-paced — output is always smooth even if rendering hitches. |
+| webm (vp9, real-time)| `MediaRecorder` (vp9)               | Works everywhere. Real-time captureStream — may stutter under load. |
+| webm (frame-locked)  | `ccapture.js` (lazy-loaded)         | Slower; perfect frame timing.                      |
+| png sequence         | `ccapture.js` (lazy-loaded)         | One PNG per frame in a zip — for compositing.      |
+
+Default mp4 bitrate is 12 Mbps at 1080p; bump to 20–30 for archival quality.
+
+If you're on Safari and need mp4: record webm, then post-process:
 
 ```bash
 ffmpeg -i out.webm -c:v libx264 -crf 18 -pix_fmt yuv420p out.mp4
 ```
 
-For higher-quality export when MediaRecorder stutters, switch to **ccapture (frame-locked)** —
-it lazy-loads ccapture.js from CDN on first use and writes frames at exact `fps`
-regardless of render speed. Slower; produces no stutter.
+To mux modulation audio back into the recorded video:
+
+```bash
+ffmpeg -i out.mp4 -i music.mp3 -c:v copy -c:a aac -shortest out-with-audio.mp4
+```
 
 ## Presets
 

@@ -1,13 +1,14 @@
 // Canvas recording.
 //
-// Two paths:
-//   1. MediaRecorder (default) — fast, in-browser, webm/vp9. Records the
-//      canvas in real-time at whatever framerate the renderer hits.
-//   2. ccapture.js — frame-locked export for high quality. Lazy-loaded
-//      from CDN on first use so we don't bloat the bundle.
+// Three paths:
+//   1. MediaRecorder      — fast, real-time, webm/vp9. Works everywhere.
+//   2. WebCodecsMp4Path   — VideoEncoder + mp4-muxer, H.264 mp4 in-browser,
+//                           no ffmpeg. Chrome/Edge/Firefox 113+. Not Safari yet.
+//   3. CCapturePath       — frame-locked, slower, webm or PNG sequence.
+//                           Lazy-loaded from CDN.
 //
-// For mp4: don't try to do mp4 in-browser. Output webm and post-process:
-//   ffmpeg -i out.webm -c:v libx264 -crf 18 -pix_fmt yuv420p out.mp4
+// If you need mp4 and WebCodecs isn't available (Safari), record webm and
+// post-process: ffmpeg -i out.webm -c:v libx264 -crf 18 -pix_fmt yuv420p out.mp4
 
 export class MediaRecorderPath {
   constructor(canvas) {
@@ -57,6 +58,125 @@ export class MediaRecorderPath {
     a.click();
     URL.revokeObjectURL(url);
     this.chunks = [];
+  }
+}
+
+// ----------------------------------------------------------------------------
+// WebCodecsMp4Path — H.264 mp4 in-browser via VideoEncoder + mp4-muxer.
+// Frame-paced (called from render loop), so output is always smooth even if
+// the renderer isn't hitting the target fps. ~12 Mbps default at 1080p.
+// ----------------------------------------------------------------------------
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+
+export class WebCodecsMp4Path {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.recording = false;
+    this.encoder = null;
+    this.muxer = null;
+    this.frameIdx = 0;
+    this.fps = 60;
+    this._endAt = Infinity;
+    this._inFlight = 0; // unflushed frames the encoder is processing
+  }
+
+  static isSupported() {
+    return typeof window !== 'undefined'
+      && typeof window.VideoEncoder !== 'undefined'
+      && typeof window.VideoFrame !== 'undefined';
+  }
+
+  async start({ fps = 60, durationSeconds = 0, bitrate = 12_000_000 } = {}) {
+    if (this.recording) return;
+    if (!WebCodecsMp4Path.isSupported()) {
+      throw new Error('WebCodecs not supported in this browser — use webm or run on Chrome/Firefox/Edge.');
+    }
+    this.fps = fps;
+    // H.264 requires even dimensions
+    const w = this.canvas.width  & ~1;
+    const h = this.canvas.height & ~1;
+
+    this.muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      video: { codec: 'avc', width: w, height: h, frameRate: fps },
+      fastStart: 'in-memory', // small enough; metadata at start = playable on social platforms
+    });
+
+    this.encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        this.muxer.addVideoChunk(chunk, meta);
+        this._inFlight = Math.max(0, this._inFlight - 1);
+      },
+      error: (e) => console.error('VideoEncoder error:', e),
+    });
+
+    // Try a couple of profiles in order of compatibility
+    const candidates = [
+      'avc1.640028', // High @ 4.0
+      'avc1.42E01F', // Baseline @ 3.1
+      'avc1.42E01E', // Baseline @ 3.0
+    ];
+    let configured = false;
+    for (const codec of candidates) {
+      const cfg = { codec, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
+      // eslint-disable-next-line no-await-in-loop
+      const support = await VideoEncoder.isConfigSupported(cfg);
+      if (support.supported) { this.encoder.configure(cfg); configured = true; break; }
+    }
+    if (!configured) {
+      this.encoder.close();
+      throw new Error(`No supported H.264 config at ${w}×${h}. Try lower resolution.`);
+    }
+
+    this.frameIdx = 0;
+    this._inFlight = 0;
+    this._startedAt = performance.now();
+    this._endAt = durationSeconds > 0 ? this._startedAt + durationSeconds * 1000 : Infinity;
+    this.recording = true;
+  }
+
+  // Called from render loop AFTER the canvas is drawn for this frame.
+  capture() {
+    if (!this.recording) return;
+    if (performance.now() >= this._endAt) { this.stop(); return; }
+
+    const ts = (this.frameIdx * 1_000_000) / this.fps; // microseconds
+    const frame = new VideoFrame(this.canvas, {
+      timestamp: ts,
+      duration: 1_000_000 / this.fps,
+    });
+    const keyFrame = (this.frameIdx % (this.fps * 2)) === 0; // key every 2s
+    try {
+      this.encoder.encode(frame, { keyFrame });
+      this._inFlight++;
+    } catch (e) {
+      console.warn('encode failed:', e);
+    } finally {
+      frame.close();
+    }
+    this.frameIdx++;
+  }
+
+  async stop() {
+    if (!this.recording) return;
+    this.recording = false;
+    try {
+      await this.encoder.flush();
+      this.encoder.close();
+      this.muxer.finalize();
+      const buffer = this.muxer.target.buffer;
+      const blob = new Blob([buffer], { type: 'video/mp4' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `duotone-${Date.now()}.mp4`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('mp4 finalize failed:', e);
+    }
+    this.encoder = null;
+    this.muxer = null;
   }
 }
 

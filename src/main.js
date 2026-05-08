@@ -9,18 +9,23 @@ import fragSrc from './shader.frag?raw';
 import {
   PRESETS, DEFAULT_PRESET, applyPreset, downloadPreset, readPresetFile,
 } from './presets.js';
-import { MediaRecorderPath, CCapturePath } from './recorder.js';
+import { MediaRecorderPath, CCapturePath, WebCodecsMp4Path } from './recorder.js';
 import { AudioModulator, CameraModulator } from './modulators.js';
 
 // -----------------------------------------------------------------------------
 // state
 // -----------------------------------------------------------------------------
 const params = { ...PRESETS[DEFAULT_PRESET] };
+// Format is the single primary control; engine is derived from it.
+//   mp4         -> WebCodecs H.264 (Chrome/Firefox/Edge; not Safari)
+//   webm        -> MediaRecorder VP9 (real-time, all browsers)
+//   webm-locked -> ccapture.js (frame-locked webm)
+//   png         -> ccapture.js PNG sequence
 const exportSettings = {
-  format: 'webm',          // 'webm' or 'png-sequence'
+  format: WebCodecsMp4Path.isSupported() ? 'mp4' : 'webm',
   durationSeconds: 6,
   fps: 60,
-  engine: 'mediarecorder', // 'mediarecorder' | 'ccapture'
+  bitrateMbps: 12,         // mp4 only
 };
 const sourceState = {
   preset: DEFAULT_PRESET,
@@ -254,6 +259,7 @@ function loadStateFromLocalStorage() {
 // -----------------------------------------------------------------------------
 const mediaPath  = new MediaRecorderPath(canvas);
 const ccapPath   = new CCapturePath(canvas);
+const mp4Path    = new WebCodecsMp4Path(canvas);
 const audioMod   = new AudioModulator();
 const cameraMod  = new CameraModulator();
 
@@ -363,6 +369,7 @@ function frameTick() {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
   if (ccapPath.recording) ccapPath.capture();
+  if (mp4Path.recording)  mp4Path.capture();
   frameCount++;
   requestAnimationFrame(frameTick);
 }
@@ -512,54 +519,78 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // --- Export ---
 {
   const f = pane.addFolder({ title: 'Export', expanded: false });
-  f.addBlade({
-    view: 'list',
-    label: 'engine',
-    options: [
-      { text: 'mediarecorder (fast)', value: 'mediarecorder' },
-      { text: 'ccapture (frame-locked)', value: 'ccapture' },
-    ],
-    value: exportSettings.engine,
-  }).on('change', (ev) => { exportSettings.engine = ev.value; });
+
+  const formatOptions = [
+    { text: 'mp4 (h.264, in-browser)' + (WebCodecsMp4Path.isSupported() ? '' : ' — UNSUPPORTED'),
+      value: 'mp4' },
+    { text: 'webm (vp9, real-time)',   value: 'webm' },
+    { text: 'webm (frame-locked)',     value: 'webm-locked' },
+    { text: 'png sequence',            value: 'png' },
+  ];
+
   f.addBlade({
     view: 'list',
     label: 'format',
-    options: [
-      { text: 'webm', value: 'webm' },
-      { text: 'png sequence (ccapture only)', value: 'png' },
-    ],
+    options: formatOptions,
     value: exportSettings.format,
   }).on('change', (ev) => { exportSettings.format = ev.value; });
+
   f.addBinding(exportSettings, 'durationSeconds', { label: 'seconds', min: 1, max: 120, step: 1 });
-  f.addBinding(exportSettings, 'fps', { label: 'fps', min: 24, max: 60, step: 1 });
+  f.addBinding(exportSettings, 'fps',             { label: 'fps',     min: 24, max: 60, step: 1 });
+  f.addBinding(exportSettings, 'bitrateMbps',     { label: 'mp4 mbps', min: 2, max: 40, step: 1 });
 
   const recBtn = f.addButton({ title: '● record' });
   let isRecording = false;
+  let recordingPath = null;
+
   recBtn.on('click', async () => {
     if (!isRecording) {
-      if (exportSettings.engine === 'mediarecorder') {
-        mediaPath.start({
-          fps: exportSettings.fps,
-          durationSeconds: exportSettings.durationSeconds,
-        });
-      } else {
-        await ccapPath.start({
-          fps: exportSettings.fps,
-          durationSeconds: exportSettings.durationSeconds,
-          format: exportSettings.format === 'png' ? 'png' : 'webm',
-        });
-      }
-      isRecording = true;
-      recBtn.title = '■ stop';
-      // auto-flip back when duration elapses
-      setTimeout(() => {
+      const fmt = exportSettings.format;
+      const opts = {
+        fps: exportSettings.fps,
+        durationSeconds: exportSettings.durationSeconds,
+      };
+
+      try {
+        if (fmt === 'mp4') {
+          if (!WebCodecsMp4Path.isSupported()) {
+            console.warn('WebCodecs unsupported in this browser. Falling back to webm.');
+            mediaPath.start(opts);
+            recordingPath = mediaPath;
+          } else {
+            await mp4Path.start({ ...opts, bitrate: exportSettings.bitrateMbps * 1_000_000 });
+            recordingPath = mp4Path;
+          }
+        } else if (fmt === 'webm') {
+          mediaPath.start(opts);
+          recordingPath = mediaPath;
+        } else if (fmt === 'webm-locked') {
+          await ccapPath.start({ ...opts, format: 'webm' });
+          recordingPath = ccapPath;
+        } else if (fmt === 'png') {
+          await ccapPath.start({ ...opts, format: 'png' });
+          recordingPath = ccapPath;
+        }
+        isRecording = true;
+        recBtn.title = '■ stop';
+        // auto-flip back when duration elapses (path stops itself)
+        setTimeout(() => {
+          isRecording = false;
+          recordingPath = null;
+          recBtn.title = '● record';
+        }, exportSettings.durationSeconds * 1000 + 400);
+      } catch (e) {
+        console.error('Recording failed:', e);
         isRecording = false;
+        recordingPath = null;
         recBtn.title = '● record';
-      }, exportSettings.durationSeconds * 1000 + 300);
+      }
     } else {
-      mediaPath.stop();
-      ccapPath.stop();
+      // manual stop
+      if (recordingPath) await recordingPath.stop();
+      mediaPath.stop(); ccapPath.stop(); mp4Path.stop();
       isRecording = false;
+      recordingPath = null;
       recBtn.title = '● record';
     }
   });
