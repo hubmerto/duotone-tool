@@ -31,7 +31,7 @@ in vec2 v_uv;
 out vec4 fragColor;
 
 // ----- texture inputs -----------------------------------------------------------
-uniform sampler2D       u_video;             // used when u_temporalMode == 0
+uniform sampler2D       u_video;             // current live video frame
 uniform sampler2DArray  u_buffer;            // ring buffer of past quarter-res frames
 
 // ----- frame state --------------------------------------------------------------
@@ -72,16 +72,20 @@ uniform float u_ditherAmp;
 // ----- edge ---------------------------------------------------------------------
 uniform float u_softness;
 
-// ----- dual-playhead temporal effect --------------------------------------------
-// Two virtual playheads (A and B) read from the same ring buffer. JS runs the
-// IDLE / FROZEN / MORPHING state machine and sends back the resolved layer
-// indices + morph progress. The shader is purely a sampler.
-uniform int   u_bufferSize;           // active wrap modulus (auto-sized from params)
-uniform int   u_bufferWriteIndex;     // next-to-write slot (live = idx-1, mod size)
-uniform int   u_layerVis;             // visible head's layer (frozen frame, or live)
-uniform int   u_layerOther;           // other head's layer (always live during freeze)
-uniform float u_morphT;               // 0 (no blend) .. 1 (fully transitioned to other)
-uniform float u_dpIntensity;          // 0 = bypass (sample u_video directly), 1 = full DP
+// ----- temporal mix --------------------------------------------------------------
+// Sample the video at two time positions and blend in luma:
+//   A: current frame (live, from u_video)
+//   B: a frame N back, from the ring buffer at u_offsetLayer
+// Modes:
+//   0 static  — constant mix at u_temporalMixAmount
+//   1 pulsing — mixAmount oscillates at u_temporalPulseFreq Hz
+//   2 ramped  — mixAmount triangle-envelopes over u_introDuration
+// At mixAmount=0 the shader bypasses the buffer entirely (true no-op).
+uniform int   u_offsetLayer;          // JS-resolved layer index for the past frame
+uniform float u_temporalMixAmount;    // base mix 0..1
+uniform int   u_temporalMode;         // 0=static, 1=pulsing, 2=ramped
+uniform float u_temporalPulseFreq;    // Hz
+uniform float u_temporalPulseAmp;     // 0..1, depth of pulse modulation
 
 // ============================================================================
 // helpers
@@ -132,41 +136,48 @@ float ease(float t, int curve) {
 }
 
 // ============================================================================
-// dual-playhead temporal sampling
+// temporal mix — luma blend between current frame and a frame N back
 // ============================================================================
 //
-// Output is mix(layerVis, layerOther, morphT) in luma space.
-//   - IDLE:      both heads at live layer → layerVis == layerOther, morphT = 0
-//                (output = current frame, identical to bypass visually)
-//   - FROZEN:    visible head holds at frozenAtLayer, other at live, morphT = 0
-//                (output = visible head's frozen frame)
-//   - MORPHING:  same layer indices, morphT animates 0 → 1 (eased in JS)
-//                (output crossfades from frozen frame to live frame)
-//   - intensity = 0 short-circuits to u_video for true zero-overhead bypass.
+// The blend happens BEFORE the threshold pass — the threshold operates on the
+// pre-blended luma signal. This is what produces the "two figures dissolving
+// into themselves a few frames later" look from the orange reference clip.
 //
-// luma-space blend: extract dot(rgb, rec709) from each layer, mix the scalar,
-// emit grey. Downstream threshold uses luma anyway, so this is mathematically
-// equivalent to a per-channel RGB blend in this pipeline — but staying in luma
-// keeps the contract obvious and lets the comment match the spec.
+// The shader returns luma directly (not RGB) — saves a redundant dot-product
+// downstream since the rest of the pipeline only uses luma.
 //
-vec3 sampleDP(vec2 uv) {
-    if (u_dpIntensity < 0.001) {
-        return texture(u_video, uv).rgb;
+float sampleMixedLuma(vec2 uv) {
+    vec3 cur = texture(u_video, uv).rgb;
+    float lumaCur = dot(cur, vec3(0.2126, 0.7152, 0.0722));
+
+    if (u_temporalMixAmount < 0.001) {
+        return lumaCur;  // true bypass — no buffer read
     }
 
-    vec3 visC = texture(u_buffer, vec3(uv, float(u_layerVis))).rgb;
-    vec3 othC = texture(u_buffer, vec3(uv, float(u_layerOther))).rgb;
-
-    float lumaV = dot(visC, vec3(0.2126, 0.7152, 0.0722));
-    float lumaO = dot(othC, vec3(0.2126, 0.7152, 0.0722));
-    float L = mix(lumaV, lumaO, clamp(u_morphT, 0.0, 1.0));
-    vec3 dp = vec3(L);
-
-    // Partial intensity → blend with full-res bypass.
-    if (u_dpIntensity < 1.0) {
-        return mix(texture(u_video, uv).rgb, dp, u_dpIntensity);
+    // Effective mix per mode
+    float effectiveMix;
+    if (u_temporalMode == 0) {
+        // Static: constant blend
+        effectiveMix = u_temporalMixAmount;
+    } else if (u_temporalMode == 1) {
+        // Pulsing: cycles through 0..mixAmount at pulseFreq Hz
+        // pulseAmp = 1 → full 0..mixAmount range, pulseAmp = 0 → constant
+        float pulse = 0.5 + 0.5 * sin(6.28318530718 * u_temporalPulseFreq * u_time);
+        effectiveMix = u_temporalMixAmount * (pulse * u_temporalPulseAmp + (1.0 - u_temporalPulseAmp));
+    } else {
+        // Ramped: triangle envelope over introDuration
+        // 0 → mixAmount → 0 across the intro window, then settles at 0
+        float t = clamp(u_time / max(u_introDuration, 1e-4), 0.0, 1.0);
+        float env = 1.0 - abs(2.0 * t - 1.0);
+        effectiveMix = u_temporalMixAmount * env;
     }
-    return dp;
+
+    if (effectiveMix < 0.001) return lumaCur;
+
+    vec3 off = texture(u_buffer, vec3(uv, float(u_offsetLayer))).rgb;
+    float lumaOff = dot(off, vec3(0.2126, 0.7152, 0.0722));
+
+    return mix(lumaCur, lumaOff, clamp(effectiveMix, 0.0, 1.0));
 }
 
 // ============================================================================
@@ -231,9 +242,9 @@ void main() {
     ) * u_warpAmp;
     vec2 warpedUV = uv + warpVec;
 
-    // luma — sampled through dual-playhead pass at warpedUV
-    vec3 src  = sampleDP(warpedUV);
-    float luma = dot(src, vec3(0.2126, 0.7152, 0.0722));
+    // luma — sampled through temporal-mix pass at warpedUV
+    // (returns luma directly — the mix happens in luma space)
+    float luma = sampleMixedLuma(warpedUV);
 
     // fast boil
     float ditherTime = float(u_frame) * 0.61803398875 * u_ditherSpeed;

@@ -201,19 +201,9 @@ gl.activeTexture(gl.TEXTURE0); // restore default unit
 let bufferWriteIndex   = 0;
 let imageBufferFilled  = false;  // for static images: write to all layers once
 
-// Dual-playhead state machine. JS resolves which buffer layer each "head"
-// references and the current morph progress; the shader is just a sampler.
-const dp = {
-  state:               'idle',  // 'idle' | 'frozen' | 'morphing'
-  visibleHead:         'A',     // which head's content is currently shown / about to freeze
-  frozenAtLayer:       -1,
-  holdStartFrame:      0,
-  morphStartFrame:     0,
-  holdDriftFrames:     0,       // how many frames the moving head drifts before morph
-  morphDurationFrames: 0,
-  nextHoldAt:          0,       // ms (performance.now)
-  triggerNow:          false,   // set true to force a freeze at the next idle check
-};
+// (Temporal Mix is stateless from JS's side — the shader computes the blend
+// per frame from u_time + the user params. JS only resolves the offsetLayer
+// based on the current bufferWriteIndex and offsetFrames slider.)
 
 // uniforms
 const U = {};
@@ -226,8 +216,8 @@ for (const name of [
   'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp','u_warpAmp',
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
-  'u_bufferSize','u_bufferWriteIndex',
-  'u_layerVis','u_layerOther','u_morphT','u_dpIntensity',
+  'u_bufferSize','u_bufferWriteIndex','u_offsetLayer',
+  'u_temporalMixAmount','u_temporalMode','u_temporalPulseFreq','u_temporalPulseAmp',
 ]) U[name] = gl.getUniformLocation(program, name);
 
 // -----------------------------------------------------------------------------
@@ -336,11 +326,9 @@ async function loadImageFromFile(file) {
 // -----------------------------------------------------------------------------
 // localStorage — last preset + UI state (no video data)
 // -----------------------------------------------------------------------------
-// v3: replaced the random-glitch Temporal module with the dual-playhead
-// freeze-and-catch-up. Existing saved state would carry obsolete keys
-// (temporalMode, stutterAmount, rewindOffset…) that no longer drive
-// anything; bumping the key forces a clean state on next load.
-const LS_KEY = 'duotone:lastState:v3';
+// v4: replaced dual-playhead with the temporal-mix luma-blend module +
+// added playbackSpeed. Old keys (dp*, morphT, etc.) no longer drive anything.
+const LS_KEY = 'duotone:lastState:v4';
 
 function saveStateToLocalStorage() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
@@ -442,16 +430,15 @@ function frameTick() {
     resize();
   }
 
-  // ----- ring buffer write (only when dual-playhead is active) ---------------
-  // Auto-size the buffer's wrap modulus from the max-duration params plus
-  // safety margin (16 frames). Texture is allocated at TEMPORAL_SIZE_MAX once;
-  // we just change the active modulus.
+  // ----- ring buffer write (only when temporal mix is active) ---------------
+  // Buffer wrap modulus auto-sizes from max useful offset + safety. The
+  // texture is allocated at TEMPORAL_SIZE_MAX once; we change the active modulus.
   const bufferDepth = Math.min(
     TEMPORAL_SIZE_MAX,
-    Math.max(32, Math.ceil((params.dpHoldDurationMax ?? 28) + (params.dpMorphDurationMax ?? 14) + 16))
+    Math.max(32, Math.ceil((params.temporalOffsetFrames ?? 18) + 16))
   );
 
-  if ((params.dpIntensity ?? 0) > 0) {
+  if ((params.temporalMixAmount ?? 0) > 0.001) {
     if (currentSource === 'video' && video.readyState >= 2 && video.videoWidth > 0) {
       tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
       gl.activeTexture(gl.TEXTURE1);
@@ -475,20 +462,15 @@ function frameTick() {
     }
   }
 
-  // ----- dual-playhead state machine -----------------------------------------
-  const nowMs = performance.now();
-  dpAdvance(nowMs, bufferDepth);
-
+  // ----- offsetLayer for the temporal mix --------------------------------------
   const liveLayer = ((bufferWriteIndex - 1) % bufferDepth + bufferDepth) % bufferDepth;
-  let layerVis, layerOther, morphT;
-  if (dp.state === 'idle') {
-    layerVis = liveLayer; layerOther = liveLayer; morphT = 0;
-  } else if (dp.state === 'frozen') {
-    layerVis = dp.frozenAtLayer; layerOther = liveLayer; morphT = 0;
-  } else {
-    layerVis = dp.frozenAtLayer; layerOther = liveLayer;
-    const t = (frameCount - dp.morphStartFrame) / Math.max(1, dp.morphDurationFrames);
-    morphT = applyMorphCurve(Math.min(1, Math.max(0, t)), params.dpMorphCurve | 0);
+  const offsetFrames = Math.max(1, Math.round(params.temporalOffsetFrames ?? 18));
+  const offsetLayer = ((liveLayer - offsetFrames) % bufferDepth + bufferDepth) % bufferDepth;
+
+  // ----- playback speed -> video.playbackRate ---------------------------------
+  if (currentSource === 'video' && video.duration > 0) {
+    const target = Math.max(0.1, Math.min(2.0, params.playbackSpeed ?? 1.0));
+    if (Math.abs(video.playbackRate - target) > 0.005) video.playbackRate = target;
   }
 
   // ----- draw -----------------------------------------------------------------
@@ -540,13 +522,14 @@ function frameTick() {
 
   gl.uniform1f(U.u_softness, lp.softness);
 
-  // dual-playhead temporal
-  gl.uniform1i(U.u_bufferSize,       bufferDepth);
-  gl.uniform1i(U.u_bufferWriteIndex, bufferWriteIndex);
-  gl.uniform1i(U.u_layerVis,         layerVis);
-  gl.uniform1i(U.u_layerOther,       layerOther);
-  gl.uniform1f(U.u_morphT,           morphT);
-  gl.uniform1f(U.u_dpIntensity,      lp.dpIntensity ?? 0);
+  // temporal mix
+  gl.uniform1i(U.u_bufferSize,        bufferDepth);
+  gl.uniform1i(U.u_bufferWriteIndex,  bufferWriteIndex);
+  gl.uniform1i(U.u_offsetLayer,       offsetLayer);
+  gl.uniform1f(U.u_temporalMixAmount, lp.temporalMixAmount ?? 0);
+  gl.uniform1i(U.u_temporalMode,      lp.temporalMode | 0);
+  gl.uniform1f(U.u_temporalPulseFreq, lp.temporalPulseFreq ?? 0.2);
+  gl.uniform1f(U.u_temporalPulseAmp,  lp.temporalPulseAmp ?? 0.85);
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -556,92 +539,8 @@ function frameTick() {
   requestAnimationFrame(frameTick);
 }
 
-// =============================================================================
-// dual-playhead — IDLE / FROZEN / MORPHING state machine
-// =============================================================================
-//
-// Every render frame, dpAdvance() decides whether to transition. All
-// randomness is seeded by `dpSeed + frameCount` so two recordings with the
-// same seed and source video produce identical output.
-//
-// Lifecycle of one round:
-//   IDLE       → wait until performance.now() ≥ nextHoldAt
-//   FROZEN     → visible head holds at frozenAtLayer; other head advances at
-//                liveLayer. After holdDriftFrames frames have passed, enter:
-//   MORPHING   → morphT animates 0 → 1 (eased by params.dpMorphCurve) over
-//                morphDurationFrames frames. Both layers feed the shader.
-//   IDLE again → frozen head snaps to live; visibleHead swaps; schedule next
-//                hold.
-
-// Seeded 0..1 scalar. extraSalt distinguishes multiple rolls in one frame.
-function dpRand(extraSalt = 0) {
-  const s = (params.dpSeed ?? 1) * 0.137 + frameCount * 0.731 + extraSalt * 1.913;
-  const x = Math.sin(s * 12.9898) * 43758.5453;
-  return x - Math.floor(x);
-}
-
-function applyMorphCurve(t, curve) {
-  if (curve === 0) return t;                                                 // linear
-  if (curve === 2) return 1 - Math.pow(1 - t, 3);                            // easeOut
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) * 0.5;        // easeInOut
-}
-
-function dpAdvance(nowMs, bufferDepth) {
-  const intensity = params.dpIntensity ?? 0;
-  if (intensity < 0.001) {
-    dp.state = 'idle';
-    dp.frozenAtLayer = -1;
-    dp.nextHoldAt = 0;
-    return;
-  }
-
-  // Initialize next hold time on first activation
-  if (dp.nextHoldAt === 0) {
-    const r = dpRand(11);
-    const interval = (params.dpHoldIntervalMin ?? 0.6)
-                   + ((params.dpHoldIntervalMax ?? 1.8) - (params.dpHoldIntervalMin ?? 0.6)) * r;
-    dp.nextHoldAt = nowMs + interval * 1000;
-  }
-
-  if (dp.state === 'idle') {
-    if (dp.triggerNow || nowMs >= dp.nextHoldAt) {
-      // pick which head freezes (swapBias: 0=always A, 0.5=balanced, 1=always B)
-      const swap = dpRand(2);
-      const bias = clamp01(params.dpSwapBias ?? 0.5);
-      dp.visibleHead = (swap < (1 - bias)) ? 'A' : 'B';
-      dp.state = 'frozen';
-      dp.frozenAtLayer = ((bufferWriteIndex - 1) % bufferDepth + bufferDepth) % bufferDepth;
-      dp.holdStartFrame = frameCount;
-      const r1 = dpRand(3);
-      const r2 = dpRand(4);
-      dp.holdDriftFrames = Math.round(
-        (params.dpHoldDurationMin ?? 6) + ((params.dpHoldDurationMax ?? 28) - (params.dpHoldDurationMin ?? 6)) * r1
-      );
-      dp.morphDurationFrames = Math.round(
-        (params.dpMorphDurationMin ?? 4) + ((params.dpMorphDurationMax ?? 14) - (params.dpMorphDurationMin ?? 4)) * r2
-      );
-      dp.triggerNow = false;
-    }
-  } else if (dp.state === 'frozen') {
-    if (frameCount - dp.holdStartFrame >= dp.holdDriftFrames) {
-      dp.state = 'morphing';
-      dp.morphStartFrame = frameCount;
-    }
-  } else { // morphing
-    if (frameCount - dp.morphStartFrame >= dp.morphDurationFrames) {
-      // morph complete: visibleHead swaps role for next round, schedule next freeze
-      dp.state = 'idle';
-      dp.frozenAtLayer = -1;
-      dp.visibleHead = (dp.visibleHead === 'A') ? 'B' : 'A';
-      const r = dpRand(5);
-      const interval = (params.dpHoldIntervalMin ?? 0.6)
-                     + ((params.dpHoldIntervalMax ?? 1.8) - (params.dpHoldIntervalMin ?? 0.6)) * r;
-      dp.nextHoldAt = nowMs + interval * 1000;
-    }
-  }
-}
-
-function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+// (Temporal mix has no JS-side state machine — the shader resolves the blend
+// from u_time + user params each frame. JS just resolves offsetLayer.)
 
 // -----------------------------------------------------------------------------
 // Tweakpane UI
@@ -662,6 +561,9 @@ let updateTempVis  = () => {};
     if (ev.value) video.play(); else video.pause();
   });
   f.addBinding(sourceState, 'loop').on('change', (ev) => { video.loop = ev.value; });
+  // playbackSpeed wires to video.playbackRate in the render loop. Slow-mo at
+  // ~0.4x is the single biggest perceptual lever on the "morphing humans" feel.
+  f.addBinding(params, 'playbackSpeed', { label: 'speed', min: 0.1, max: 2.0, step: 0.05 });
 }
 
 // --- Color ---
@@ -672,13 +574,15 @@ let updateTempVis  = () => {};
     view: 'list',
     label: 'preset',
     options: [
-      { text: 'green',           value: 'green'          },
-      { text: 'orange',          value: 'orange'         },
-      { text: 'blue',            value: 'blue'           },
-      { text: '— showcase —',    value: 'custom'         },
-      { text: 'green · catchup', value: 'green-catchup'  },
-      { text: 'blue · radiance', value: 'blue-radiance'  },
-      { text: 'custom',          value: 'custom'         },
+      { text: 'orange · reference', value: 'orange-reference' },
+      { text: 'green · reference',  value: 'green-reference'  },
+      { text: 'blue · reference',   value: 'blue-reference'   },
+      { text: '— bare —',           value: 'custom'           },
+      { text: 'green',              value: 'green'            },
+      { text: 'orange',             value: 'orange'           },
+      { text: 'blue',               value: 'blue'             },
+      { text: 'blue · radiance',    value: 'blue-radiance'    },
+      { text: 'custom',             value: 'custom'           },
     ],
     value: sourceState.preset,
   }).on('change', (ev) => {
@@ -778,43 +682,38 @@ let updateTempVis  = () => {};
   f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
 }
 
-// --- Dual Playhead ---
-// Two virtual playheads on the same ring buffer. One freezes while the other
-// advances; they reconverge via a luma-blend morph. See dpAdvance() in this
-// file for the full state-machine description.
+// --- Temporal Mix ---
+// Blend the live frame with a frame N back in luma. Three modes:
+//   static  — constant blend at mixAmount
+//   pulsing — mixAmount oscillates at pulseFreq Hz, depth pulseAmp
+//   ramped  — triangle envelope over introDuration (one-shot)
+// At mixAmount=0 the buffer is bypassed entirely.
 {
-  const f = pane.addFolder({ title: 'Dual Playhead', expanded: false });
+  const f = pane.addFolder({ title: 'Temporal Mix', expanded: false });
 
-  f.addBinding(params, 'dpIntensity', { label: 'intensity', min: 0, max: 1, step: 0.01 });
-
-  const fHold = f.addFolder({ title: 'Hold timing', expanded: false });
-  fHold.addBinding(params, 'dpHoldIntervalMin', { label: 'interval min (s)', min: 0.3, max: 3.0, step: 0.05 });
-  fHold.addBinding(params, 'dpHoldIntervalMax', { label: 'interval max (s)', min: 0.5, max: 6.0, step: 0.05 });
-  fHold.addBinding(params, 'dpHoldDurationMin', { label: 'hold min (frames)', min: 4,  max: 20, step: 1 });
-  fHold.addBinding(params, 'dpHoldDurationMax', { label: 'hold max (frames)', min: 10, max: 60, step: 1 });
-
-  const fMorph = f.addFolder({ title: 'Morph', expanded: false });
-  fMorph.addBinding(params, 'dpMorphDurationMin', { label: 'morph min (frames)', min: 2, max: 10, step: 1 });
-  fMorph.addBinding(params, 'dpMorphDurationMax', { label: 'morph max (frames)', min: 6, max: 30, step: 1 });
-  fMorph.addBlade({
+  f.addBlade({
     view: 'list',
-    label: 'curve',
+    label: 'mode',
     options: [
-      { text: 'linear',     value: 0 },
-      { text: 'easeInOut',  value: 1 },
-      { text: 'easeOut',    value: 2 },
+      { text: 'static',  value: 0 },
+      { text: 'pulsing', value: 1 },
+      { text: 'ramped',  value: 2 },
     ],
-    value: params.dpMorphCurve | 0,
-  }).on('change', (ev) => { params.dpMorphCurve = ev.value | 0; });
+    value: params.temporalMode | 0,
+  }).on('change', (ev) => { params.temporalMode = ev.value | 0; updateTempVis(); });
 
-  f.addBinding(params, 'dpSwapBias', { label: 'swap bias', min: 0, max: 1,    step: 0.01 });
-  f.addBinding(params, 'dpSeed',     { label: 'seed',      min: 0, max: 9999, step: 1    });
-  f.addButton({ title: 'Trigger now' }).on('click', () => { dp.triggerNow = true; });
+  f.addBinding(params, 'temporalMixAmount',    { label: 'mix amount',    min: 0,    max: 1,    step: 0.01 });
+  f.addBinding(params, 'temporalOffsetFrames', { label: 'offset frames', min: 1,    max: 60,   step: 1    });
+  const bPulseFreq = f.addBinding(params, 'temporalPulseFreq', { label: 'pulse freq (hz)', min: 0.05, max: 1.0, step: 0.01 });
+  const bPulseAmp  = f.addBinding(params, 'temporalPulseAmp',  { label: 'pulse amp',       min: 0,    max: 1,   step: 0.01 });
 
-  // No conditional visibility needed — params are valid whether intensity
-  // is 0 or 1. Old updateTempVis is unused now.
+  updateTempVis = function () {
+    const m = params.temporalMode | 0;
+    bPulseFreq.hidden = (m !== 1);
+    bPulseAmp.hidden  = (m !== 1);
+  };
+  updateTempVis();
 }
-updateTempVis = () => {}; // legacy helper, no-op
 
 // --- Edge ---
 {
