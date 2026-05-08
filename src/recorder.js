@@ -18,7 +18,7 @@ export class MediaRecorderPath {
     this.recording = false;
   }
 
-  start({ fps = 60, durationSeconds = 0, bitrate = 20_000_000 } = {}) {
+  start({ fps = 60, durationSeconds = 0, bitrate = 40_000_000 } = {}) {
     if (this.recording) return;
     const stream = this.canvas.captureStream(fps);
 
@@ -86,7 +86,13 @@ export class WebCodecsMp4Path {
       && typeof window.VideoFrame !== 'undefined';
   }
 
-  async start({ fps = 60, durationSeconds = 0, bitrate = 12_000_000 } = {}) {
+  async start({
+    fps = 60,
+    durationSeconds = 0,
+    bitrate = 25_000_000,
+    latencyMode = 'quality',     // 'quality' (better) | 'realtime' (faster)
+    bitrateMode = 'variable',    // 'variable' (VBR, better q@same kbps) | 'constant'
+  } = {}) {
     if (this.recording) return;
     if (!WebCodecsMp4Path.isSupported()) {
       throw new Error('WebCodecs not supported in this browser — use webm or run on Chrome/Firefox/Edge.');
@@ -110,18 +116,33 @@ export class WebCodecsMp4Path {
       error: (e) => console.error('VideoEncoder error:', e),
     });
 
-    // Try a couple of profiles in order of compatibility
+    // Order: prefer high-level/high-profile (better quality, supports 4K) and
+    // fall back to lower levels for browsers / hardware that reject the better
+    // configs.
     const candidates = [
-      'avc1.640028', // High @ 4.0
+      'avc1.640034', // High @ 5.2 — up to 4K60+ in spec
+      'avc1.640033', // High @ 5.1 — up to 4K30
+      'avc1.640028', // High @ 4.0 — 1080p60
+      'avc1.42E033', // Baseline @ 5.1
       'avc1.42E01F', // Baseline @ 3.1
       'avc1.42E01E', // Baseline @ 3.0
     ];
     let configured = false;
     for (const codec of candidates) {
-      const cfg = { codec, width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime' };
+      const cfg = { codec, width: w, height: h, bitrate, framerate: fps, latencyMode, bitrateMode };
       // eslint-disable-next-line no-await-in-loop
       const support = await VideoEncoder.isConfigSupported(cfg);
       if (support.supported) { this.encoder.configure(cfg); configured = true; break; }
+    }
+    // Some Chrome builds reject `bitrateMode: 'variable'` for certain configs;
+    // retry once with CBR before giving up.
+    if (!configured && bitrateMode !== 'constant') {
+      for (const codec of candidates) {
+        const cfg = { codec, width: w, height: h, bitrate, framerate: fps, latencyMode, bitrateMode: 'constant' };
+        // eslint-disable-next-line no-await-in-loop
+        const support = await VideoEncoder.isConfigSupported(cfg);
+        if (support.supported) { this.encoder.configure(cfg); configured = true; break; }
+      }
     }
     if (!configured) {
       this.encoder.close();

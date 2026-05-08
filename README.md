@@ -65,9 +65,11 @@ boil and creep across the frame.
 |               | mot→warp / mot→lfo / mot→flash | Webcam motion drives warp, LFO breathing, and flash       |
 |               | bass / mid / treble / motion graphs | Live monitors of the active signal(s)                |
 | Export        | format               | mp4 (h.264) / webm real-time / webm frame-locked / png sequence     |
+|               | quality              | preview (720p, fast) / standard (1080p) / high (1080p, 28 Mbps) / archival (4K, 60 Mbps). Caps the backing store + sets default bitrate + sets encoder latency mode. |
 |               | seconds              | Recording duration                                                  |
 |               | fps                  | Frame rate                                                          |
-|               | mp4 mbps             | Bitrate for mp4 export (12 Mbps default at 1080p is plenty)         |
+|               | mp4 mbps             | Bitrate slider — auto-set by quality preset, override anytime       |
+|               | replay intro         | When recording, reset effect time to t=0 so the intro is captured   |
 |               | record / stop        | Start/stop recording                                                |
 |               | save / load preset   | JSON download / upload                                              |
 
@@ -105,7 +107,21 @@ Four output formats, picked from the **Export → format** dropdown:
 | webm (frame-locked)  | `ccapture.js` (lazy-loaded)         | Slower; perfect frame timing.                      |
 | png sequence         | `ccapture.js` (lazy-loaded)         | One PNG per frame in a zip — for compositing.      |
 
-Default mp4 bitrate is 12 Mbps at 1080p; bump to 20–30 for archival quality.
+**Quality preset** (in the Export folder) bundles resolution-cap + bitrate +
+encoder mode into one choice:
+
+| preset    | max height | mp4 bitrate | webm bitrate | encoder mode    |
+| --------- | ---------- | ----------- | ------------ | --------------- |
+| preview   | 720p       | 6 Mbps      | 10 Mbps      | realtime, VBR   |
+| standard  | 1080p      | 14 Mbps     | 20 Mbps      | quality, VBR    |
+| **high**  | **1080p**  | **28 Mbps** | **40 Mbps**  | **quality, VBR** (default) |
+| archival  | 2160p (4K) | 60 Mbps     | 80 Mbps      | quality, VBR    |
+
+`latencyMode: 'quality'` makes the encoder use larger lookahead and do more work
+per frame — the visual difference vs. `'realtime'` is most noticeable on the
+high-frequency boil grain (cleaner, fewer artifacts at scene transitions).
+Since recording is frame-paced from the render loop, the encoder isn't time-
+pressured and `quality` mode is the right default.
 
 If you're on Safari and need mp4: record webm, then post-process:
 

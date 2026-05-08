@@ -21,12 +21,23 @@ const params = { ...PRESETS[DEFAULT_PRESET] };
 //   webm        -> MediaRecorder VP9 (real-time, all browsers)
 //   webm-locked -> ccapture.js (frame-locked webm)
 //   png         -> ccapture.js PNG sequence
+// Quality presets bundle (resolution-cap, bitrate, encoder mode) into one
+// choice. Picking a preset writes its values into exportSettings; the
+// individual fps / bitrate sliders still let you override.
+const QUALITY_PRESETS = {
+  preview:  { maxResHeight:  720, mp4Mbps:  6,  webmMbps: 10, latencyMode: 'realtime', bitrateMode: 'variable' },
+  standard: { maxResHeight: 1080, mp4Mbps: 14,  webmMbps: 20, latencyMode: 'quality',  bitrateMode: 'variable' },
+  high:     { maxResHeight: 1080, mp4Mbps: 28,  webmMbps: 40, latencyMode: 'quality',  bitrateMode: 'variable' },
+  archival: { maxResHeight: 2160, mp4Mbps: 60,  webmMbps: 80, latencyMode: 'quality',  bitrateMode: 'variable' },
+};
+
 const exportSettings = {
-  format: WebCodecsMp4Path.isSupported() ? 'mp4' : 'webm',
-  durationSeconds: 10,
-  fps: 60,
-  bitrateMbps: 12,            // mp4 only
-  replayIntroOnRecord: true,  // reset effect time to t=0 so the intro is captured
+  format:              WebCodecsMp4Path.isSupported() ? 'mp4' : 'webm',
+  quality:             'high',
+  durationSeconds:     10,
+  fps:                 60,
+  bitrateMbps:         QUALITY_PRESETS.high.mp4Mbps,
+  replayIntroOnRecord: true,
 };
 const sourceState = {
   preset: DEFAULT_PRESET,
@@ -189,8 +200,12 @@ function resize() {
     vh = video.videoHeight;
   }
 
-  // Cap backing store at 1920x1080 for export sanity / perf
-  const MAX_W = 1920, MAX_H = 1080;
+  // Cap backing-store HEIGHT to the active quality preset (preview=720,
+  // standard/high=1080, archival=2160). Width follows source AR. This is
+  // both the rendered viewport AND the export resolution — bumping
+  // quality means more pixels everywhere.
+  const MAX_H = QUALITY_PRESETS[exportSettings.quality]?.maxResHeight ?? 1080;
+  const MAX_W = Math.round(MAX_H * 16 / 9 + 0.5); // generous ceiling for ultrawide; AR-respect below
   const sc = Math.min(MAX_W / vw, MAX_H / vh, 1);
   const bw = Math.round(vw * sc);
   const bh = Math.round(vh * sc);
@@ -579,9 +594,27 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
     value: exportSettings.format,
   }).on('change', (ev) => { exportSettings.format = ev.value; });
 
+  f.addBlade({
+    view: 'list',
+    label: 'quality',
+    options: [
+      { text: 'preview  (720p, fast)',          value: 'preview'  },
+      { text: 'standard (1080p)',               value: 'standard' },
+      { text: 'high     (1080p, max bitrate)',  value: 'high'     },
+      { text: 'archival (4K, max bitrate)',     value: 'archival' },
+    ],
+    value: exportSettings.quality,
+  }).on('change', (ev) => {
+    exportSettings.quality = ev.value;
+    const p = QUALITY_PRESETS[ev.value];
+    exportSettings.bitrateMbps = p.mp4Mbps; // sync slider to preset
+    pane.refresh();
+    resize();                                // re-cap backing store
+  });
+
   f.addBinding(exportSettings, 'durationSeconds',     { label: 'seconds',  min: 1, max: 120, step: 1 });
   f.addBinding(exportSettings, 'fps',                 { label: 'fps',      min: 24, max: 60, step: 1 });
-  f.addBinding(exportSettings, 'bitrateMbps',         { label: 'mp4 mbps', min: 2,  max: 40, step: 1 });
+  f.addBinding(exportSettings, 'bitrateMbps',         { label: 'mp4 mbps', min: 2,  max: 80, step: 1 });
   f.addBinding(exportSettings, 'replayIntroOnRecord', { label: 'replay intro' });
 
   const recBtn = f.addButton({ title: '● record' });
@@ -602,18 +635,25 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
         frameCount = 0;
       }
 
+      const q = QUALITY_PRESETS[exportSettings.quality];
+
       try {
         if (fmt === 'mp4') {
           if (!WebCodecsMp4Path.isSupported()) {
             console.warn('WebCodecs unsupported in this browser. Falling back to webm.');
-            mediaPath.start(opts);
+            mediaPath.start({ ...opts, bitrate: q.webmMbps * 1_000_000 });
             recordingPath = mediaPath;
           } else {
-            await mp4Path.start({ ...opts, bitrate: exportSettings.bitrateMbps * 1_000_000 });
+            await mp4Path.start({
+              ...opts,
+              bitrate: exportSettings.bitrateMbps * 1_000_000,
+              latencyMode: q.latencyMode,
+              bitrateMode: q.bitrateMode,
+            });
             recordingPath = mp4Path;
           }
         } else if (fmt === 'webm') {
-          mediaPath.start(opts);
+          mediaPath.start({ ...opts, bitrate: q.webmMbps * 1_000_000 });
           recordingPath = mediaPath;
         } else if (fmt === 'webm-locked') {
           await ccapPath.start({ ...opts, format: 'webm' });
