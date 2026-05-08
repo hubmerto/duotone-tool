@@ -23,9 +23,10 @@ const params = { ...PRESETS[DEFAULT_PRESET] };
 //   png         -> ccapture.js PNG sequence
 const exportSettings = {
   format: WebCodecsMp4Path.isSupported() ? 'mp4' : 'webm',
-  durationSeconds: 6,
+  durationSeconds: 10,
   fps: 60,
-  bitrateMbps: 12,         // mp4 only
+  bitrateMbps: 12,            // mp4 only
+  replayIntroOnRecord: true,  // reset effect time to t=0 so the intro is captured
 };
 const sourceState = {
   preset: DEFAULT_PRESET,
@@ -578,9 +579,10 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
     value: exportSettings.format,
   }).on('change', (ev) => { exportSettings.format = ev.value; });
 
-  f.addBinding(exportSettings, 'durationSeconds', { label: 'seconds', min: 1, max: 120, step: 1 });
-  f.addBinding(exportSettings, 'fps',             { label: 'fps',     min: 24, max: 60, step: 1 });
-  f.addBinding(exportSettings, 'bitrateMbps',     { label: 'mp4 mbps', min: 2, max: 40, step: 1 });
+  f.addBinding(exportSettings, 'durationSeconds',     { label: 'seconds',  min: 1, max: 120, step: 1 });
+  f.addBinding(exportSettings, 'fps',                 { label: 'fps',      min: 24, max: 60, step: 1 });
+  f.addBinding(exportSettings, 'bitrateMbps',         { label: 'mp4 mbps', min: 2,  max: 40, step: 1 });
+  f.addBinding(exportSettings, 'replayIntroOnRecord', { label: 'replay intro' });
 
   const recBtn = f.addButton({ title: '● record' });
   let isRecording = false;
@@ -593,6 +595,12 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
         fps: exportSettings.fps,
         durationSeconds: exportSettings.durationSeconds,
       };
+
+      // reset effect time so the intro ramp is captured at the start of the file
+      if (exportSettings.replayIntroOnRecord) {
+        effectStart = performance.now();
+        frameCount = 0;
+      }
 
       try {
         if (fmt === 'mp4') {
