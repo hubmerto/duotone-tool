@@ -49,6 +49,7 @@ boil and creep across the frame.
 | Slow Field    | scale                | Domain frequency of the slow ink-blob field (higher = smaller blobs) |
 |               | speed                | Drift speed                                                         |
 |               | amp                  | How strongly the slow field warps the threshold                     |
+|               | warp                 | UV displacement by the same field — drives the morphism / ripple feel. Tiny values (0.01–0.03) go a long way; high values dissolve detail. |
 | Boil          | scale                | Domain frequency of the fast grain (higher = finer)                 |
 |               | speed                | 0 = static, 1 = full per-frame reseed                               |
 |               | amp                  | How strongly the boil warps the threshold                           |

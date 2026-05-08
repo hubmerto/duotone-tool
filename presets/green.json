@@ -6,11 +6,12 @@
   "thresholdLFOFreq": 0.18,
   "introDuration": 1.2,
   "introCurve": 1,
-  "slowNoiseScale": 4.0,
-  "slowNoiseSpeed": 0.12,
-  "slowAmp": 0.25,
+  "slowNoiseScale": 3.5,
+  "slowNoiseSpeed": 0.10,
+  "slowAmp": 0.32,
+  "warpAmp": 0.018,
   "ditherScale": 600.0,
-  "ditherSpeed": 0.6,
-  "ditherAmp": 0.10,
+  "ditherSpeed": 0.55,
+  "ditherAmp": 0.07,
   "softness": 0.015
 }

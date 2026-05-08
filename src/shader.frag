@@ -2,8 +2,13 @@
 // =============================================================================
 // 1-bit duotone with animated "boiling threshold". Single-pass.
 //
-// Recipe (matches build spec, step-by-step):
-//   1. luma  = Rec.709 weights on video sample
+// Recipe (matches build spec + UV-morph extension):
+//   0. warp  = same fbm field, sampled twice at decorrelated offsets, used as
+//              a 2D displacement on the UV before sampling. This is what makes
+//              the *image content* ripple/morph coherently with the ink, not
+//              just the threshold edge. The "morphism" of the boiling-threshold
+//              look comes mostly from this step.
+//   1. luma  = Rec.709 on video sample at warped UV
 //   2. slow  = domain-warped fbm — the "ink-blob" field that drifts slowly
 //   3. fast  = blue-noise dither + golden-ratio time offset — the "boil"
 //   4. lfo   = sin breathing on the threshold center
@@ -42,6 +47,7 @@ uniform int   u_introCurve;       // 0=linear, 1=easeOut, 2=easeInOut
 uniform float u_slowNoiseScale;
 uniform float u_slowNoiseSpeed;
 uniform float u_slowAmp;
+uniform float u_warpAmp;          // UV displacement — the morphism knob
 
 // fast grain / boil
 uniform float u_ditherScale;
@@ -103,13 +109,23 @@ float ease(float t, int curve) {
 void main() {
     vec2 uv = v_uv;
 
-    // 1. luma — Rec.709
-    vec3 src = texture(u_video, uv).rgb;
-    float luma = dot(src, vec3(0.2126, 0.7152, 0.0722));
-
-    // 2. slow ink-blob field — iq-style domain warping
+    // 2. slow ink-blob field — iq-style domain warping (computed first so we
+    //    can also use it for UV displacement)
     vec2 p = uv * u_slowNoiseScale + u_time * u_slowNoiseSpeed;
     float slowField = fbm(p + fbm(p + fbm(p))); // already roughly centered
+
+    // 0. UV warp — sample the same field twice at decorrelated offsets to get
+    //    a 2D displacement vector. The image content morphs along with the
+    //    ink-blob field; this is what gives the "morphism" feel.
+    vec2 warpVec = vec2(
+        fbm(p + vec2(0.00, 0.00)),
+        fbm(p + vec2(5.20, 1.30))
+    ) * u_warpAmp;
+    vec2 warpedUV = uv + warpVec;
+
+    // 1. luma — Rec.709, sampled from the warped UV
+    vec3 src = texture(u_video, warpedUV).rgb;
+    float luma = dot(src, vec3(0.2126, 0.7152, 0.0722));
 
     // 3. fast boil — golden-ratio time offset reseeds dither without strobing
     //    (Xor's trick: phi-spaced offsets are maximally low-discrepancy)

@@ -127,7 +127,7 @@ for (const name of [
   'u_video','u_resolution','u_time','u_frame','u_spotColor',
   'u_thresholdBase','u_thresholdLFOAmp','u_thresholdLFOFreq',
   'u_introDuration','u_introCurve',
-  'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp',
+  'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp','u_warpAmp',
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
 ]) U[name] = gl.getUniformLocation(program, name);
@@ -199,7 +199,9 @@ function loadVideoFromUrl(url) {
 // -----------------------------------------------------------------------------
 // localStorage — last preset + UI state (no video data)
 // -----------------------------------------------------------------------------
-const LS_KEY = 'duotone:lastState:v1';
+// bumped to v2 when warpAmp was added — invalidates v1 saves so the new
+// default tuning (with warp + lower boil) is picked up on first reload.
+const LS_KEY = 'duotone:lastState:v2';
 
 function saveStateToLocalStorage() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
@@ -261,6 +263,7 @@ function frameTick() {
   gl.uniform1f(U.u_slowNoiseScale, params.slowNoiseScale);
   gl.uniform1f(U.u_slowNoiseSpeed, params.slowNoiseSpeed);
   gl.uniform1f(U.u_slowAmp,        params.slowAmp);
+  gl.uniform1f(U.u_warpAmp,        params.warpAmp ?? 0.0);
 
   gl.uniform1f(U.u_ditherScale, params.ditherScale);
   gl.uniform1f(U.u_ditherSpeed, params.ditherSpeed);
@@ -346,9 +349,11 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // --- Slow Field ---
 {
   const f = pane.addFolder({ title: 'Slow Field', expanded: false });
-  f.addBinding(params, 'slowNoiseScale', { label: 'scale',  min: 0.5, max: 12,  step: 0.1  });
-  f.addBinding(params, 'slowNoiseSpeed', { label: 'speed',  min: 0,   max: 1,   step: 0.005 });
-  f.addBinding(params, 'slowAmp',        { label: 'amp',    min: 0,   max: 0.6, step: 0.005 });
+  f.addBinding(params, 'slowNoiseScale', { label: 'scale',  min: 0.5, max: 12,   step: 0.1   });
+  f.addBinding(params, 'slowNoiseSpeed', { label: 'speed',  min: 0,   max: 1,    step: 0.005 });
+  f.addBinding(params, 'slowAmp',        { label: 'amp',    min: 0,   max: 0.6,  step: 0.005 });
+  // morphism knob — UV warp by the same field; tiny values go a long way
+  f.addBinding(params, 'warpAmp',        { label: 'warp',   min: 0,   max: 0.06, step: 0.001 });
 }
 
 // --- Boil ---

@@ -12,12 +12,15 @@ const SHARED = {
   thresholdLFOFreq: 0.18,
   introDuration: 1.2,
   introCurve: 1, // easeOutCubic
-  slowNoiseScale: 4.0,
-  slowNoiseSpeed: 0.12,
-  slowAmp: 0.25,
+  // slow ink-blob field — main "morphism" driver
+  slowNoiseScale: 3.5,
+  slowNoiseSpeed: 0.10,
+  slowAmp: 0.32,    // bumped from 0.25 — bigger threshold push = bigger blobs
+  warpAmp: 0.018,   // NEW: UV displacement; tiny values morph the image content
+  // fast boil — kept lighter so it doesn't drown the morphism
   ditherScale: 600.0,
-  ditherSpeed: 0.6,
-  ditherAmp: 0.10,
+  ditherSpeed: 0.55,
+  ditherAmp: 0.07,  // was 0.10 — let the morph breathe
   softness: 0.015,
 };
 
