@@ -76,16 +76,11 @@ uniform float u_softness;
 // Sample the video at two time positions and blend in luma:
 //   A: current frame (live, from u_video)
 //   B: a frame N back, from the ring buffer at u_offsetLayer
-// Modes:
-//   0 static  — constant mix at u_temporalMixAmount
-//   1 pulsing — mixAmount oscillates at u_temporalPulseFreq Hz
-//   2 ramped  — mixAmount triangle-envelopes over u_introDuration
-// At mixAmount=0 the shader bypasses the buffer entirely (true no-op).
-uniform int   u_offsetLayer;          // JS-resolved layer index for the past frame
-uniform float u_temporalMixAmount;    // base mix 0..1
-uniform int   u_temporalMode;         // 0=static, 1=pulsing, 2=ramped
-uniform float u_temporalPulseFreq;    // Hz
-uniform float u_temporalPulseAmp;     // 0..1, depth of pulse modulation
+// All mode logic + phase-lock + speed coupling is computed in JS so the
+// shader stays simple. JS sends one effective scalar per frame.
+uniform int   u_offsetLayer;             // JS-resolved layer index for the past frame
+uniform float u_temporalEffectiveMix;    // 0..1, JS already applied mode + phase lock
+uniform int   u_temporalShowBufferOnly;  // debug: 1 = output offset luma alone
 
 // ============================================================================
 // helpers
@@ -150,34 +145,20 @@ float sampleMixedLuma(vec2 uv) {
     vec3 cur = texture(u_video, uv).rgb;
     float lumaCur = dot(cur, vec3(0.2126, 0.7152, 0.0722));
 
-    if (u_temporalMixAmount < 0.001) {
-        return lumaCur;  // true bypass — no buffer read
+    // Show-buffer-only debug: emit just the offset frame's luma
+    if (u_temporalShowBufferOnly == 1) {
+        vec3 dbg = texture(u_buffer, vec3(uv, float(u_offsetLayer))).rgb;
+        return dot(dbg, vec3(0.2126, 0.7152, 0.0722));
     }
 
-    // Effective mix per mode
-    float effectiveMix;
-    if (u_temporalMode == 0) {
-        // Static: constant blend
-        effectiveMix = u_temporalMixAmount;
-    } else if (u_temporalMode == 1) {
-        // Pulsing: cycles through 0..mixAmount at pulseFreq Hz
-        // pulseAmp = 1 → full 0..mixAmount range, pulseAmp = 0 → constant
-        float pulse = 0.5 + 0.5 * sin(6.28318530718 * u_temporalPulseFreq * u_time);
-        effectiveMix = u_temporalMixAmount * (pulse * u_temporalPulseAmp + (1.0 - u_temporalPulseAmp));
-    } else {
-        // Ramped: triangle envelope over introDuration
-        // 0 → mixAmount → 0 across the intro window, then settles at 0
-        float t = clamp(u_time / max(u_introDuration, 1e-4), 0.0, 1.0);
-        float env = 1.0 - abs(2.0 * t - 1.0);
-        effectiveMix = u_temporalMixAmount * env;
+    // True bypass — JS sends 0 when mode=off or amount=0
+    if (u_temporalEffectiveMix < 0.001) {
+        return lumaCur;
     }
-
-    if (effectiveMix < 0.001) return lumaCur;
 
     vec3 off = texture(u_buffer, vec3(uv, float(u_offsetLayer))).rgb;
     float lumaOff = dot(off, vec3(0.2126, 0.7152, 0.0722));
-
-    return mix(lumaCur, lumaOff, clamp(effectiveMix, 0.0, 1.0));
+    return mix(lumaCur, lumaOff, clamp(u_temporalEffectiveMix, 0.0, 1.0));
 }
 
 // ============================================================================

@@ -1,10 +1,7 @@
 // Preset definitions. The three "reference" presets target the orange / green /
 // blue webp clips — same recipe across all three, only spotColor differs. The
-// "bare" presets (green / orange / blue) leave temporal mix off for a cleaner
-// boiling-threshold-only look.
-//
-// JSON shape: a plain object of param values, mirrors the `params` object in
-// main.js exactly. applyPreset() copies whichever keys are present.
+// "bare" presets (green / orange / blue) leave temporal mix off and run at
+// normal speed for a cleaner threshold-only look.
 
 const SHARED = {
   thresholdBase: 0.50,
@@ -35,53 +32,63 @@ const SHARED = {
   ditherAmp: 0.07,
   softness: 0.015,
 
-  // playback
-  playbackSpeed: 1.0,
+  // -- Speed Staging (Module 2) --
+  speedMode: 0,            // 0=static, 1=cycle (sin), 2=step (random hold)
+  staticSpeed: 1.0,
+  slowSpeed: 0.35,
+  fastSpeed: 1.0,
+  speedCycleFreq: 0.18,    // Hz, cycle mode only
+  stepIntervalMin: 1.5,    // s
+  stepIntervalMax: 4.0,    // s
+  speedSmoothing: 0.85,    // 0=instant, 1=very slow ease
+  speedSeed: 1,
 
-  // temporal mix — off by default
-  temporalMixAmount:    0.0,
-  temporalOffsetFrames: 18,
-  temporalMode:         0,    // 0=static, 1=pulsing, 2=ramped
-  temporalPulseFreq:    0.22, // Hz
-  temporalPulseAmp:     0.85,
+  // -- Temporal Mix (Module 1) --
+  temporalMode: 0,         // 0=off, 1=static, 2=pulsing
+  temporalMixAmount: 0.0,
+  temporalOffsetFrames: 22,
+  temporalPulseFreq: 0.22, // Hz, pulsing mode only (overridden by phase lock)
+  temporalPulseAmp: 0.85,
+  phaseLockToSpeed: false, // ties pulse to speed phase (Module 3)
+  temporalShowBufferOnly: false, // debug
 };
 
-// --------- "bare" presets (no temporal mix, tuned threshold-only) ---------
-const BARE = {
-  ...SHARED,
-};
+// "Bare" preset values — clean threshold-only effect, no temporal mix
+const BARE = { ...SHARED };
 
-// --------- reference presets (mid-cycle pulsing temporal mix, slow-mo) -----
-// Tuned by ear/eye against the orange webp clip. Same recipe across green /
-// orange / blue — only spotColor swaps.
+// "Reference" preset values — matches the spec's test protocol:
+// cycle speed + pulsing temporal mix + phase lock = the morphism rhythm
 const REFERENCE = {
   ...SHARED,
-  // Source — slow-mo, this is the largest perceptual lever
-  playbackSpeed: 0.45,
-  // Threshold — softer LFO than the bare preset (the source already moves slowly)
-  thresholdBase: 0.50,
+
+  // Threshold — softer LFO than bare since the source already moves slowly
   thresholdLFOAmp: 0.04,
   thresholdLFOFreq: 0.15,
-  // Intro — develop-in
-  introMode: 0,
-  introDuration: 1.2,
-  introCurve: 1,
+
   // Slow field — slightly bigger blobs, calmer drift
   slowNoiseScale: 4.0,
-  slowNoiseSpeed: 0.10,
   slowAmp: 0.22,
-  // Boil — finer + a touch more amp than bare
+
+  // Boil — finer + more amp
   ditherScale: 750.0,
-  ditherSpeed: 0.55,
   ditherAmp: 0.10,
-  // Edge — slightly sharper
+
+  // Edge — sharper
   softness: 0.012,
-  // Temporal Mix — pulsing ghost trail; this is the "morphing humans" piece
-  temporalMode:         1,     // pulsing
-  temporalMixAmount:    0.45,
-  temporalOffsetFrames: 18,
-  temporalPulseFreq:    0.22,  // ~1 cycle per 4.5s
-  temporalPulseAmp:     0.85,
+
+  // Speed Staging — cycle mode oscillates between slow-mo and normal
+  speedMode: 1,
+  slowSpeed: 0.35,
+  fastSpeed: 1.0,
+  speedCycleFreq: 0.18,
+  speedSmoothing: 0.85,
+
+  // Temporal Mix — pulsing ghost, phase-locked to speed
+  temporalMode: 2,
+  temporalMixAmount: 0.55,
+  temporalOffsetFrames: 22,
+  temporalPulseAmp: 0.9,
+  phaseLockToSpeed: true,
 };
 
 export const PRESETS = {
@@ -90,7 +97,7 @@ export const PRESETS = {
   orange: { name: 'orange', spotColor: '#FF4500', ...BARE },
   blue:   { name: 'blue',   spotColor: '#0066FF', ...BARE },
 
-  // reference (full stack: slow-mo + temporal mix + threshold)
+  // reference (full stack: speed cycle + pulsing temporal mix + phase lock)
   'orange-reference': { name: 'orange-reference', spotColor: '#E84510', ...REFERENCE },
   'green-reference':  { name: 'green-reference',  spotColor: '#9FFF00', ...REFERENCE },
   'blue-reference':   { name: 'blue-reference',   spotColor: '#0066FF', ...REFERENCE },
@@ -111,8 +118,8 @@ export const PRESETS = {
   },
 };
 
-// First-load default — the orange reference preset is what the spec wants
-// users to see immediately when they land on the tool with no saved state.
+// First-load default — orange-reference is the "what was actually wanted"
+// look (spec section: "Make these the defaults").
 export const DEFAULT_PRESET = 'orange-reference';
 
 // ---- helpers ---------------------------------------------------------------

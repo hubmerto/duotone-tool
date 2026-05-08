@@ -201,9 +201,15 @@ gl.activeTexture(gl.TEXTURE0); // restore default unit
 let bufferWriteIndex   = 0;
 let imageBufferFilled  = false;  // for static images: write to all layers once
 
-// (Temporal Mix is stateless from JS's side — the shader computes the blend
-// per frame from u_time + the user params. JS only resolves the offsetLayer
-// based on the current bufferWriteIndex and offsetFrames slider.)
+// rVFC fires once per real video frame (vs rAF which fires per display frame).
+// Using rVFC means the offset slider counts in *video* frames, which is what
+// the user thinks about. Older Firefox (<113) lacks it — fall back to rAF.
+const HAS_RVFC = typeof HTMLVideoElement !== 'undefined'
+              && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+// Speed state machine — slow/fast staging with smoothed transitions
+let _currentSpeed = 1.0;
+let lastFrameMs   = performance.now();
 
 // uniforms
 const U = {};
@@ -217,7 +223,7 @@ for (const name of [
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
   'u_bufferSize','u_bufferWriteIndex','u_offsetLayer',
-  'u_temporalMixAmount','u_temporalMode','u_temporalPulseFreq','u_temporalPulseAmp',
+  'u_temporalEffectiveMix','u_temporalShowBufferOnly',
 ]) U[name] = gl.getUniformLocation(program, name);
 
 // -----------------------------------------------------------------------------
@@ -288,6 +294,8 @@ function loadVideoFromFile(file) {
   currentSource = 'video';
   effectStart = performance.now();
   frameCount = 0;
+  bufferWriteIndex = 0;       // fresh buffer per clip
+  imageBufferFilled = false;  // image buffer state irrelevant now
 }
 
 function loadVideoFromUrl(url) {
@@ -297,6 +305,8 @@ function loadVideoFromUrl(url) {
   currentSource = 'video';
   effectStart = performance.now();
   frameCount = 0;
+  bufferWriteIndex = 0;
+  imageBufferFilled = false;
 }
 
 async function loadImageFromFile(file) {
@@ -326,9 +336,9 @@ async function loadImageFromFile(file) {
 // -----------------------------------------------------------------------------
 // localStorage — last preset + UI state (no video data)
 // -----------------------------------------------------------------------------
-// v4: replaced dual-playhead with the temporal-mix luma-blend module +
-// added playbackSpeed. Old keys (dp*, morphT, etc.) no longer drive anything.
-const LS_KEY = 'duotone:lastState:v4';
+// v5: added Speed Staging state machine (replacing single playbackSpeed) and
+// Phase Lock toggle. Old playbackSpeed key is dead.
+const LS_KEY = 'duotone:lastState:v5';
 
 function saveStateToLocalStorage() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
@@ -430,36 +440,31 @@ function frameTick() {
     resize();
   }
 
-  // ----- ring buffer write (only when temporal mix is active) ---------------
-  // Buffer wrap modulus auto-sizes from max useful offset + safety. The
-  // texture is allocated at TEMPORAL_SIZE_MAX once; we change the active modulus.
+  // ----- ring buffer write -----------------------------------------------------
+  // Video: buffer writes happen via rVFC (or rAF fallback) outside this loop —
+  // see onVideoFrame() below. This guarantees one buffer slot per *real* video
+  // frame, so offset N is in video frames not display frames.
+  // Image: one-time fill on load.
   const bufferDepth = Math.min(
     TEMPORAL_SIZE_MAX,
     Math.max(32, Math.ceil((params.temporalOffsetFrames ?? 18) + 16))
   );
-
-  if ((params.temporalMixAmount ?? 0) > 0.001) {
-    if (currentSource === 'video' && video.readyState >= 2 && video.videoWidth > 0) {
-      tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, bufferWriteIndex,
+  if (currentSource === 'image' && imageEl.naturalWidth > 0 && !imageBufferFilled
+      && (((params.temporalMode | 0) > 0) || (params.temporalShowBufferOnly ? 1 : 0))) {
+    tempCtx.drawImage(imageEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    for (let i = 0; i < TEMPORAL_SIZE_MAX; i++) {
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i,
                        TEMPORAL_W, TEMPORAL_H, 1,
                        gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
-      bufferWriteIndex = (bufferWriteIndex + 1) % bufferDepth;
-    } else if (currentSource === 'image' && imageEl.naturalWidth > 0 && !imageBufferFilled) {
-      tempCtx.drawImage(imageEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      for (let i = 0; i < TEMPORAL_SIZE_MAX; i++) {
-        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i,
-                         TEMPORAL_W, TEMPORAL_H, 1,
-                         gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
-      }
-      imageBufferFilled = true;
     }
+    imageBufferFilled = true;
+  }
+  // rAF fallback for browsers without rVFC (older Firefox before 113)
+  if (!HAS_RVFC && currentSource === 'video') {
+    onVideoFrameWrite();
   }
 
   // ----- offsetLayer for the temporal mix --------------------------------------
@@ -467,17 +472,21 @@ function frameTick() {
   const offsetFrames = Math.max(1, Math.round(params.temporalOffsetFrames ?? 18));
   const offsetLayer = ((liveLayer - offsetFrames) % bufferDepth + bufferDepth) % bufferDepth;
 
-  // ----- playback speed -> video.playbackRate ---------------------------------
-  if (currentSource === 'video' && video.duration > 0) {
-    const target = Math.max(0.1, Math.min(2.0, params.playbackSpeed ?? 1.0));
-    if (Math.abs(video.playbackRate - target) > 0.005) video.playbackRate = target;
-  }
+  // ----- effect time + delta --------------------------------------------------
+  const t  = (performance.now() - effectStart) / 1000;
+  const dt = Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
+  lastFrameMs = performance.now();
+
+  // ----- speed state machine -> video.playbackRate ----------------------------
+  const currentSpeed = updateSpeed(t, dt);
+
+  // ----- effective temporal mix (mode + pulse + phase lock) -------------------
+  const effectiveMix = computeTemporalEffectiveMix(t, currentSpeed);
 
   // ----- draw -----------------------------------------------------------------
   gl.useProgram(program);
   gl.bindVertexArray(vao);
 
-  const t = (performance.now() - effectStart) / 1000;
   const c = hexToRgb(params.spotColor);
   const lp = computeLiveParams();   // base params + modulation offsets
 
@@ -523,13 +532,11 @@ function frameTick() {
   gl.uniform1f(U.u_softness, lp.softness);
 
   // temporal mix
-  gl.uniform1i(U.u_bufferSize,        bufferDepth);
-  gl.uniform1i(U.u_bufferWriteIndex,  bufferWriteIndex);
-  gl.uniform1i(U.u_offsetLayer,       offsetLayer);
-  gl.uniform1f(U.u_temporalMixAmount, lp.temporalMixAmount ?? 0);
-  gl.uniform1i(U.u_temporalMode,      lp.temporalMode | 0);
-  gl.uniform1f(U.u_temporalPulseFreq, lp.temporalPulseFreq ?? 0.2);
-  gl.uniform1f(U.u_temporalPulseAmp,  lp.temporalPulseAmp ?? 0.85);
+  gl.uniform1i(U.u_bufferSize,             bufferDepth);
+  gl.uniform1i(U.u_bufferWriteIndex,       bufferWriteIndex);
+  gl.uniform1i(U.u_offsetLayer,            offsetLayer);
+  gl.uniform1f(U.u_temporalEffectiveMix,   effectiveMix);
+  gl.uniform1i(U.u_temporalShowBufferOnly, params.temporalShowBufferOnly ? 1 : 0);
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -539,8 +546,107 @@ function frameTick() {
   requestAnimationFrame(frameTick);
 }
 
-// (Temporal mix has no JS-side state machine — the shader resolves the blend
-// from u_time + user params each frame. JS just resolves offsetLayer.)
+// =============================================================================
+// Temporal-mix helpers
+// =============================================================================
+
+// Single buffer-write step. Called from rVFC on real video-frame boundaries
+// (or from the rAF loop as fallback if rVFC is unavailable).
+function onVideoFrameWrite() {
+  if (currentSource !== 'video') return;
+  if (!(video.readyState >= 2 && video.videoWidth > 0)) return;
+  const active = (params.temporalMode | 0) > 0 || (params.temporalShowBufferOnly === true);
+  if (!active) return;
+
+  tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, bufferWriteIndex,
+                   TEMPORAL_W, TEMPORAL_H, 1,
+                   gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
+  const depth = Math.min(
+    TEMPORAL_SIZE_MAX,
+    Math.max(32, Math.ceil((params.temporalOffsetFrames ?? 18) + 16))
+  );
+  bufferWriteIndex = (bufferWriteIndex + 1) % depth;
+}
+
+function videoFrameCallback() {
+  onVideoFrameWrite();
+  if (HAS_RVFC) video.requestVideoFrameCallback(videoFrameCallback);
+}
+
+// Speed Staging — three modes. Returns the smoothed currentSpeed.
+function updateSpeed(t, dt) {
+  const mode = params.speedMode | 0;
+  let target;
+
+  if (mode === 0) {
+    target = params.staticSpeed ?? 1.0;
+  } else if (mode === 1) {
+    // cycle (sin) between slow ↔ fast at speedCycleFreq Hz
+    const phase = 0.5 + 0.5 * Math.sin(2 * Math.PI * (params.speedCycleFreq ?? 0.18) * t);
+    target = (params.slowSpeed ?? 0.35) + ((params.fastSpeed ?? 1.0) - (params.slowSpeed ?? 0.35)) * phase;
+  } else {
+    // step (random hold) — deterministic by hashed bucket, alternates slow/fast
+    const minIv = Math.max(0.1, params.stepIntervalMin ?? 1.5);
+    const maxIv = Math.max(minIv, params.stepIntervalMax ?? 4.0);
+    const stepBucket = Math.floor(t / minIv);
+    const r = hash01(stepBucket + (params.speedSeed ?? 1));
+    const intervalLen = minIv + (maxIv - minIv) * r;
+    const stepIdx = Math.floor(t / Math.max(0.01, intervalLen));
+    target = (stepIdx % 2 === 0) ? (params.slowSpeed ?? 0.35) : (params.fastSpeed ?? 1.0);
+  }
+
+  // Smoothing — params.speedSmoothing ∈ [0..1], 1 = very slow ease, 0 = instant
+  const sm = Math.min(0.999, Math.max(0, params.speedSmoothing ?? 0.85));
+  const k  = 1 - Math.pow(sm, dt * 60);
+  _currentSpeed += (target - _currentSpeed) * k;
+
+  if (currentSource === 'video' && video.duration > 0) {
+    const clamped = Math.max(0.1, Math.min(2.0, _currentSpeed));
+    if (Math.abs(video.playbackRate - clamped) > 0.005) video.playbackRate = clamped;
+  }
+  return _currentSpeed;
+}
+
+// Hash for step-mode pseudo-random hold lengths
+function hash01(x) {
+  const s = Math.sin(x * 12.9898) * 43758.5453;
+  return s - Math.floor(s);
+}
+
+// Compute the effective temporal-mix blend strength for this frame,
+// applying mode + pulse + phase lock. Returns 0 to fully bypass.
+function computeTemporalEffectiveMix(t, currentSpeed) {
+  const mode = params.temporalMode | 0;
+  if (mode === 0) return 0;
+  const mix = params.temporalMixAmount ?? 0;
+  if (mix < 0.001) return 0;
+
+  if (mode === 1) {
+    // static
+    return mix;
+  }
+
+  // mode === 2: pulsing
+  const amp = Math.max(0, Math.min(1, params.temporalPulseAmp ?? 0.85));
+  let pulse;
+
+  if (params.phaseLockToSpeed) {
+    // Drive the pulse from the speed phase instead of pulseFreq.
+    // slow → ghost peak (1.0). fast → ghost trough (0.0).
+    const slow = params.slowSpeed ?? 0.35;
+    const fast = params.fastSpeed ?? 1.0;
+    const range = fast - slow;
+    const norm  = range > 0 ? (currentSpeed - slow) / range : 0.5;
+    pulse = 1 - Math.max(0, Math.min(1, norm));
+  } else {
+    pulse = 0.5 + 0.5 * Math.sin(2 * Math.PI * (params.temporalPulseFreq ?? 0.22) * t);
+  }
+  return mix * ((1 - amp) + amp * pulse);
+}
 
 // -----------------------------------------------------------------------------
 // Tweakpane UI
@@ -553,6 +659,7 @@ let updateIntroVis = () => {};
 let updateTempVis  = () => {};
 
 // --- Source ---
+let updateSpeedVis = () => {};
 {
   const f = pane.addFolder({ title: 'Source', expanded: true });
   f.addButton({ title: 'Pick file… (video / image)' }).on('click', () => mediaPicker.click());
@@ -561,9 +668,39 @@ let updateTempVis  = () => {};
     if (ev.value) video.play(); else video.pause();
   });
   f.addBinding(sourceState, 'loop').on('change', (ev) => { video.loop = ev.value; });
-  // playbackSpeed wires to video.playbackRate in the render loop. Slow-mo at
-  // ~0.4x is the single biggest perceptual lever on the "morphing humans" feel.
-  f.addBinding(params, 'playbackSpeed', { label: 'speed', min: 0.1, max: 2.0, step: 0.05 });
+
+  // Speed Staging — three modes (static / cycle / step). updateSpeed() in the
+  // render loop turns these into video.playbackRate with smoothing.
+  f.addBlade({
+    view: 'list',
+    label: 'speed mode',
+    options: [
+      { text: 'static',          value: 0 },
+      { text: 'cycle (sin)',     value: 1 },
+      { text: 'step (random)',   value: 2 },
+    ],
+    value: params.speedMode | 0,
+  }).on('change', (ev) => { params.speedMode = ev.value | 0; updateSpeedVis(); });
+
+  const bStat   = f.addBinding(params, 'staticSpeed',     { label: 'static speed', min: 0.1, max: 2.0, step: 0.05 });
+  const bSlow   = f.addBinding(params, 'slowSpeed',       { label: 'slow value',   min: 0.1, max: 1.0, step: 0.05 });
+  const bFast   = f.addBinding(params, 'fastSpeed',       { label: 'fast value',   min: 0.5, max: 2.0, step: 0.05 });
+  const bCycle  = f.addBinding(params, 'speedCycleFreq',  { label: 'cycle freq',   min: 0.05, max: 0.5, step: 0.01 });
+  const bStMin  = f.addBinding(params, 'stepIntervalMin', { label: 'step min (s)', min: 0.5,  max: 5.0, step: 0.1 });
+  const bStMax  = f.addBinding(params, 'stepIntervalMax', { label: 'step max (s)', min: 0.5,  max: 8.0, step: 0.1 });
+  const bSm     = f.addBinding(params, 'speedSmoothing',  { label: 'smoothing',    min: 0,    max: 0.99, step: 0.01 });
+
+  updateSpeedVis = function () {
+    const m = params.speedMode | 0;
+    bStat.hidden  = m !== 0;
+    bSlow.hidden  = m === 0;
+    bFast.hidden  = m === 0;
+    bCycle.hidden = m !== 1;
+    bStMin.hidden = m !== 2;
+    bStMax.hidden = m !== 2;
+    bSm.hidden    = false;  // smoothing useful in all modes
+  };
+  updateSpeedVis();
 }
 
 // --- Color ---
@@ -591,6 +728,7 @@ let updateTempVis  = () => {};
       applyPreset(params, PRESETS[ev.value]);
       pane.refresh();
       updateIntroVis();
+      updateSpeedVis();
       updateTempVis();
       // restart intro on preset change so spatial wavefronts re-play
       effectStart = performance.now();
@@ -657,6 +795,7 @@ let updateTempVis  = () => {};
     bTurb.hidden    = !spatial;
   };
   updateIntroVis();
+      updateSpeedVis();
 
   f.addButton({ title: 'Replay intro' }).on('click', () => {
     effectStart = performance.now();
@@ -683,11 +822,10 @@ let updateTempVis  = () => {};
 }
 
 // --- Temporal Mix ---
-// Blend the live frame with a frame N back in luma. Three modes:
-//   static  — constant blend at mixAmount
-//   pulsing — mixAmount oscillates at pulseFreq Hz, depth pulseAmp
-//   ramped  — triangle envelope over introDuration (one-shot)
-// At mixAmount=0 the buffer is bypassed entirely.
+// Blend the live frame with a frame N back in luma. Modes:
+//   0 = off       — true bypass, no buffer reads
+//   1 = static    — constant blend at mixAmount
+//   2 = pulsing   — mixAmount cycles at pulseFreq Hz, or by Phase Lock to speed
 {
   const f = pane.addFolder({ title: 'Temporal Mix', expanded: false });
 
@@ -695,22 +833,32 @@ let updateTempVis  = () => {};
     view: 'list',
     label: 'mode',
     options: [
-      { text: 'static',  value: 0 },
-      { text: 'pulsing', value: 1 },
-      { text: 'ramped',  value: 2 },
+      { text: 'off',     value: 0 },
+      { text: 'static',  value: 1 },
+      { text: 'pulsing', value: 2 },
     ],
     value: params.temporalMode | 0,
   }).on('change', (ev) => { params.temporalMode = ev.value | 0; updateTempVis(); });
 
-  f.addBinding(params, 'temporalMixAmount',    { label: 'mix amount',    min: 0,    max: 1,    step: 0.01 });
-  f.addBinding(params, 'temporalOffsetFrames', { label: 'offset frames', min: 1,    max: 60,   step: 1    });
-  const bPulseFreq = f.addBinding(params, 'temporalPulseFreq', { label: 'pulse freq (hz)', min: 0.05, max: 1.0, step: 0.01 });
-  const bPulseAmp  = f.addBinding(params, 'temporalPulseAmp',  { label: 'pulse amp',       min: 0,    max: 1,   step: 0.01 });
+  const bMix    = f.addBinding(params, 'temporalMixAmount',    { label: 'mix amount',    min: 0,    max: 1,    step: 0.01 });
+  const bOff    = f.addBinding(params, 'temporalOffsetFrames', { label: 'offset frames', min: 1,    max: 60,   step: 1    });
+  const bFreq   = f.addBinding(params, 'temporalPulseFreq',    { label: 'pulse freq (hz)', min: 0.05, max: 1.0, step: 0.01 });
+  const bAmp    = f.addBinding(params, 'temporalPulseAmp',     { label: 'pulse amp',     min: 0,    max: 1,    step: 0.01 });
+  const bPhase  = f.addBinding(params, 'phaseLockToSpeed',     { label: 'phase lock to speed' });
+  const bDebug  = f.addBinding(params, 'temporalShowBufferOnly', { label: 'show buffer only' });
+
+  bPhase.on('change', () => updateTempVis());
 
   updateTempVis = function () {
-    const m = params.temporalMode | 0;
-    bPulseFreq.hidden = (m !== 1);
-    bPulseAmp.hidden  = (m !== 1);
+    const m   = params.temporalMode | 0;
+    const off = m === 0;
+    const pulsing = m === 2;
+    const locked  = pulsing && !!params.phaseLockToSpeed;
+    bMix.hidden   = off;
+    bOff.hidden   = off;
+    bFreq.hidden  = !pulsing || locked;
+    bAmp.hidden   = !pulsing;
+    bPhase.hidden = !pulsing;
   };
   updateTempVis();
 }
@@ -920,6 +1068,7 @@ presetPicker.addEventListener('change', async () => {
     sourceState.preset = obj.name || 'custom';
     pane.refresh();
     updateIntroVis();
+      updateSpeedVis();
     updateTempVis();
     saveStateToLocalStorage();
   } catch (e) {
@@ -963,6 +1112,7 @@ window.addEventListener('drop', (e) => {
       sourceState.preset = obj.name || 'custom';
       pane.refresh();
       updateIntroVis();
+      updateSpeedVis();
       updateTempVis();
       saveStateToLocalStorage();
     });
@@ -990,6 +1140,7 @@ pane.on('change', saveStateToLocalStorage);
 loadStateFromLocalStorage();
 pane.refresh();
 updateIntroVis();
+      updateSpeedVis();
 updateTempVis();
 
 // Expose handles for automation / debugging / capture scripts.
@@ -1007,6 +1158,7 @@ if (typeof window !== 'undefined') {
       sourceState.preset = name;
       pane.refresh();
       updateIntroVis();
+      updateSpeedVis();
       updateTempVis();
       effectStart = performance.now();
       frameCount = 0;
@@ -1019,6 +1171,7 @@ if (typeof window !== 'undefined') {
     refresh() {
       pane.refresh();
       updateIntroVis();
+      updateSpeedVis();
       updateTempVis();
     },
   };
@@ -1027,4 +1180,12 @@ if (typeof window !== 'undefined') {
 window.addEventListener('resize', resize);
 resize();
 video.addEventListener('loadedmetadata', resize);
+
+// rVFC chain — registers a callback that fires once per real video frame.
+// Chain re-registers itself inside the callback. The chain stays alive across
+// src changes since it's bound to the video element, not the URL.
+if (HAS_RVFC) {
+  video.requestVideoFrameCallback(videoFrameCallback);
+}
+
 requestAnimationFrame(frameTick);
