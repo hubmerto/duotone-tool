@@ -20,7 +20,8 @@ html, body {
   cursor: default;
 }
 
-#source-video {
+#source-video,
+#source-image {
   /* hidden — used only as texture source */
   position: fixed;
   width: 1px;

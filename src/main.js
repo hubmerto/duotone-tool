@@ -71,11 +71,16 @@ let frameCount = 0;
 // -----------------------------------------------------------------------------
 const canvas      = document.getElementById('stage');
 const video       = document.getElementById('source-video');
+const imageEl     = document.getElementById('source-image');
 const dropOverlay = document.getElementById('dropzone-overlay');
 const hint        = document.getElementById('hint');
 
+// Which source the texture is currently bound to. Video uploads each frame;
+// image uploads once on load and the texture is reused.
+let currentSource = 'none'; // 'none' | 'video' | 'image'
+
 // hidden file pickers (Tweakpane has no native file input)
-const videoPicker  = makeHiddenInput('file', 'video/*');
+const mediaPicker  = makeHiddenInput('file', 'video/*,image/*');
 const presetPicker = makeHiddenInput('file', 'application/json,.json');
 const audioPicker  = makeHiddenInput('file', 'audio/*');
 
@@ -173,8 +178,15 @@ for (const name of [
 // for export sanity); CSS letterboxes inside viewport.
 // -----------------------------------------------------------------------------
 function resize() {
-  const vw = video.videoWidth  || 1920;
-  const vh = video.videoHeight || 1080;
+  // unified source dims (image or video)
+  let vw = 1920, vh = 1080;
+  if (currentSource === 'image' && imageEl.naturalWidth > 0) {
+    vw = imageEl.naturalWidth;
+    vh = imageEl.naturalHeight;
+  } else if (video.videoWidth > 0) {
+    vw = video.videoWidth;
+    vh = video.videoHeight;
+  }
 
   // Cap backing store at 1920x1080 for export sanity / perf
   const MAX_W = 1920, MAX_H = 1080;
@@ -217,9 +229,12 @@ function hexToRgb(hex) {
 
 function loadVideoFromFile(file) {
   if (video.src && video.src.startsWith('blob:')) URL.revokeObjectURL(video.src);
+  if (imageEl.src && imageEl.src.startsWith('blob:')) URL.revokeObjectURL(imageEl.src);
+  imageEl.removeAttribute('src');
   video.src = URL.createObjectURL(file);
   video.loop = sourceState.loop;
   video.play().catch(() => {});
+  currentSource = 'video';
   effectStart = performance.now();
   frameCount = 0;
 }
@@ -228,8 +243,32 @@ function loadVideoFromUrl(url) {
   video.src = url;
   video.loop = sourceState.loop;
   video.play().catch(() => {});
+  currentSource = 'video';
   effectStart = performance.now();
   frameCount = 0;
+}
+
+async function loadImageFromFile(file) {
+  if (imageEl.src && imageEl.src.startsWith('blob:')) URL.revokeObjectURL(imageEl.src);
+  imageEl.src = URL.createObjectURL(file);
+  try { await imageEl.decode(); } catch { /* fall through; onload will fire eventually */ }
+
+  // upload once — texture stays in GPU memory, render loop reuses it
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, imageEl);
+
+  // pause & detach video so we don't keep blitting black frames over the image
+  video.pause();
+  if (video.src && video.src.startsWith('blob:')) URL.revokeObjectURL(video.src);
+  video.removeAttribute('src');
+  video.load();
+
+  currentSource = 'image';
+  effectStart = performance.now();
+  frameCount = 0;
+  resize();
 }
 
 // -----------------------------------------------------------------------------
@@ -322,16 +361,20 @@ async function setModulationMode(next) {
 // render loop
 // -----------------------------------------------------------------------------
 function frameTick() {
-  // upload video frame to texture if ready
-  if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+  // upload current video frame to texture (only when source is a video —
+  // images are uploaded once on load and reused)
+  if (currentSource === 'video'
+      && video.readyState >= video.HAVE_CURRENT_DATA
+      && video.videoWidth > 0) {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
   }
 
-  // ensure backing-store size matches latest video dims
-  if (video.videoWidth > 0 && (canvas.width === 1 || canvas.height === 1)) {
+  // ensure backing-store size matches latest source dims
+  const srcW = currentSource === 'image' ? (imageEl.naturalWidth || 0) : (video.videoWidth || 0);
+  if (srcW > 0 && (canvas.width === 1 || canvas.height === 1)) {
     resize();
   }
 
@@ -382,7 +425,7 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // --- Source ---
 {
   const f = pane.addFolder({ title: 'Source', expanded: true });
-  f.addButton({ title: 'Pick video file…' }).on('click', () => videoPicker.click());
+  f.addButton({ title: 'Pick file… (video / image)' }).on('click', () => mediaPicker.click());
   f.addButton({ title: 'Use sample' }).on('click', () => loadVideoFromUrl('/samples/sample.mp4'));
   f.addBinding(sourceState, 'playing', { label: 'play' }).on('change', (ev) => {
     if (ev.value) video.play(); else video.pause();
@@ -604,9 +647,11 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // -----------------------------------------------------------------------------
 // File pickers
 // -----------------------------------------------------------------------------
-videoPicker.addEventListener('change', () => {
-  const f = videoPicker.files?.[0];
-  if (f) loadVideoFromFile(f);
+mediaPicker.addEventListener('change', () => {
+  const f = mediaPicker.files?.[0];
+  if (!f) return;
+  if (f.type.startsWith('video/'))      loadVideoFromFile(f);
+  else if (f.type.startsWith('image/')) loadImageFromFile(f);
 });
 audioPicker.addEventListener('change', async () => {
   const f = audioPicker.files?.[0];
@@ -658,6 +703,8 @@ window.addEventListener('drop', (e) => {
   if (!file) return;
   if (file.type.startsWith('video/')) {
     loadVideoFromFile(file);
+  } else if (file.type.startsWith('image/')) {
+    loadImageFromFile(file);
   } else if (file.type.startsWith('audio/')) {
     audioMod.loadFile(file).then(() => {
       audioMod.setVolume(modulation.audio.volume);

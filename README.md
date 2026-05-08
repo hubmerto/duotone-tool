@@ -36,8 +36,8 @@ boil and creep across the frame.
 
 | Folder        | Param                | Effect                                                              |
 | ------------- | -------------------- | ------------------------------------------------------------------- |
-| Source        | Pick video / sample  | Load a video file (drag-drop also works anywhere)                   |
-|               | play, loop           | Video playback controls                                             |
+| Source        | Pick file…           | Load a video or image file (drag-drop also works anywhere)          |
+|               | play, loop           | Video playback controls (no-op when source is an image)             |
 | Color         | spot                 | The duotone accent color                                            |
 |               | preset               | Switch between bundled green / orange / blue                        |
 | Threshold     | base                 | Center of the cutoff (0..1); 0.5 ≈ midtone                          |
@@ -134,7 +134,8 @@ Tune one, get all three.
 - 4K acceptable but may drop frames during recording (MediaRecorder still
   captures cleanly).
 - Desktop only — no mobile UI.
-- No multiple effects, no audio reactivity, no still-image input.
+- Inputs: video, still image, and (separately) audio file as a modulation
+  source. No effect chain / nodes UI.
 
 ## Stack
 
