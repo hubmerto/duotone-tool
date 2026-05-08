@@ -174,15 +174,54 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,    gl.CLAMP_TO_EDGE);
 // upload a 1x1 black placeholder so texture is "complete" before first frame
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
 
+// -----------------------------------------------------------------------------
+// Temporal ring buffer — quarter-res past frames in a TEXTURE_2D_ARRAY. The
+// shader reads from this when u_temporalMode != 0 to drive stutter/morph/rewind.
+// 120 layers × 480 × 270 × RGBA8 ≈ 60 MB on GPU; only updated while mode != 0.
+// -----------------------------------------------------------------------------
+const TEMPORAL_W = 480;
+const TEMPORAL_H = 270;
+const TEMPORAL_SIZE_MAX = 120;
+
+const tempCanvas = document.createElement('canvas');
+tempCanvas.width  = TEMPORAL_W;
+tempCanvas.height = TEMPORAL_H;
+const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: false });
+
+const bufferTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, TEMPORAL_W, TEMPORAL_H, TEMPORAL_SIZE_MAX);
+gl.activeTexture(gl.TEXTURE0); // restore default unit
+
+let bufferWriteIndex   = 0;
+let imageBufferFilled  = false;  // for static images: write to all layers once
+
+// Rewind state machine. JS computes the offset; shader samples at it.
+let rewindState  = 'idle';   // 'idle' | 'rewinding' | 'resuming'
+let rewindStartT = 0;
+let rewindOff    = 0;
+let lastTickT    = performance.now();
+
 // uniforms
 const U = {};
 for (const name of [
-  'u_video','u_resolution','u_time','u_frame','u_spotColor',
+  'u_video','u_buffer','u_resolution','u_time','u_frame','u_spotColor',
   'u_thresholdBase','u_thresholdLFOAmp','u_thresholdLFOFreq',
-  'u_introDuration','u_introCurve',
+  'u_introMode','u_introDuration','u_introCurve',
+  'u_introOrigin','u_introSpread','u_introFalloff',
+  'u_introDirectionality','u_introAngle','u_introTurbulence',
   'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp','u_warpAmp',
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
+  'u_temporalMode','u_bufferSize','u_bufferWriteIndex',
+  'u_stutterAmount','u_stutterHoldFrames',
+  'u_morphBlend','u_morphSpread',
+  'u_rewindOffset','u_temporalSeed',
 ]) U[name] = gl.getUniformLocation(program, name);
 
 // -----------------------------------------------------------------------------
@@ -282,6 +321,7 @@ async function loadImageFromFile(file) {
   video.load();
 
   currentSource = 'image';
+  imageBufferFilled = false;          // re-fill ring buffer on next tick
   effectStart = performance.now();
   frameCount = 0;
   resize();
@@ -394,6 +434,73 @@ function frameTick() {
     resize();
   }
 
+  // ----- temporal buffer write + state machine ---------------------------------
+  // Only when temporal mode is on. Mode 0 is a true bypass.
+  if (params.temporalMode > 0) {
+    if (currentSource === 'video' && video.readyState >= 2 && video.videoWidth > 0) {
+      tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, bufferWriteIndex,
+                       TEMPORAL_W, TEMPORAL_H, 1,
+                       gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
+      const sz = Math.max(16, Math.min(TEMPORAL_SIZE_MAX, params.bufferSize | 0));
+      bufferWriteIndex = (bufferWriteIndex + 1) % sz;
+    } else if (currentSource === 'image' && imageEl.naturalWidth > 0 && !imageBufferFilled) {
+      // static image — fill all layers once so any mode produces consistent (no-change) output
+      tempCtx.drawImage(imageEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      for (let i = 0; i < TEMPORAL_SIZE_MAX; i++) {
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i,
+                         TEMPORAL_W, TEMPORAL_H, 1,
+                         gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
+      }
+      imageBufferFilled = true;
+    }
+  }
+
+  // ----- speedRamp drives video playbackRate ----------------------------------
+  // -1 -> 0.5x, 0 -> 1x, +1 -> 2x. Only when temporal mode is active.
+  if (currentSource === 'video' && video.duration > 0) {
+    const targetRate = (params.temporalMode > 0)
+      ? Math.max(0.25, Math.min(4.0, Math.pow(2, params.speedRamp ?? 0)))
+      : 1.0;
+    if (Math.abs(video.playbackRate - targetRate) > 0.01) video.playbackRate = targetRate;
+  }
+
+  // ----- rewind state machine -------------------------------------------------
+  const nowMs = performance.now();
+  const dt = Math.max(0, (nowMs - lastTickT) / 1000);
+  lastTickT = nowMs;
+  if (params.temporalMode === 3 || params.temporalMode === 4) {
+    if (rewindState === 'idle') {
+      // seeded trigger: 1 chance per second window, hashed by floor(time*2)
+      const bucket = Math.floor((nowMs / 1000) * 2);
+      if (deterministicHash(bucket + (params.temporalSeed ?? 1)) < (params.rewindChance ?? 0) * 0.5) {
+        rewindState = 'rewinding';
+        rewindStartT = nowMs;
+        rewindOff = 0;
+      }
+    } else if (rewindState === 'rewinding') {
+      const fps = exportSettings.fps || 60;
+      rewindOff += (params.rewindSpeed ?? 1.5) * fps * dt;
+      // cap at usable buffer depth - safety margin
+      const cap = Math.max(8, (params.bufferSize ?? 64) - 4);
+      if (rewindOff > cap) rewindOff = cap;
+      if ((nowMs - rewindStartT) / 1000 > (params.rewindLength ?? 1.5)) rewindState = 'resuming';
+    } else { // resuming
+      rewindOff *= 0.85; // exponential ease back
+      if (rewindOff < 0.5) { rewindOff = 0; rewindState = 'idle'; }
+    }
+  } else {
+    rewindOff = 0;
+    rewindState = 'idle';
+  }
+
+  // ----- draw -----------------------------------------------------------------
   gl.useProgram(program);
   gl.bindVertexArray(vao);
 
@@ -401,7 +508,14 @@ function frameTick() {
   const c = hexToRgb(params.spotColor);
   const lp = computeLiveParams();   // base params + modulation offsets
 
-  gl.uniform1i(U.u_video, 0);
+  // bind both texture units
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+  gl.uniform1i(U.u_video,  0);
+  gl.uniform1i(U.u_buffer, 1);
+
   gl.uniform2f(U.u_resolution, canvas.width, canvas.height);
   gl.uniform1f(U.u_time, t);
   gl.uniform1i(U.u_frame, frameCount);
@@ -411,19 +525,40 @@ function frameTick() {
   gl.uniform1f(U.u_thresholdLFOAmp,  lp.thresholdLFOAmp);
   gl.uniform1f(U.u_thresholdLFOFreq, lp.thresholdLFOFreq);
 
-  gl.uniform1f(U.u_introDuration, lp.introDuration);
-  gl.uniform1i(U.u_introCurve,    lp.introCurve | 0);
+  // intro
+  gl.uniform1i(U.u_introMode,           lp.introMode | 0);
+  gl.uniform1f(U.u_introDuration,       lp.introDuration);
+  gl.uniform1i(U.u_introCurve,          lp.introCurve | 0);
+  gl.uniform2f(U.u_introOrigin,         lp.introOriginX ?? 0.5, lp.introOriginY ?? 0.5);
+  gl.uniform1f(U.u_introSpread,         lp.introSpread        ?? 0.25);
+  gl.uniform1f(U.u_introFalloff,        lp.introFalloff       ?? 0.5);
+  gl.uniform1f(U.u_introDirectionality, lp.introDirectionality?? 0.0);
+  gl.uniform1f(U.u_introAngle,          lp.introAngle         ?? 0.0);
+  gl.uniform1f(U.u_introTurbulence,     lp.introTurbulence    ?? 0.3);
 
+  // slow + warp
   gl.uniform1f(U.u_slowNoiseScale, lp.slowNoiseScale);
   gl.uniform1f(U.u_slowNoiseSpeed, lp.slowNoiseSpeed);
   gl.uniform1f(U.u_slowAmp,        lp.slowAmp);
   gl.uniform1f(U.u_warpAmp,        lp.warpAmp ?? 0.0);
 
+  // boil
   gl.uniform1f(U.u_ditherScale, lp.ditherScale);
   gl.uniform1f(U.u_ditherSpeed, lp.ditherSpeed);
   gl.uniform1f(U.u_ditherAmp,   lp.ditherAmp);
 
   gl.uniform1f(U.u_softness, lp.softness);
+
+  // temporal
+  gl.uniform1i(U.u_temporalMode,      lp.temporalMode | 0);
+  gl.uniform1i(U.u_bufferSize,        Math.max(16, Math.min(TEMPORAL_SIZE_MAX, lp.bufferSize | 0)));
+  gl.uniform1i(U.u_bufferWriteIndex,  bufferWriteIndex);
+  gl.uniform1f(U.u_stutterAmount,     lp.stutterAmount     ?? 0.3);
+  gl.uniform1f(U.u_stutterHoldFrames, lp.stutterHoldFrames ?? 6);
+  gl.uniform1f(U.u_morphBlend,        lp.morphBlend        ?? 0.5);
+  gl.uniform1f(U.u_morphSpread,       lp.morphSpread       ?? 12);
+  gl.uniform1f(U.u_rewindOffset,      rewindOff);
+  gl.uniform1f(U.u_temporalSeed,      lp.temporalSeed      ?? 1);
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
@@ -433,10 +568,21 @@ function frameTick() {
   requestAnimationFrame(frameTick);
 }
 
+// deterministic 1D hash for the rewind trigger — same input -> same output
+function deterministicHash(x) {
+  const s = Math.sin(x * 12.9898) * 43758.5453;
+  return s - Math.floor(s);
+}
+
 // -----------------------------------------------------------------------------
 // Tweakpane UI
 // -----------------------------------------------------------------------------
 const pane = new Pane({ title: 'DUOTONE', expanded: true });
+
+// Hoisted visibility updaters — assigned inside their folder blocks so
+// preset-switch / preset-load can re-evaluate which params are visible.
+let updateIntroVis = () => {};
+let updateTempVis  = () => {};
 
 // --- Source ---
 {
@@ -457,17 +603,26 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
     view: 'list',
     label: 'preset',
     options: [
-      { text: 'green',  value: 'green' },
-      { text: 'orange', value: 'orange' },
-      { text: 'blue',   value: 'blue' },
-      { text: 'custom', value: 'custom' },
+      { text: 'green',           value: 'green'          },
+      { text: 'orange',          value: 'orange'         },
+      { text: 'blue',            value: 'blue'           },
+      { text: '— showcase —',    value: 'custom'         },
+      { text: 'green · stutter', value: 'green-stutter'  },
+      { text: 'orange · rewind', value: 'orange-rewind'  },
+      { text: 'blue · radiance', value: 'blue-radiance'  },
+      { text: 'custom',          value: 'custom'         },
     ],
     value: sourceState.preset,
   }).on('change', (ev) => {
     sourceState.preset = ev.value;
-    if (ev.value !== 'custom') {
+    if (ev.value !== 'custom' && PRESETS[ev.value]) {
       applyPreset(params, PRESETS[ev.value]);
       pane.refresh();
+      updateIntroVis();
+      updateTempVis();
+      // restart intro on preset change so spatial wavefronts re-play
+      effectStart = performance.now();
+      frameCount = 0;
       saveStateToLocalStorage();
     }
   });
@@ -484,6 +639,19 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // --- Intro ---
 {
   const f = pane.addFolder({ title: 'Intro', expanded: false });
+
+  f.addBlade({
+    view: 'list',
+    label: 'mode',
+    options: [
+      { text: 'develop  (global ramp)',  value: 0 },
+      { text: 'radiance (outward)',      value: 1 },
+      { text: 'aperture (inward iris)',  value: 2 },
+      { text: 'scanline (linear sweep)', value: 3 },
+    ],
+    value: params.introMode | 0,
+  }).on('change', (ev) => { params.introMode = ev.value | 0; updateIntroVis(); });
+
   f.addBinding(params, 'introDuration', { label: 'duration', min: 0, max: 6, step: 0.05 });
   f.addBlade({
     view: 'list',
@@ -495,6 +663,29 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
     ],
     value: params.introCurve,
   }).on('change', (ev) => { params.introCurve = ev.value | 0; });
+
+  // spatial params — visible only for modes 1-3
+  const bOriginX = f.addBinding(params, 'introOriginX',        { label: 'origin x',   min: 0, max: 1, step: 0.005 });
+  const bOriginY = f.addBinding(params, 'introOriginY',        { label: 'origin y',   min: 0, max: 1, step: 0.005 });
+  const bSpread  = f.addBinding(params, 'introSpread',         { label: 'spread',     min: 0.05, max: 1.0, step: 0.005 });
+  const bFalloff = f.addBinding(params, 'introFalloff',        { label: 'falloff',    min: 0, max: 1, step: 0.01 });
+  const bDir     = f.addBinding(params, 'introDirectionality', { label: 'direction',  min: 0, max: 1, step: 0.01 });
+  const bAngle   = f.addBinding(params, 'introAngle',          { label: 'angle (rad)', min: -3.14159, max: 3.14159, step: 0.01 });
+  const bTurb    = f.addBinding(params, 'introTurbulence',     { label: 'turbulence', min: 0, max: 1, step: 0.01 });
+
+  updateIntroVis = function () {
+    const m = params.introMode | 0;
+    const spatial = m !== 0;
+    bOriginX.hidden = !spatial;
+    bOriginY.hidden = !spatial;
+    bSpread.hidden  = !spatial;
+    bFalloff.hidden = !spatial;
+    bDir.hidden     = m !== 1;                 // directionality only meaningful in radiance
+    bAngle.hidden   = (m === 0 || m === 2);    // not used in develop or aperture
+    bTurb.hidden    = !spatial;
+  };
+  updateIntroVis();
+
   f.addButton({ title: 'Replay intro' }).on('click', () => {
     effectStart = performance.now();
     frameCount = 0;
@@ -517,6 +708,51 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
   f.addBinding(params, 'ditherScale', { label: 'scale', min: 50,  max: 1500, step: 5    });
   f.addBinding(params, 'ditherSpeed', { label: 'speed', min: 0,   max: 1,    step: 0.01 });
   f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
+}
+
+// --- Temporal ---
+{
+  const f = pane.addFolder({ title: 'Temporal', expanded: false });
+
+  f.addBlade({
+    view: 'list',
+    label: 'mode',
+    options: [
+      { text: 'off',               value: 0 },
+      { text: 'stutter',           value: 1 },
+      { text: 'morph',             value: 2 },
+      { text: 'rewind',            value: 3 },
+      { text: 'mix-all (random)',  value: 4 },
+    ],
+    value: params.temporalMode | 0,
+  }).on('change', (ev) => { params.temporalMode = ev.value | 0; updateTempVis(); });
+
+  const bBuf    = f.addBinding(params, 'bufferSize',        { label: 'buffer (frames)', min: 16,  max: 120,  step: 1    });
+  const bStutA  = f.addBinding(params, 'stutterAmount',     { label: 'stutter prob',    min: 0,   max: 1,    step: 0.01 });
+  const bStutH  = f.addBinding(params, 'stutterHoldFrames', { label: 'stutter hold',    min: 1,   max: 30,   step: 1    });
+  const bMorphB = f.addBinding(params, 'morphBlend',        { label: 'morph blend',     min: 0,   max: 1,    step: 0.01 });
+  const bMorphS = f.addBinding(params, 'morphSpread',       { label: 'morph spread',    min: 1,   max: 60,   step: 1    });
+  const bRewC   = f.addBinding(params, 'rewindChance',      { label: 'rewind chance',   min: 0,   max: 1,    step: 0.01 });
+  const bRewL   = f.addBinding(params, 'rewindLength',      { label: 'rewind length',   min: 0,   max: 3,    step: 0.05 });
+  const bRewS   = f.addBinding(params, 'rewindSpeed',       { label: 'rewind speed',    min: 0.5, max: 4,    step: 0.05 });
+  const bSpeed  = f.addBinding(params, 'speedRamp',         { label: 'speed ramp',      min: -1,  max: 1,    step: 0.05 });
+  const bSeed   = f.addBinding(params, 'temporalSeed',      { label: 'seed',            min: 0,   max: 9999, step: 1    });
+
+  updateTempVis = function () {
+    const m = params.temporalMode | 0;
+    const off = m === 0;
+    bBuf.hidden    = off;
+    bStutA.hidden  = !(m === 1 || m === 4);
+    bStutH.hidden  = !(m === 1 || m === 4);
+    bMorphB.hidden = !(m === 2 || m === 4);
+    bMorphS.hidden = !(m === 2 || m === 4);
+    bRewC.hidden   = !(m === 3 || m === 4);
+    bRewL.hidden   = !(m === 3 || m === 4);
+    bRewS.hidden   = !(m === 3 || m === 4);
+    bSpeed.hidden  = off;
+    bSeed.hidden   = off;
+  };
+  updateTempVis();
 }
 
 // --- Edge ---
@@ -723,6 +959,8 @@ presetPicker.addEventListener('change', async () => {
     applyPreset(params, obj);
     sourceState.preset = obj.name || 'custom';
     pane.refresh();
+    updateIntroVis();
+    updateTempVis();
     saveStateToLocalStorage();
   } catch (e) {
     console.error('Preset load failed:', e);
@@ -764,6 +1002,8 @@ window.addEventListener('drop', (e) => {
       applyPreset(params, obj);
       sourceState.preset = obj.name || 'custom';
       pane.refresh();
+      updateIntroVis();
+      updateTempVis();
       saveStateToLocalStorage();
     });
   }
@@ -789,6 +1029,8 @@ pane.on('change', saveStateToLocalStorage);
 // -----------------------------------------------------------------------------
 loadStateFromLocalStorage();
 pane.refresh();
+updateIntroVis();
+updateTempVis();
 window.addEventListener('resize', resize);
 resize();
 video.addEventListener('loadedmetadata', resize);

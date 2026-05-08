@@ -1,5 +1,5 @@
 {
-  "name": "orange",
+  "name": "orange-rewind",
   "spotColor": "#FF4500",
   "thresholdBase": 0.50,
   "thresholdLFOAmp": 0.08,
@@ -22,15 +22,15 @@
   "ditherSpeed": 0.55,
   "ditherAmp": 0.07,
   "softness": 0.015,
-  "temporalMode": 0,
-  "bufferSize": 64,
+  "temporalMode": 3,
+  "bufferSize": 96,
   "stutterAmount": 0.30,
   "stutterHoldFrames": 6,
   "morphBlend": 0.50,
   "morphSpread": 12,
-  "rewindChance": 0.05,
-  "rewindLength": 1.5,
-  "rewindSpeed": 1.5,
-  "speedRamp": 0.0,
+  "rewindChance": 0.18,
+  "rewindLength": 1.8,
+  "rewindSpeed": 1.8,
+  "speedRamp": 0.10,
   "temporalSeed": 1
 }
