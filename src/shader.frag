@@ -72,16 +72,16 @@ uniform float u_ditherAmp;
 // ----- edge ---------------------------------------------------------------------
 uniform float u_softness;
 
-// ----- temporal effects ---------------------------------------------------------
-uniform int   u_temporalMode;         // 0=off, 1=stutter, 2=morph, 3=rewind, 4=mix-all
-uniform int   u_bufferSize;           // active depth (16..120)
+// ----- dual-playhead temporal effect --------------------------------------------
+// Two virtual playheads (A and B) read from the same ring buffer. JS runs the
+// IDLE / FROZEN / MORPHING state machine and sends back the resolved layer
+// indices + morph progress. The shader is purely a sampler.
+uniform int   u_bufferSize;           // active wrap modulus (auto-sized from params)
 uniform int   u_bufferWriteIndex;     // next-to-write slot (live = idx-1, mod size)
-uniform float u_stutterAmount;        // 0..1 prob of holding a frame
-uniform float u_stutterHoldFrames;    // chunk length for the stutter
-uniform float u_morphBlend;           // 0..1
-uniform float u_morphSpread;          // frames apart for morph
-uniform float u_rewindOffset;         // JS-driven offset (frames-back) during rewind
-uniform float u_temporalSeed;         // for reproducibility
+uniform int   u_layerVis;             // visible head's layer (frozen frame, or live)
+uniform int   u_layerOther;           // other head's layer (always live during freeze)
+uniform float u_morphT;               // 0 (no blend) .. 1 (fully transitioned to other)
+uniform float u_dpIntensity;          // 0 = bypass (sample u_video directly), 1 = full DP
 
 // ============================================================================
 // helpers
@@ -131,66 +131,42 @@ float ease(float t, int curve) {
     return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) * 0.5;
 }
 
-// wrap an int into [0, u_bufferSize) — handles negatives
-int wrapLayer(int idx) {
-    int s = max(u_bufferSize, 1);
-    return ((idx % s) + s) % s;
-}
-
 // ============================================================================
-// temporal sampling — module 1
+// dual-playhead temporal sampling
 // ============================================================================
 //
-// Mode 0 is a true bypass: directly sample u_video at full resolution. Modes
-// 1-4 sample from the ring buffer (quarter-res) at a manipulated layer index.
+// Output is mix(layerVis, layerOther, morphT) in luma space.
+//   - IDLE:      both heads at live layer → layerVis == layerOther, morphT = 0
+//                (output = current frame, identical to bypass visually)
+//   - FROZEN:    visible head holds at frozenAtLayer, other at live, morphT = 0
+//                (output = visible head's frozen frame)
+//   - MORPHING:  same layer indices, morphT animates 0 → 1 (eased in JS)
+//                (output crossfades from frozen frame to live frame)
+//   - intensity = 0 short-circuits to u_video for true zero-overhead bypass.
 //
-vec3 sampleTemporal(vec2 uv) {
-    if (u_temporalMode == 0) {
+// luma-space blend: extract dot(rgb, rec709) from each layer, mix the scalar,
+// emit grey. Downstream threshold uses luma anyway, so this is mathematically
+// equivalent to a per-channel RGB blend in this pipeline — but staying in luma
+// keeps the contract obvious and lets the comment match the spec.
+//
+vec3 sampleDP(vec2 uv) {
+    if (u_dpIntensity < 0.001) {
         return texture(u_video, uv).rgb;
     }
 
-    int liveLayer = wrapLayer(u_bufferWriteIndex - 1);
+    vec3 visC = texture(u_buffer, vec3(uv, float(u_layerVis))).rgb;
+    vec3 othC = texture(u_buffer, vec3(uv, float(u_layerOther))).rgb;
 
-    // Mix-all: pick one mode for ~1.4s at a time, seeded random
-    int mode = u_temporalMode;
-    if (mode == 4) {
-        float bucket = floor(u_time * 0.7);
-        float r = hash11(bucket + u_temporalSeed);
-        if      (r < 0.40) mode = 1;
-        else if (r < 0.75) mode = 2;
-        else               mode = 3;
+    float lumaV = dot(visC, vec3(0.2126, 0.7152, 0.0722));
+    float lumaO = dot(othC, vec3(0.2126, 0.7152, 0.0722));
+    float L = mix(lumaV, lumaO, clamp(u_morphT, 0.0, 1.0));
+    vec3 dp = vec3(L);
+
+    // Partial intensity → blend with full-res bypass.
+    if (u_dpIntensity < 1.0) {
+        return mix(texture(u_video, uv).rgb, dp, u_dpIntensity);
     }
-
-    // Stutter: divide frames into chunks, with prob stutterAmount per chunk
-    // freeze on the chunk's first frame for the whole chunk.
-    if (mode == 1) {
-        float chunk = max(u_stutterHoldFrames, 1.0);
-        float bucket = floor(float(u_frame) / chunk);
-        if (hash11(bucket + u_temporalSeed) < u_stutterAmount) {
-            int freezeOff = int(mod(float(u_frame), chunk));
-            int layer = wrapLayer(liveLayer - freezeOff);
-            return texture(u_buffer, vec3(uv, float(layer))).rgb;
-        }
-        return texture(u_buffer, vec3(uv, float(liveLayer))).rgb;
-    }
-
-    // Morph: blend live with frame N back. luma is linear in dot product so
-    // RGB blend == luma blend in this pipeline (we only use luma downstream).
-    if (mode == 2) {
-        int spread = int(max(u_morphSpread, 1.0));
-        int layerB = wrapLayer(liveLayer - spread);
-        vec3 a = texture(u_buffer, vec3(uv, float(liveLayer))).rgb;
-        vec3 b = texture(u_buffer, vec3(uv, float(layerB))).rgb;
-        return mix(a, b, u_morphBlend);
-    }
-
-    // Rewind: JS-driven offset into the past (eased back toward 0).
-    if (mode == 3) {
-        int layer = wrapLayer(liveLayer - int(u_rewindOffset));
-        return texture(u_buffer, vec3(uv, float(layer))).rgb;
-    }
-
-    return texture(u_buffer, vec3(uv, float(liveLayer))).rgb;
+    return dp;
 }
 
 // ============================================================================
@@ -255,8 +231,8 @@ void main() {
     ) * u_warpAmp;
     vec2 warpedUV = uv + warpVec;
 
-    // luma — sampled through temporal pass at warpedUV
-    vec3 src  = sampleTemporal(warpedUV);
+    // luma — sampled through dual-playhead pass at warpedUV
+    vec3 src  = sampleDP(warpedUV);
     float luma = dot(src, vec3(0.2126, 0.7152, 0.0722));
 
     // fast boil

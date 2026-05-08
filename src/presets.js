@@ -35,18 +35,19 @@ const SHARED = {
   ditherAmp: 0.07,
   softness: 0.015,
 
-  // temporal — mode 0 = off (no buffer overhead)
-  temporalMode: 0,
-  bufferSize: 64,
-  stutterAmount: 0.30,
-  stutterHoldFrames: 6,
-  morphBlend: 0.50,
-  morphSpread: 12,
-  rewindChance: 0.05,
-  rewindLength: 1.5,
-  rewindSpeed: 1.5,
-  speedRamp: 0.0,
-  temporalSeed: 1,
+  // dual-playhead temporal — off by default. Two virtual heads in the ring
+  // buffer; one freezes while the other advances, then they reconverge via
+  // a luma morph. See dpAdvance() in main.js.
+  dpIntensity:        0,
+  dpHoldIntervalMin:  0.6,    // s — lower bound of time between freezes
+  dpHoldIntervalMax:  1.8,    // s — upper bound
+  dpHoldDurationMin:  6,      // frames the moving head drifts before morph
+  dpHoldDurationMax:  28,
+  dpMorphDurationMin: 4,      // morph length lower bound
+  dpMorphDurationMax: 14,
+  dpMorphCurve:       1,      // 0=linear, 1=easeInOut, 2=easeOut
+  dpSwapBias:         0.5,    // 0=always A freezes, 1=always B
+  dpSeed:             1,      // change for a different "performance"
 };
 
 export const PRESETS = {
@@ -54,42 +55,35 @@ export const PRESETS = {
   orange: { name: 'orange', spotColor: '#FF4500', ...SHARED },
   blue:   { name: 'blue',   spotColor: '#0066FF', ...SHARED },
 
-  // ---- showcase presets for the new modules ----
-  'green-stutter': {
-    name: 'green-stutter',
-    spotColor: '#9FFF00',
-    ...SHARED,
-    temporalMode: 1,         // stutter
-    bufferSize: 48,
-    stutterAmount: 0.45,
-    stutterHoldFrames: 5,
-    morphBlend: 0.35,        // mild concurrent morph for textural depth
-    morphSpread: 7,
-    speedRamp: -0.15,        // slight slow-mo bias accentuates the holds
-  },
-  'orange-rewind': {
-    name: 'orange-rewind',
-    spotColor: '#FF4500',
-    ...SHARED,
-    temporalMode: 3,         // rewind
-    bufferSize: 96,
-    rewindChance: 0.18,
-    rewindLength: 1.8,
-    rewindSpeed: 1.8,
-    speedRamp: 0.10,
-  },
+  // Showcase: spatial intro (kept from previous module)
   'blue-radiance': {
     name: 'blue-radiance',
     spotColor: '#0066FF',
     ...SHARED,
-    introMode: 1,            // radiance
+    introMode: 1,
     introOriginX: 0.5,
-    introOriginY: 1.0,       // top-center (UV y=1 is top in our convention)
-    introDuration: 2.4,      // slower so the wavefront is hypnotic
+    introOriginY: 1.0,
+    introDuration: 2.4,
     introSpread: 0.45,
     introFalloff: 0.7,
     introTurbulence: 0.6,
-    introAngle: -1.5708,     // -π/2 = downward, in case directionality > 0
+    introAngle: -1.5708,
+  },
+
+  // Showcase: dual-playhead at moderate intensity, calm timing
+  'green-catchup': {
+    name: 'green-catchup',
+    spotColor: '#9FFF00',
+    ...SHARED,
+    dpIntensity: 1.0,
+    dpHoldIntervalMin: 0.5,
+    dpHoldIntervalMax: 1.4,
+    dpHoldDurationMin: 6,
+    dpHoldDurationMax: 22,
+    dpMorphDurationMin: 4,
+    dpMorphDurationMax: 12,
+    dpMorphCurve: 1,
+    dpSwapBias: 0.5,
   },
 };
 
