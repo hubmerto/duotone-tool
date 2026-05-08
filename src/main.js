@@ -1031,6 +1031,39 @@ loadStateFromLocalStorage();
 pane.refresh();
 updateIntroVis();
 updateTempVis();
+
+// Expose handles for automation / debugging / capture scripts.
+// This is a creative tool, not security-critical — making the state reachable
+// from the console is broadly useful.
+if (typeof window !== 'undefined') {
+  window.boiler = {
+    params, sourceState, modulation, exportSettings, monitor,
+    pane, mediaPicker, audioPicker, presetPicker,
+    PRESETS,
+    loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
+    setPreset(name) {
+      if (!PRESETS[name]) return false;
+      applyPreset(params, PRESETS[name]);
+      sourceState.preset = name;
+      pane.refresh();
+      updateIntroVis();
+      updateTempVis();
+      effectStart = performance.now();
+      frameCount = 0;
+      return true;
+    },
+    replayIntro() {
+      effectStart = performance.now();
+      frameCount = 0;
+    },
+    refresh() {
+      pane.refresh();
+      updateIntroVis();
+      updateTempVis();
+    },
+  };
+}
+
 window.addEventListener('resize', resize);
 resize();
 video.addEventListener('loadedmetadata', resize);
