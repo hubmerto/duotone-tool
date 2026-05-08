@@ -1,0 +1,16 @@
+{
+  "name": "blue",
+  "spotColor": "#0066FF",
+  "thresholdBase": 0.50,
+  "thresholdLFOAmp": 0.08,
+  "thresholdLFOFreq": 0.18,
+  "introDuration": 1.2,
+  "introCurve": 1,
+  "slowNoiseScale": 4.0,
+  "slowNoiseSpeed": 0.12,
+  "slowAmp": 0.25,
+  "ditherScale": 600.0,
+  "ditherSpeed": 0.6,
+  "ditherAmp": 0.10,
+  "softness": 0.015
+}

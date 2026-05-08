@@ -1,0 +1,18 @@
+{
+  "name": "duotone-tool",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Real-time animated 1-bit duotone web tool — boiling-threshold effect over video, single-pass GLSL.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "tweakpane": "^4.0.4"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
+  }
+}

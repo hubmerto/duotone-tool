@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DUOTONE — boiling threshold</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <div id="dropzone-overlay" aria-hidden="true">
+    <p>DROP A VIDEO FILE ANYWHERE</p>
+  </div>
+
+  <div id="hint" class="hint visible">
+    <p>DRAG AND DROP A VIDEO FILE</p>
+    <p>OR USE THE SOURCE FOLDER (TOP RIGHT) &rarr; "USE SAMPLE"</p>
+  </div>
+
+  <video id="source-video" playsinline muted loop crossorigin="anonymous"></video>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
