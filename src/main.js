@@ -11,6 +11,23 @@ import {
 } from './presets.js';
 import { MediaRecorderPath, CCapturePath, WebCodecsMp4Path } from './recorder.js';
 import { AudioModulator, CameraModulator } from './modulators.js';
+import { SPECIMENS, SECTION_DEFS } from './specimens.js';
+
+// =============================================================================
+// Specimen routing — detected from URL on boot.
+//
+//   /             → normal app
+//   /specimens/01 → render specimen #01 as a 1920×1080 composite
+//
+// Vercel SPA fallback is configured in vercel.json so any /specimens/* path
+// serves index.html.
+// =============================================================================
+const SPECIMEN_PATH_RE = /^\/specimens\/(\d+)\/?$/;
+const _specimenMatch   = window.location.pathname.match(SPECIMEN_PATH_RE);
+const SPECIMEN         = _specimenMatch
+  ? SPECIMENS.find((s) => s.id === _specimenMatch[1])
+  : null;
+if (SPECIMEN) document.body.classList.add('specimen-mode');
 
 // -----------------------------------------------------------------------------
 // state
@@ -373,7 +390,11 @@ const cameraMod  = new CameraModulator();
 function computeLiveParams() {
   const lp = { ...params };
   if (modulation.mode === 'audio') {
-    const m = audioMod.update();
+    // Specimen 06: synthetic peak signals instead of real audio analyzer.
+    // Lets a still capture show what the effect looks like at audio peak.
+    const m = (SPECIMEN && SPECIMEN.forceModulationPeak)
+      ? { bass: 1.0, mid: 1.0, treble: 1.0, rms: 1.0 }
+      : audioMod.update();
     monitor.bass = m.bass; monitor.mid = m.mid;
     monitor.treble = m.treble; monitor.rms = m.rms;
     const A = modulation.audio;
@@ -538,7 +559,39 @@ function frameTick() {
   gl.uniform1f(U.u_temporalEffectiveMix,   effectiveMix);
   gl.uniform1i(U.u_temporalShowBufferOnly, params.temporalShowBufferOnly ? 1 : 0);
 
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  // Specimen 05 split-render: draw left half with leftConfig, right with right.
+  // Scissor clips the writes; uniforms differ per draw. Single-pass shader,
+  // two draws — same canvas.
+  if (SPECIMEN && SPECIMEN.splitConfig) {
+    const halfW = canvas.width >> 1;
+    gl.enable(gl.SCISSOR_TEST);
+
+    // left half
+    for (const [k, v] of Object.entries(SPECIMEN.splitConfig.left)) {
+      const u = U['u_' + k];
+      if (u !== undefined && u !== null) {
+        if (typeof v === 'number' && Number.isInteger(v) && k.endsWith('Mode')) gl.uniform1i(u, v);
+        else gl.uniform1f(u, v);
+      }
+    }
+    gl.scissor(0, 0, halfW, canvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // right half
+    for (const [k, v] of Object.entries(SPECIMEN.splitConfig.right)) {
+      const u = U['u_' + k];
+      if (u !== undefined && u !== null) {
+        if (typeof v === 'number' && Number.isInteger(v) && k.endsWith('Mode')) gl.uniform1i(u, v);
+        else gl.uniform1f(u, v);
+      }
+    }
+    gl.scissor(halfW, 0, canvas.width - halfW, canvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    gl.disable(gl.SCISSOR_TEST);
+  } else {
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
 
   if (ccapPath.recording) ccapPath.capture();
   if (mp4Path.recording)  mp4Path.capture();
@@ -1189,3 +1242,146 @@ if (HAS_RVFC) {
 }
 
 requestAnimationFrame(frameTick);
+
+// =============================================================================
+// Specimen mode activation — runs after Tweakpane + render loop are wired.
+// Applies preset + param overrides, auto-loads sample, builds the panel
+// fragment + hairline line + caption.
+// =============================================================================
+if (SPECIMEN) activateSpecimen(SPECIMEN);
+
+function activateSpecimen(spec) {
+  // Apply preset baseline, then specimen-specific param overrides
+  if (spec.preset && PRESETS[spec.preset]) {
+    applyPreset(params, PRESETS[spec.preset]);
+  }
+  for (const [k, v] of Object.entries(spec.params || {})) {
+    params[k] = v;
+  }
+  pane.refresh();
+  updateIntroVis();
+  updateTempVis();
+  updateSpeedVis();
+
+  // Specimen 06: switch on audio modulation so the forced-peak path engages
+  if (spec.forceModulationPeak) {
+    modulation.mode = 'audio';
+  }
+
+  // Specimen 05: tag body so the split-rule CSS shows
+  if (spec.splitConfig) {
+    document.body.classList.add('specimen-split');
+  }
+
+  // Auto-load default sample video
+  loadVideoFromUrl('/samples/sample.mp4');
+
+  // Replay the intro so the captured frame is past the develop ramp
+  effectStart = performance.now();
+  frameCount = 0;
+
+  // Build the panel fragment + caption + line
+  buildSpecimenPanel(spec);
+  buildSpecimenCaption(spec);
+  // line is drawn after a tick so panel layout has computed
+  requestAnimationFrame(() => requestAnimationFrame(() => drawSpecimenLine(spec)));
+}
+
+function buildSpecimenPanel(spec) {
+  const root = document.getElementById('specimen-panel');
+  root.replaceChildren();
+  for (const sectionName of (spec.panelSections || [])) {
+    const def = SECTION_DEFS[sectionName];
+    if (!def) continue;
+    const mod = document.createElement('div');
+    mod.className = 'spec-mod';
+    const title = document.createElement('div');
+    title.className = 'spec-mod-title';
+    title.textContent = def.title;
+    mod.appendChild(title);
+
+    for (const row of def.rows) {
+      const obj = row.fromObj
+        ? row.fromObj.split('.').reduce((o, k) => o?.[k], window) || modulation.audio
+        : params;
+      const v = obj[row.key];
+      if (v === undefined || v === null) continue;
+      const pct = Math.max(0, Math.min(1, (v - row.min) / Math.max(1e-6, row.max - row.min)));
+      const r = document.createElement('div');
+      r.className = 'spec-mod-row';
+      if (spec.primary === row.key) r.setAttribute('data-primary', 'true');
+      r.innerHTML = ''; // safe — we'll append children
+      const lbl = document.createElement('span');
+      lbl.className = 'spec-mod-label';
+      lbl.textContent = row.label;
+      const trk = document.createElement('div');
+      trk.className = 'spec-mod-track';
+      const fill = document.createElement('div');
+      fill.className = 'spec-mod-fill';
+      fill.style.width = `${(pct * 100).toFixed(1)}%`;
+      trk.appendChild(fill);
+      const val = document.createElement('span');
+      val.className = 'spec-mod-value';
+      val.textContent = row.fmt(v);
+      const mkr = document.createElement('div');
+      mkr.className = 'spec-mod-marker';
+      r.appendChild(lbl); r.appendChild(trk); r.appendChild(val); r.appendChild(mkr);
+      mod.appendChild(r);
+    }
+    root.appendChild(mod);
+  }
+}
+
+function buildSpecimenCaption(spec) {
+  const cap = document.getElementById('specimen-caption');
+  const parts = [`FIG ${spec.id} · ${spec.label}`];
+  if (spec.captionParts && spec.captionParts.length) {
+    parts.push(spec.captionParts.join(' · '));
+  }
+  cap.textContent = parts.join('   ');
+}
+
+function drawSpecimenLine(spec) {
+  const svg = document.getElementById('specimen-line');
+  svg.replaceChildren();
+  if (!spec.primary || !spec.panelSections?.length) return;
+
+  // Find the marker element in the panel — look up by data-primary row
+  const primaryRow = document.querySelector('#specimen-panel .spec-mod-row[data-primary="true"] .spec-mod-marker');
+  if (!primaryRow) return;
+
+  const compRect   = document.getElementById('specimen-composite').getBoundingClientRect();
+  const markerRect = primaryRow.getBoundingClientRect();
+  const canvasRect = canvas.getBoundingClientRect();
+
+  // Coordinates within the 1920×1080 composite (composite has position fixed,
+  // so its rect is in viewport space — we subtract its top-left offset).
+  const x1 = markerRect.left + markerRect.width / 2 - compRect.left;
+  const y1 = markerRect.top  + markerRect.height / 2 - compRect.top;
+  // Canvas upper-left corner — for split, use midline top
+  let x2 = canvasRect.left - compRect.left;
+  let y2 = canvasRect.top  - compRect.top;
+  if (spec.splitConfig) x2 = canvasRect.left + canvasRect.width / 2 - compRect.left;
+
+  svg.setAttribute('viewBox', '0 0 1920 1080');
+
+  // Single bend if needed: route via a midpoint to the right of the marker
+  const midX = Math.max(x1 + 60, (x1 + x2) / 2);
+  const path = `M ${x1} ${y1} L ${midX} ${y1} L ${midX} ${y2} L ${x2} ${y2}`;
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  p.setAttribute('d', path);
+  p.setAttribute('stroke', '#9FFF00');
+  p.setAttribute('stroke-width', '1');
+  p.setAttribute('fill', 'none');
+  svg.appendChild(p);
+
+  // Endpoint markers (4px filled circles)
+  for (const [cx, cy] of [[x1, y1], [x2, y2]]) {
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('cx', String(cx));
+    c.setAttribute('cy', String(cy));
+    c.setAttribute('r',  '2');
+    c.setAttribute('fill', '#9FFF00');
+    svg.appendChild(c);
+  }
+}

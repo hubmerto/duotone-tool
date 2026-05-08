@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/specimens/:id", "destination": "/" },
+    { "source": "/specimens/:id/", "destination": "/" }
+  ]
+}

@@ -9,6 +9,16 @@
 <body>
   <canvas id="stage"></canvas>
 
+  <!-- Specimen-mode overlay (path /specimens/<id>): composite layout for
+       portfolio renders. Hidden by default; main.js shows it when the
+       URL matches. -->
+  <div id="specimen-composite" aria-hidden="true">
+    <div id="specimen-panel"></div>
+    <svg id="specimen-line" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="specimen-caption"></div>
+    <div id="specimen-split-rule" aria-hidden="true"></div>
+  </div>
+
   <div id="dropzone-overlay" aria-hidden="true">
     <p>DROP A VIDEO FILE ANYWHERE</p>
   </div>

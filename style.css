@@ -121,3 +121,157 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+
+/* =============================================================================
+   Specimen mode — diagrammatic composite for portfolio captures.
+   Triggered by `body.specimen-mode` (set by main.js when URL matches
+   /specimens/<id>). Hides production UI, repositions canvas, paints panel
+   fragment + hairline line + caption inside a fixed 1920×1080 composite.
+   ============================================================================= */
+
+#specimen-composite { display: none; }
+
+body.specimen-mode {
+  background: #0a0a0a;       /* very dark, not pure black — editorial */
+  overflow: hidden;
+}
+
+/* Hide the live UI chrome (panel, hint, drop overlay) */
+body.specimen-mode .tp-dfwv,
+body.specimen-mode #hint,
+body.specimen-mode #dropzone-overlay { display: none !important; }
+
+/* Reposition canvas into the result-image slot */
+body.specimen-mode #stage {
+  position: absolute !important;
+  left: 900px !important;
+  top: 160px !important;
+  width: 900px !important;
+  height: 760px !important;
+  inset: auto !important;
+  background: #000 !important;
+}
+
+/* Composite container — exactly 1920×1080 */
+body.specimen-mode #specimen-composite {
+  display: block;
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1920px;
+  height: 1080px;
+  background: #0a0a0a;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Panel fragment slot */
+#specimen-panel {
+  position: absolute;
+  left: 120px;
+  top: 240px;
+  width: 480px;
+  height: 600px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* One section module — mirrors Tweakpane's brutalist styling */
+.spec-mod {
+  border: 2px solid #0DFF00;
+  background: #000;
+  color: #0DFF00;
+  font-family: var(--mono);
+  padding: 0;
+}
+.spec-mod-title {
+  background: #0a3d00;
+  color: #9FFF00;
+  padding: 6px 10px;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-bottom: 1px solid #0DFF00;
+}
+.spec-mod-row {
+  display: grid;
+  grid-template-columns: 88px 1fr 56px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+.spec-mod-row + .spec-mod-row { border-top: 1px solid #002800; }
+.spec-mod-label {
+  text-transform: uppercase;
+  color: #9FFF00;
+  opacity: 0.85;
+}
+.spec-mod-track {
+  position: relative;
+  height: 8px;
+  background: #001a00;
+  border: 1px solid #0a3d00;
+}
+.spec-mod-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: #0DFF00;
+}
+.spec-mod-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #9FFF00;
+}
+/* Marker dot — used as the line endpoint anchor */
+.spec-mod-marker {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #9FFF00;
+  margin-left: 4px;
+  display: none;
+}
+.spec-mod-row[data-primary="true"] .spec-mod-marker { display: block; }
+
+/* Hairline line + endpoint markers */
+#specimen-line {
+  position: absolute;
+  inset: 0;
+  width: 1920px;
+  height: 1080px;
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* Caption row */
+#specimen-caption {
+  position: absolute;
+  left: 120px;
+  top: 900px;
+  width: 1680px;
+  height: 40px;
+  font-family: var(--mono);
+  font-size: 14px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+  display: flex;
+  align-items: center;
+}
+
+/* Vertical hairline rule for split specimen 05 */
+#specimen-split-rule {
+  display: none;
+  position: absolute;
+  left: 1349px;          /* canvas at 900..1800; midline = 1350 */
+  top: 160px;
+  width: 1px;
+  height: 760px;
+  background: #9FFF00;
+  z-index: 7;
+}
+body.specimen-mode.specimen-split #specimen-split-rule { display: block; }
+
