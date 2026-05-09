@@ -4,16 +4,22 @@
 // orange / green / blue presets share the SAME recipe and differ ONLY in
 // spotColor. Same Two Layer cadence, same speed staging, same boil.
 
+// Recipe authored by hand against a reference clip — exported via
+// "Save preset (json)" then re-imported here as the boot state.
+// Aesthetic: low threshold + multiply blend + heavy speed cycling + the
+// Two Layer pause-and-catch-up morph. Slow field and boil grain are
+// effectively off in this preset (the threshold cut + two layers do all
+// the work).
 const SHARED = {
   // Threshold
-  thresholdBase:    0.50,
-  thresholdLFOAmp:  0.06,
-  thresholdLFOFreq: 0.18,
+  thresholdBase:    0.15,
+  thresholdLFOAmp:  0.04,
+  thresholdLFOFreq: 0.81,
 
   // Intro
-  introMode: 0,                       // 0=develop, 1=radiance, 2=aperture, 3=scanline
+  introMode: 0,
   introDuration: 1.2,
-  introCurve: 1,                      // easeOut
+  introCurve: 1,
   introOriginX: 0.5,
   introOriginY: 0.5,
   introSpread: 0.30,
@@ -22,34 +28,34 @@ const SHARED = {
   introAngle: 0.0,
   introTurbulence: 0.30,
 
-  // Slow field / warp
-  slowNoiseScale: 3.5,
-  slowNoiseSpeed: 0.12,
-  slowAmp: 0.32,
-  warpAmp: 0.0,                       // off in default
+  // Slow field / warp — disabled in this recipe
+  slowNoiseScale: 0.5,
+  slowNoiseSpeed: 0.0,
+  slowAmp: 0.0,
+  warpAmp: 0.0,
 
-  // Boil
-  ditherScale: 600.0,
-  ditherSpeed: 0.7,
-  ditherAmp: 0.18,
+  // Boil — also essentially off; the threshold edge does the cut alone
+  ditherScale: 50,
+  ditherSpeed: 0.02,
+  ditherAmp: 0.0,
 
   // Edge
   softness: 0.018,
 
-  // Speed staging
-  speedMode: 1,                       // 1 = cycle (sin)
+  // Speed staging — cycle 0.9x ↔ 2.0x at 0.5 Hz, snappy
+  speedMode: 1,
   staticSpeed: 0.45,
-  slowSpeed: 0.35,
-  fastSpeed: 1.0,
-  speedCycleFreq: 0.18,
-  speedSmoothing: 0.8,
+  slowSpeed: 0.9,
+  fastSpeed: 2.0,
+  speedCycleFreq: 0.5,
+  speedSmoothing: 0.28,
   stepIntervalMin: 1.5,
   stepIntervalMax: 3.5,
   speedSeed: 1,
 
-  // Two Layer (the morphism)
+  // Two Layer — the morphism
   twoLayerEnabled: true,
-  syncDuration: 1.0,
+  syncDuration: 2.0,
   syncJitter: 0.4,
   holdDuration: 0.5,
   holdJitter: 0.2,
@@ -57,11 +63,11 @@ const SHARED = {
   resyncDuration: 0.1,
   pauseBias: 0.5,
   trailSampleCount: 10,
-  trailStyle: 0,                      // 0=smear, 1=glitch
-  layerBlendMode: 0,                  // 0=luma 50/50
+  trailStyle: 0,
+  layerBlendMode: 2,                  // multiply
   layerBlendBalance: 0.5,
   twoLayerSeed: 42,
-  phaseLockToSpeed: true,             // rebind: ties Two Layer playback to slow/fast
+  phaseLockToSpeed: true,
 };
 
 // orange/green/blue all inherit the same recipe; only spotColor differs.

@@ -389,9 +389,10 @@ async function loadImageFromFile(file) {
 // -----------------------------------------------------------------------------
 // localStorage — last preset + UI state (no video data)
 // -----------------------------------------------------------------------------
-// v6: replaced Temporal Mix with Two Layer pause-and-catch-up. Old
-// temporalMode/temporalMixAmount/etc. keys are dead. New twoLayer* keys.
-const LS_KEY = 'duotone:lastState:v6';
+// v7: adopted user's hand-tuned default — low threshold, multiply blend,
+// snappier speed cycling, slow field + boil disabled. Bumped so existing
+// v6 saved state doesn't override the new defaults.
+const LS_KEY = 'duotone:lastState:v7';
 
 function saveStateToLocalStorage() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
