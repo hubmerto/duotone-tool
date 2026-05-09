@@ -28,7 +28,11 @@
     <p>OR USE THE SOURCE FOLDER (TOP RIGHT)</p>
   </div>
 
-  <video id="source-video" playsinline muted loop crossorigin="anonymous"></video>
+  <!-- Two Layer needs two independent playheads on the same source.
+       videoA is the primary (used as u_videoA + writes to ring buffer).
+       videoB shadows A on the same src URL with its own currentTime / playbackRate. -->
+  <video id="source-video"   playsinline muted loop crossorigin="anonymous"></video>
+  <video id="source-video-b" playsinline muted loop crossorigin="anonymous"></video>
   <img   id="source-image" alt="" crossorigin="anonymous" />
 
   <script type="module" src="/src/main.js"></script>

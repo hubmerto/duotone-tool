@@ -1,126 +1,79 @@
-// Preset definitions. The three "reference" presets target the orange / green /
-// blue webp clips — same recipe across all three, only spotColor differs. The
-// "bare" presets (green / orange / blue) leave temporal mix off and run at
-// normal speed for a cleaner threshold-only look.
+// Preset definitions. The "default" / orange-reference preset is the boot
+// state — what the user sees on a clean first load.
+//
+// orange / green / blue presets share the SAME recipe and differ ONLY in
+// spotColor. Same Two Layer cadence, same speed staging, same boil.
 
 const SHARED = {
-  thresholdBase: 0.50,
-  thresholdLFOAmp: 0.08,
+  // Threshold
+  thresholdBase:    0.50,
+  thresholdLFOAmp:  0.06,
   thresholdLFOFreq: 0.18,
 
-  // intro — mode 0 = develop (existing), 1 = radiance, 2 = aperture, 3 = scanline
-  introMode: 0,
+  // Intro
+  introMode: 0,                       // 0=develop, 1=radiance, 2=aperture, 3=scanline
   introDuration: 1.2,
-  introCurve: 1, // easeOut
+  introCurve: 1,                      // easeOut
   introOriginX: 0.5,
   introOriginY: 0.5,
-  introSpread: 0.25,
+  introSpread: 0.30,
   introFalloff: 0.5,
-  introDirectionality: 0,
-  introAngle: 0,
+  introDirectionality: 0.0,
+  introAngle: 0.0,
   introTurbulence: 0.30,
 
-  // slow ink-blob field
+  // Slow field / warp
   slowNoiseScale: 3.5,
-  slowNoiseSpeed: 0.10,
+  slowNoiseSpeed: 0.12,
   slowAmp: 0.32,
-  warpAmp: 0.018,
+  warpAmp: 0.0,                       // off in default
 
-  // fast boil
+  // Boil
   ditherScale: 600.0,
-  ditherSpeed: 0.55,
-  ditherAmp: 0.07,
-  softness: 0.015,
+  ditherSpeed: 0.7,
+  ditherAmp: 0.18,
 
-  // -- Speed Staging (Module 2) --
-  speedMode: 0,            // 0=static, 1=cycle (sin), 2=step (random hold)
-  staticSpeed: 1.0,
-  slowSpeed: 0.35,
-  fastSpeed: 1.0,
-  speedCycleFreq: 0.18,    // Hz, cycle mode only
-  stepIntervalMin: 1.5,    // s
-  stepIntervalMax: 4.0,    // s
-  speedSmoothing: 0.85,    // 0=instant, 1=very slow ease
-  speedSeed: 1,
+  // Edge
+  softness: 0.018,
 
-  // -- Temporal Mix (Module 1) --
-  temporalMode: 0,         // 0=off, 1=static, 2=pulsing
-  temporalMixAmount: 0.0,
-  temporalOffsetFrames: 22,
-  temporalPulseFreq: 0.22, // Hz, pulsing mode only (overridden by phase lock)
-  temporalPulseAmp: 0.85,
-  phaseLockToSpeed: false, // ties pulse to speed phase (Module 3)
-  temporalShowBufferOnly: false, // debug
-};
-
-// "Bare" preset values — clean threshold-only effect, no temporal mix
-const BARE = { ...SHARED };
-
-// "Reference" preset values — matches the spec's test protocol:
-// cycle speed + pulsing temporal mix + phase lock = the morphism rhythm
-const REFERENCE = {
-  ...SHARED,
-
-  // Threshold — softer LFO than bare since the source already moves slowly
-  thresholdLFOAmp: 0.04,
-  thresholdLFOFreq: 0.15,
-
-  // Slow field — slightly bigger blobs, calmer drift
-  slowNoiseScale: 4.0,
-  slowAmp: 0.22,
-
-  // Boil — finer + more amp
-  ditherScale: 750.0,
-  ditherAmp: 0.10,
-
-  // Edge — sharper
-  softness: 0.012,
-
-  // Speed Staging — cycle mode oscillates between slow-mo and normal
-  speedMode: 1,
+  // Speed staging
+  speedMode: 1,                       // 1 = cycle (sin)
+  staticSpeed: 0.45,
   slowSpeed: 0.35,
   fastSpeed: 1.0,
   speedCycleFreq: 0.18,
-  speedSmoothing: 0.85,
+  speedSmoothing: 0.8,
+  stepIntervalMin: 1.5,
+  stepIntervalMax: 3.5,
+  speedSeed: 1,
 
-  // Temporal Mix — pulsing ghost, phase-locked to speed
-  temporalMode: 2,
-  temporalMixAmount: 0.55,
-  temporalOffsetFrames: 22,
-  temporalPulseAmp: 0.9,
-  phaseLockToSpeed: true,
+  // Two Layer (the morphism)
+  twoLayerEnabled: true,
+  syncDuration: 1.0,
+  syncJitter: 0.4,
+  holdDuration: 0.5,
+  holdJitter: 0.2,
+  catchUpDuration: 0.45,
+  resyncDuration: 0.1,
+  pauseBias: 0.5,
+  trailSampleCount: 10,
+  trailStyle: 0,                      // 0=smear, 1=glitch
+  layerBlendMode: 0,                  // 0=luma 50/50
+  layerBlendBalance: 0.5,
+  twoLayerSeed: 42,
+  phaseLockToSpeed: true,             // rebind: ties Two Layer playback to slow/fast
 };
 
+// orange/green/blue all inherit the same recipe; only spotColor differs.
 export const PRESETS = {
-  // bare (threshold-only)
-  green:  { name: 'green',  spotColor: '#9FFF00', ...BARE },
-  orange: { name: 'orange', spotColor: '#FF4500', ...BARE },
-  blue:   { name: 'blue',   spotColor: '#0066FF', ...BARE },
-
-  // reference (full stack: speed cycle + pulsing temporal mix + phase lock)
-  'orange-reference': { name: 'orange-reference', spotColor: '#E84510', ...REFERENCE },
-  'green-reference':  { name: 'green-reference',  spotColor: '#9FFF00', ...REFERENCE },
-  'blue-reference':   { name: 'blue-reference',   spotColor: '#0066FF', ...REFERENCE },
-
-  // showcase: spatial intro
-  'blue-radiance': {
-    name: 'blue-radiance',
-    spotColor: '#0066FF',
-    ...SHARED,
-    introMode: 1,
-    introOriginX: 0.5,
-    introOriginY: 1.0,
-    introDuration: 2.4,
-    introSpread: 0.45,
-    introFalloff: 0.7,
-    introTurbulence: 0.6,
-    introAngle: -1.5708,
-  },
+  default: { name: 'default', spotColor: '#E84510', ...SHARED },
+  orange:  { name: 'orange',  spotColor: '#E84510', ...SHARED },
+  green:   { name: 'green',   spotColor: '#9FFF00', ...SHARED },
+  blue:    { name: 'blue',    spotColor: '#0066FF', ...SHARED },
 };
 
-// First-load default — orange-reference is the "what was actually wanted"
-// look (spec section: "Make these the defaults").
-export const DEFAULT_PRESET = 'orange-reference';
+// Boot state when no localStorage exists.
+export const DEFAULT_PRESET = 'default';
 
 // ---- helpers ---------------------------------------------------------------
 

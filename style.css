@@ -21,6 +21,7 @@ html, body {
 }
 
 #source-video,
+#source-video-b,
 #source-image {
   /* hidden — used only as texture source */
   position: fixed;

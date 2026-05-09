@@ -100,6 +100,7 @@ let frameCount = 0;
 // -----------------------------------------------------------------------------
 const canvas      = document.getElementById('stage');
 const video       = document.getElementById('source-video');
+const videoB      = document.getElementById('source-video-b');
 const imageEl     = document.getElementById('source-image');
 const dropOverlay = document.getElementById('dropzone-overlay');
 const hint        = document.getElementById('hint');
@@ -181,14 +182,22 @@ const aPos = gl.getAttribLocation(program, 'a_position');
 gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-// video texture
+// video texture A (and image source — they share this slot)
 const texture = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, texture);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,    gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,    gl.CLAMP_TO_EDGE);
-// upload a 1x1 black placeholder so texture is "complete" before first frame
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
+
+// video texture B — Two Layer's secondary playhead
+const textureB = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, textureB);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,    gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,    gl.CLAMP_TO_EDGE);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
 
 // -----------------------------------------------------------------------------
@@ -228,10 +237,23 @@ const HAS_RVFC = typeof HTMLVideoElement !== 'undefined'
 let _currentSpeed = 1.0;
 let lastFrameMs   = performance.now();
 
+// Two Layer pause-and-catch-up state.
+// Phases cycle: sync → holding (one side) → catchup (the held side races to
+// the other) → resync → loop. holdSide alternates each round.
+const twoLayer = {
+  phase:            'sync',
+  nextPhaseAt:      0,
+  holdSide:         'A',
+  isCatchup:        false,
+  catchupHoldPosA:  0,
+  catchupTargetPos: 0,
+  triggerNow:       false,
+};
+
 // uniforms
 const U = {};
 for (const name of [
-  'u_video','u_buffer','u_resolution','u_time','u_frame','u_spotColor',
+  'u_videoA','u_videoB','u_buffer','u_resolution','u_time','u_frame','u_spotColor',
   'u_thresholdBase','u_thresholdLFOAmp','u_thresholdLFOFreq',
   'u_introMode','u_introDuration','u_introCurve',
   'u_introOrigin','u_introSpread','u_introFalloff',
@@ -239,8 +261,9 @@ for (const name of [
   'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp','u_warpAmp',
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
-  'u_bufferSize','u_bufferWriteIndex','u_offsetLayer',
-  'u_temporalEffectiveMix','u_temporalShowBufferOnly',
+  'u_bufferSize','u_bufferWriteIndex',
+  'u_twoLayerEnabled','u_layerBlendMode','u_layerBlendBalance',
+  'u_isCatchupActive','u_trailSampleCount','u_trailStyle',
 ]) U[name] = gl.getUniformLocation(program, name);
 
 // -----------------------------------------------------------------------------
@@ -301,29 +324,42 @@ function hexToRgb(hex) {
   ];
 }
 
-function loadVideoFromFile(file) {
-  if (video.src && video.src.startsWith('blob:')) URL.revokeObjectURL(video.src);
+function _loadBothVideos(srcURL, isBlob) {
+  // Revoke old blob URL only if the new src isn't the same one (Two Layer
+  // shares one blob URL across both elements)
+  if (video.src && video.src.startsWith('blob:') && video.src !== srcURL) {
+    URL.revokeObjectURL(video.src);
+  }
   if (imageEl.src && imageEl.src.startsWith('blob:')) URL.revokeObjectURL(imageEl.src);
   imageEl.removeAttribute('src');
-  video.src = URL.createObjectURL(file);
-  video.loop = sourceState.loop;
+
+  video.src  = srcURL;
+  videoB.src = srcURL;
+  video.loop  = sourceState.loop;
+  videoB.loop = sourceState.loop;
   video.play().catch(() => {});
-  currentSource = 'video';
-  effectStart = performance.now();
-  frameCount = 0;
-  bufferWriteIndex = 0;       // fresh buffer per clip
-  imageBufferFilled = false;  // image buffer state irrelevant now
+  videoB.play().catch(() => {});
+
+  currentSource     = 'video';
+  effectStart       = performance.now();
+  frameCount        = 0;
+  bufferWriteIndex  = 0;
+  imageBufferFilled = false;
+  // Reset Two Layer state machine for the new clip
+  twoLayer.phase            = 'sync';
+  twoLayer.nextPhaseAt      = performance.now() + 1500;
+  twoLayer.holdSide         = 'A';
+  twoLayer.isCatchup        = false;
+  twoLayer.catchupHoldPosA  = 0;
+  twoLayer.catchupTargetPos = 0;
+}
+
+function loadVideoFromFile(file) {
+  _loadBothVideos(URL.createObjectURL(file), true);
 }
 
 function loadVideoFromUrl(url) {
-  video.src = url;
-  video.loop = sourceState.loop;
-  video.play().catch(() => {});
-  currentSource = 'video';
-  effectStart = performance.now();
-  frameCount = 0;
-  bufferWriteIndex = 0;
-  imageBufferFilled = false;
+  _loadBothVideos(url, false);
 }
 
 async function loadImageFromFile(file) {
@@ -353,9 +389,9 @@ async function loadImageFromFile(file) {
 // -----------------------------------------------------------------------------
 // localStorage — last preset + UI state (no video data)
 // -----------------------------------------------------------------------------
-// v5: added Speed Staging state machine (replacing single playbackSpeed) and
-// Phase Lock toggle. Old playbackSpeed key is dead.
-const LS_KEY = 'duotone:lastState:v5';
+// v6: replaced Temporal Mix with Two Layer pause-and-catch-up. Old
+// temporalMode/temporalMixAmount/etc. keys are dead. New twoLayer* keys.
+const LS_KEY = 'duotone:lastState:v6';
 
 function saveStateToLocalStorage() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
@@ -461,17 +497,16 @@ function frameTick() {
     resize();
   }
 
-  // ----- ring buffer write -----------------------------------------------------
-  // Video: buffer writes happen via rVFC (or rAF fallback) outside this loop —
-  // see onVideoFrame() below. This guarantees one buffer slot per *real* video
-  // frame, so offset N is in video frames not display frames.
-  // Image: one-time fill on load.
+  // ----- Two Layer: ring buffer write of A's frames + videoB texture upload ----
+  // Buffer holds N most recent A frames. During catch-up, the shader samples
+  // the most recent N to build the trail. Auto-sized from trailSampleCount.
   const bufferDepth = Math.min(
     TEMPORAL_SIZE_MAX,
-    Math.max(32, Math.ceil((params.temporalOffsetFrames ?? 18) + 16))
+    Math.max(32, (params.trailSampleCount ?? 10) + 22)
   );
+  // Image source — fill all buffer layers once with the static image
   if (currentSource === 'image' && imageEl.naturalWidth > 0 && !imageBufferFilled
-      && (((params.temporalMode | 0) > 0) || (params.temporalShowBufferOnly ? 1 : 0))) {
+      && !!params.twoLayerEnabled) {
     tempCtx.drawImage(imageEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
@@ -483,15 +518,18 @@ function frameTick() {
     }
     imageBufferFilled = true;
   }
-  // rAF fallback for browsers without rVFC (older Firefox before 113)
-  if (!HAS_RVFC && currentSource === 'video') {
-    onVideoFrameWrite();
-  }
+  // rAF fallback when rVFC is unavailable
+  if (!HAS_RVFC && currentSource === 'video') onVideoFrameWrite();
 
-  // ----- offsetLayer for the temporal mix --------------------------------------
-  const liveLayer = ((bufferWriteIndex - 1) % bufferDepth + bufferDepth) % bufferDepth;
-  const offsetFrames = Math.max(1, Math.round(params.temporalOffsetFrames ?? 18));
-  const offsetLayer = ((liveLayer - offsetFrames) % bufferDepth + bufferDepth) % bufferDepth;
+  // Upload videoB to its own texture each render frame (when source is video
+  // and Two Layer is enabled — otherwise we don't need it)
+  if (currentSource === 'video' && !!params.twoLayerEnabled
+      && videoB.readyState >= 2 && videoB.videoWidth > 0) {
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, textureB);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, videoB);
+  }
 
   // ----- effect time + delta --------------------------------------------------
   const t  = (performance.now() - effectStart) / 1000;
@@ -501,8 +539,8 @@ function frameTick() {
   // ----- speed state machine -> video.playbackRate ----------------------------
   const currentSpeed = updateSpeed(t, dt);
 
-  // ----- effective temporal mix (mode + pulse + phase lock) -------------------
-  const effectiveMix = computeTemporalEffectiveMix(t, currentSpeed);
+  // ----- Two Layer phase advancement (mutates twoLayer + sets video.playbackRate)
+  twoLayerAdvance(performance.now(), currentSpeed);
 
   // ----- draw -----------------------------------------------------------------
   gl.useProgram(program);
@@ -511,13 +549,16 @@ function frameTick() {
   const c = hexToRgb(params.spotColor);
   const lp = computeLiveParams();   // base params + modulation offsets
 
-  // bind both texture units
+  // bind texture units: 0 = videoA / image, 1 = ring buffer, 2 = videoB
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
-  gl.uniform1i(U.u_video,  0);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, textureB);
+  gl.uniform1i(U.u_videoA, 0);
   gl.uniform1i(U.u_buffer, 1);
+  gl.uniform1i(U.u_videoB, 2);
 
   gl.uniform2f(U.u_resolution, canvas.width, canvas.height);
   gl.uniform1f(U.u_time, t);
@@ -552,12 +593,15 @@ function frameTick() {
 
   gl.uniform1f(U.u_softness, lp.softness);
 
-  // temporal mix
-  gl.uniform1i(U.u_bufferSize,             bufferDepth);
-  gl.uniform1i(U.u_bufferWriteIndex,       bufferWriteIndex);
-  gl.uniform1i(U.u_offsetLayer,            offsetLayer);
-  gl.uniform1f(U.u_temporalEffectiveMix,   effectiveMix);
-  gl.uniform1i(U.u_temporalShowBufferOnly, params.temporalShowBufferOnly ? 1 : 0);
+  // Two Layer
+  gl.uniform1i(U.u_bufferSize,         bufferDepth);
+  gl.uniform1i(U.u_bufferWriteIndex,   bufferWriteIndex);
+  gl.uniform1i(U.u_twoLayerEnabled,    params.twoLayerEnabled ? 1 : 0);
+  gl.uniform1i(U.u_layerBlendMode,     lp.layerBlendMode | 0);
+  gl.uniform1f(U.u_layerBlendBalance,  lp.layerBlendBalance ?? 0.5);
+  gl.uniform1i(U.u_isCatchupActive,    twoLayer.phase === 'catchup' ? 1 : 0);
+  gl.uniform1i(U.u_trailSampleCount,   Math.max(1, Math.min(16, lp.trailSampleCount | 0 || 10)));
+  gl.uniform1i(U.u_trailStyle,         lp.trailStyle | 0);
 
   // Specimen 05 split-render: draw left half with leftConfig, right with right.
   // Scissor clips the writes; uniforms differ per draw. Single-pass shader,
@@ -600,16 +644,16 @@ function frameTick() {
 }
 
 // =============================================================================
-// Temporal-mix helpers
+// Two Layer helpers
 // =============================================================================
 
-// Single buffer-write step. Called from rVFC on real video-frame boundaries
-// (or from the rAF loop as fallback if rVFC is unavailable).
+// Per-rVFC video-frame buffer write. Captures A's frames into the ring buffer.
+// The buffer fills fastest during catch-up (when A's playbackRate is high),
+// which is exactly when the shader needs the recent-frame trail.
 function onVideoFrameWrite() {
   if (currentSource !== 'video') return;
   if (!(video.readyState >= 2 && video.videoWidth > 0)) return;
-  const active = (params.temporalMode | 0) > 0 || (params.temporalShowBufferOnly === true);
-  if (!active) return;
+  if (!params.twoLayerEnabled) return;
 
   tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
   gl.activeTexture(gl.TEXTURE1);
@@ -620,7 +664,7 @@ function onVideoFrameWrite() {
                    gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
   const depth = Math.min(
     TEMPORAL_SIZE_MAX,
-    Math.max(32, Math.ceil((params.temporalOffsetFrames ?? 18) + 16))
+    Math.max(32, (params.trailSampleCount ?? 10) + 22)
   );
   bufferWriteIndex = (bufferWriteIndex + 1) % depth;
 }
@@ -657,7 +701,8 @@ function updateSpeed(t, dt) {
   const k  = 1 - Math.pow(sm, dt * 60);
   _currentSpeed += (target - _currentSpeed) * k;
 
-  if (currentSource === 'video' && video.duration > 0) {
+  // Two Layer owns playback rate when enabled — don't fight it.
+  if (currentSource === 'video' && video.duration > 0 && !params.twoLayerEnabled) {
     const clamped = Math.max(0.1, Math.min(2.0, _currentSpeed));
     if (Math.abs(video.playbackRate - clamped) > 0.005) video.playbackRate = clamped;
   }
@@ -670,35 +715,107 @@ function hash01(x) {
   return s - Math.floor(s);
 }
 
-// Compute the effective temporal-mix blend strength for this frame,
-// applying mode + pulse + phase lock. Returns 0 to fully bypass.
-function computeTemporalEffectiveMix(t, currentSpeed) {
-  const mode = params.temporalMode | 0;
-  if (mode === 0) return 0;
-  const mix = params.temporalMixAmount ?? 0;
-  if (mix < 0.001) return 0;
-
-  if (mode === 1) {
-    // static
-    return mix;
+// =============================================================================
+// Two Layer state machine — sync → holding → catchup → resync → loop
+// =============================================================================
+// Drives twoLayer.phase + per-phase video.playbackRate. When Two Layer is
+// disabled (or source is image), it does nothing and updateSpeed() owns
+// playback rate as before.
+function twoLayerAdvance(nowMs) {
+  if (currentSource !== 'video' || !params.twoLayerEnabled) {
+    twoLayer.phase = 'sync';
+    twoLayer.isCatchup = false;
+    return;
   }
 
-  // mode === 2: pulsing
-  const amp = Math.max(0, Math.min(1, params.temporalPulseAmp ?? 0.85));
-  let pulse;
+  // Initialize first phase boundary
+  if (twoLayer.nextPhaseAt === 0) {
+    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs();
+  }
 
-  if (params.phaseLockToSpeed) {
-    // Drive the pulse from the speed phase instead of pulseFreq.
-    // slow → ghost peak (1.0). fast → ghost trough (0.0).
-    const slow = params.slowSpeed ?? 0.35;
-    const fast = params.fastSpeed ?? 1.0;
-    const range = fast - slow;
-    const norm  = range > 0 ? (currentSpeed - slow) / range : 0.5;
-    pulse = 1 - Math.max(0, Math.min(1, norm));
+  if (twoLayer.triggerNow) {
+    _twoLayerNextPhase(nowMs);
+    twoLayer.triggerNow = false;
+  } else if (nowMs >= twoLayer.nextPhaseAt) {
+    _twoLayerNextPhase(nowMs);
+  }
+
+  // Per-phase playback rate assignment
+  const phaseLocked = !!params.phaseLockToSpeed;
+  const slowS = params.slowSpeed   ?? 0.35;
+  const fastS = params.fastSpeed   ?? 1.0;
+  const stat  = params.staticSpeed ?? 1.0;
+  const baseRate = phaseLocked ? slowS : stat;
+
+  if (twoLayer.phase === 'sync' || twoLayer.phase === 'resync') {
+    _setRate(video,  baseRate);
+    _setRate(videoB, baseRate);
+  } else if (twoLayer.phase === 'holding') {
+    if (twoLayer.holdSide === 'A') { _setRate(video, 0); _setRate(videoB, baseRate); }
+    else                            { _setRate(videoB, 0); _setRate(video, baseRate); }
+  } else { // catchup — held side races, other side stops
+    const dt = Math.max(0.05, params.catchUpDuration ?? 0.45);
+    const distance = Math.max(0.05, twoLayer.catchupTargetPos - twoLayer.catchupHoldPosA);
+    const rate = Math.max(0.1, Math.min(16, distance / dt));
+    if (twoLayer.holdSide === 'A') { _setRate(videoB, 0); _setRate(video,  rate); }
+    else                            { _setRate(video,  0); _setRate(videoB, rate); }
+  }
+}
+
+function _twoLayerNextPhase(nowMs) {
+  if (twoLayer.phase === 'sync') {
+    // Pick who pauses next (with bias). Alternate by default, biased by pauseBias.
+    const r = hash01(nowMs * 0.0011 + (params.twoLayerSeed ?? 1));
+    const bias = Math.max(0, Math.min(1, params.pauseBias ?? 0.5));
+    twoLayer.holdSide = (r < (1 - bias)) ? 'A' : 'B';
+    twoLayer.phase = 'holding';
+    twoLayer.isCatchup = false;
+    twoLayer.nextPhaseAt = nowMs + _sampleHoldMs();
+  } else if (twoLayer.phase === 'holding') {
+    // Save catchup positions: held side at hold pos, other (moving) at its current
+    const heldVid  = twoLayer.holdSide === 'A' ? video  : videoB;
+    const otherVid = twoLayer.holdSide === 'A' ? videoB : video;
+    twoLayer.catchupHoldPosA  = heldVid.currentTime;
+    twoLayer.catchupTargetPos = otherVid.currentTime;
+    twoLayer.phase = 'catchup';
+    twoLayer.isCatchup = true;
+    twoLayer.nextPhaseAt = nowMs + (params.catchUpDuration ?? 0.45) * 1000;
+  } else if (twoLayer.phase === 'catchup') {
+    // Resync: force B to A (don't trust drift)
+    if (twoLayer.holdSide === 'A') {
+      videoB.currentTime = video.currentTime;
+    } else {
+      video.currentTime  = videoB.currentTime;
+    }
+    twoLayer.phase = 'resync';
+    twoLayer.isCatchup = false;
+    twoLayer.nextPhaseAt = nowMs + (params.resyncDuration ?? 0.1) * 1000;
+  } else { // resync → sync
+    twoLayer.phase = 'sync';
+    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs();
+  }
+}
+
+function _setRate(vid, rate) {
+  if (!vid || vid.duration <= 0) return;
+  const r = Math.max(0, Math.min(16, rate));
+  if (r === 0) {
+    if (!vid.paused) vid.pause();
   } else {
-    pulse = 0.5 + 0.5 * Math.sin(2 * Math.PI * (params.temporalPulseFreq ?? 0.22) * t);
+    if (vid.paused) vid.play().catch(() => {});
+    if (Math.abs(vid.playbackRate - r) > 0.01) vid.playbackRate = r;
   }
-  return mix * ((1 - amp) + amp * pulse);
+}
+
+function _sampleSyncMs() {
+  const base = (params.syncDuration ?? 1.0) * 1000;
+  const jit  = (params.syncJitter   ?? 0.4) * 1000;
+  return base + (hash01(performance.now() * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
+}
+function _sampleHoldMs() {
+  const base = (params.holdDuration ?? 0.5) * 1000;
+  const jit  = (params.holdJitter   ?? 0.2) * 1000;
+  return base + (hash01(performance.now() * 0.0009 + 0.371 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
 }
 
 // -----------------------------------------------------------------------------
@@ -764,15 +881,11 @@ let updateSpeedVis = () => {};
     view: 'list',
     label: 'preset',
     options: [
-      { text: 'orange · reference', value: 'orange-reference' },
-      { text: 'green · reference',  value: 'green-reference'  },
-      { text: 'blue · reference',   value: 'blue-reference'   },
-      { text: '— bare —',           value: 'custom'           },
-      { text: 'green',              value: 'green'            },
-      { text: 'orange',             value: 'orange'           },
-      { text: 'blue',               value: 'blue'             },
-      { text: 'blue · radiance',    value: 'blue-radiance'    },
-      { text: 'custom',             value: 'custom'           },
+      { text: 'default (orange ref)', value: 'default' },
+      { text: 'orange',               value: 'orange'  },
+      { text: 'green',                value: 'green'   },
+      { text: 'blue',                 value: 'blue'    },
+      { text: 'custom',               value: 'custom'  },
     ],
     value: sourceState.preset,
   }).on('change', (ev) => {
@@ -874,44 +987,50 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
 }
 
-// --- Temporal Mix ---
-// Blend the live frame with a frame N back in luma. Modes:
-//   0 = off       — true bypass, no buffer reads
-//   1 = static    — constant blend at mixAmount
-//   2 = pulsing   — mixAmount cycles at pulseFreq Hz, or by Phase Lock to speed
+// --- TWO LAYER ---
+// Two video playheads on the same source. Cycles through 4 phases:
+// sync (both play) → holding (one pauses) → catchup (held side races to the
+// other, leaving a luma trail) → resync (snap, brief breath) → loop. The
+// alternation of which side holds gives the "morphing humans" rhythm.
 {
-  const f = pane.addFolder({ title: 'Temporal Mix', expanded: false });
+  const f = pane.addFolder({ title: 'TWO LAYER', expanded: false });
 
-  f.addBlade({
-    view: 'list',
-    label: 'mode',
+  f.addBinding(params, 'twoLayerEnabled',  { label: 'enabled' })
+    .on('change', () => updateTempVis());
+
+  const bSync   = f.addBinding(params, 'syncDuration',    { label: 'sync (s)',     min: 0.5, max: 6.0, step: 0.05 });
+  const bSyncJ  = f.addBinding(params, 'syncJitter',      { label: 'sync jitter',  min: 0,   max: 1.0, step: 0.05 });
+  const bHold   = f.addBinding(params, 'holdDuration',    { label: 'hold (s)',     min: 0.2, max: 2.0, step: 0.05 });
+  const bHoldJ  = f.addBinding(params, 'holdJitter',      { label: 'hold jitter',  min: 0,   max: 0.5, step: 0.02 });
+  const bCatch  = f.addBinding(params, 'catchUpDuration', { label: 'catch-up (s)', min: 0.2, max: 1.5, step: 0.05 });
+  const bResy   = f.addBinding(params, 'resyncDuration',  { label: 'resync (s)',   min: 0,   max: 1.0, step: 0.05 });
+  const bBias   = f.addBinding(params, 'pauseBias',       { label: 'pause bias',   min: 0,   max: 1,   step: 0.01 });
+  const bTSamp  = f.addBinding(params, 'trailSampleCount',{ label: 'trail samples',min: 4,   max: 16,  step: 1    });
+  const bTStyle = f.addBlade({
+    view: 'list', label: 'trail style',
+    options: [{ text: 'smear',  value: 0 }, { text: 'glitch', value: 1 }],
+    value: params.trailStyle | 0,
+  });
+  bTStyle.on('change', (ev) => { params.trailStyle = ev.value | 0; });
+  const bMode   = f.addBlade({
+    view: 'list', label: 'blend mode',
     options: [
-      { text: 'off',     value: 0 },
-      { text: 'static',  value: 1 },
-      { text: 'pulsing', value: 2 },
+      { text: 'luma 50/50', value: 0 },
+      { text: 'screen',     value: 1 },
+      { text: 'multiply',   value: 2 },
     ],
-    value: params.temporalMode | 0,
-  }).on('change', (ev) => { params.temporalMode = ev.value | 0; updateTempVis(); });
-
-  const bMix    = f.addBinding(params, 'temporalMixAmount',    { label: 'mix amount',    min: 0,    max: 1,    step: 0.01 });
-  const bOff    = f.addBinding(params, 'temporalOffsetFrames', { label: 'offset frames', min: 1,    max: 60,   step: 1    });
-  const bFreq   = f.addBinding(params, 'temporalPulseFreq',    { label: 'pulse freq (hz)', min: 0.05, max: 1.0, step: 0.01 });
-  const bAmp    = f.addBinding(params, 'temporalPulseAmp',     { label: 'pulse amp',     min: 0,    max: 1,    step: 0.01 });
-  const bPhase  = f.addBinding(params, 'phaseLockToSpeed',     { label: 'phase lock to speed' });
-  const bDebug  = f.addBinding(params, 'temporalShowBufferOnly', { label: 'show buffer only' });
-
-  bPhase.on('change', () => updateTempVis());
+    value: params.layerBlendMode | 0,
+  });
+  bMode.on('change', (ev) => { params.layerBlendMode = ev.value | 0; });
+  const bBal    = f.addBinding(params, 'layerBlendBalance', { label: 'blend balance', min: 0, max: 1, step: 0.01 });
+  const bPhase  = f.addBinding(params, 'phaseLockToSpeed',  { label: 'phase lock to speed' });
+  const bSeed   = f.addBinding(params, 'twoLayerSeed',      { label: 'seed', min: 0, max: 9999, step: 1 });
+  f.addButton({ title: 'Trigger now' }).on('click', () => { twoLayer.triggerNow = true; });
 
   updateTempVis = function () {
-    const m   = params.temporalMode | 0;
-    const off = m === 0;
-    const pulsing = m === 2;
-    const locked  = pulsing && !!params.phaseLockToSpeed;
-    bMix.hidden   = off;
-    bOff.hidden   = off;
-    bFreq.hidden  = !pulsing || locked;
-    bAmp.hidden   = !pulsing;
-    bPhase.hidden = !pulsing;
+    const enabled = !!params.twoLayerEnabled;
+    [bSync, bSyncJ, bHold, bHoldJ, bCatch, bResy, bBias,
+     bTSamp, bTStyle, bMode, bBal, bPhase, bSeed].forEach((b) => { b.hidden = !enabled; });
   };
   updateTempVis();
 }
@@ -1081,6 +1200,18 @@ let updateSpeedVis = () => {};
       recordingPath = null;
       recBtn.title = '● record';
     }
+  });
+
+  f.addButton({ title: 'Reset to default' }).on('click', () => {
+    applyPreset(params, PRESETS[DEFAULT_PRESET]);
+    sourceState.preset = DEFAULT_PRESET;
+    pane.refresh();
+    updateIntroVis();
+    updateTempVis();
+    updateSpeedVis();
+    effectStart = performance.now();
+    frameCount = 0;
+    saveStateToLocalStorage();
   });
 
   f.addButton({ title: 'Save preset (json)' }).on('click', () => {

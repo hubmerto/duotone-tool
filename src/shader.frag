@@ -1,27 +1,25 @@
 #version 300 es
 // =============================================================================
-// 1-bit duotone with animated "boiling threshold" + temporal effects + radiance
-// intro. Single-pass.
+// 1-bit duotone with animated "boiling threshold" + Two Layer pause-and-catch-up
+// + radiance intro. Single-pass.
 //
 // Pipeline:
-//   video frame ──► (JS) write quarter-res to ring-buffer layer
+//   videoA & videoB ──► (JS) per-rVFC write to ring buffer (A's frames only,
+//                       since A is the layer that does catch-up trail sampling)
 //                       │
 //                       ▼
-//   shader: sampleTemporal(uv)  ─── stutter / morph / rewind / mix-all
-//                       │
+//   shader: sampleTwoLayer(uv) — composites layer A and B in luma space
+//                       │       (A may be a trail-blend during catch-up phase)
 //                       ▼
 //                     luma
 //                       │
 //                       ▼
-//   slow fbm field  →  warpedUV (re-sampled if mode==0; else passed in)
+//   slow fbm field  →  warpedUV
 //   fast blue noise →  threshold T
 //   per-pixel introT (4 modes: develop, radiance, aperture, scanline)
 //                       │
 //                       ▼
 //                  smoothstep mask  →  duotone mix
-//
-// All randomness is seeded by u_frame / u_time / u_temporalSeed so recordings
-// are reproducible.
 // =============================================================================
 
 precision highp float;
@@ -31,8 +29,9 @@ in vec2 v_uv;
 out vec4 fragColor;
 
 // ----- texture inputs -----------------------------------------------------------
-uniform sampler2D       u_video;             // current live video frame
-uniform sampler2DArray  u_buffer;            // ring buffer of past quarter-res frames
+uniform sampler2D       u_videoA;            // live frame from layer A
+uniform sampler2D       u_videoB;            // live frame from layer B
+uniform sampler2DArray  u_buffer;            // ring buffer of past A frames
 
 // ----- frame state --------------------------------------------------------------
 uniform vec2  u_resolution;
@@ -50,13 +49,13 @@ uniform float u_thresholdLFOFreq;
 // ----- intro (4 modes) ----------------------------------------------------------
 uniform int   u_introMode;            // 0=develop, 1=radiance, 2=aperture, 3=scanline
 uniform float u_introDuration;
-uniform int   u_introCurve;           // 0=linear, 1=easeOut, 2=easeInOut
-uniform vec2  u_introOrigin;          // 0..1 in UV space
-uniform float u_introSpread;          // wavefront thickness
-uniform float u_introFalloff;         // 0=hard edge, 1=soft halo
-uniform float u_introDirectionality;  // 0=radial, 1=directional (radiance mode only)
-uniform float u_introAngle;           // radians
-uniform float u_introTurbulence;      // 0..1 fbm warp on the wavefront
+uniform int   u_introCurve;
+uniform vec2  u_introOrigin;
+uniform float u_introSpread;
+uniform float u_introFalloff;
+uniform float u_introDirectionality;
+uniform float u_introAngle;
+uniform float u_introTurbulence;
 
 // ----- slow ink-blob field ------------------------------------------------------
 uniform float u_slowNoiseScale;
@@ -72,32 +71,24 @@ uniform float u_ditherAmp;
 // ----- edge ---------------------------------------------------------------------
 uniform float u_softness;
 
-// ----- temporal mix --------------------------------------------------------------
-// Sample the video at two time positions and blend in luma:
-//   A: current frame (live, from u_video)
-//   B: a frame N back, from the ring buffer at u_offsetLayer
-// All mode logic + phase-lock + speed coupling is computed in JS so the
-// shader stays simple. JS sends one effective scalar per frame.
-uniform int   u_offsetLayer;             // JS-resolved layer index for the past frame
-uniform float u_temporalEffectiveMix;    // 0..1, JS already applied mode + phase lock
-uniform int   u_temporalShowBufferOnly;  // debug: 1 = output offset luma alone
+// ----- Two Layer compositing ----------------------------------------------------
+// All phase / timing logic lives in JS; the shader just samples + composites.
+uniform int   u_twoLayerEnabled;        // 1 = composite A+B, 0 = bypass (use A only)
+uniform int   u_layerBlendMode;         // 0=luma 50/50, 1=screen, 2=multiply
+uniform float u_layerBlendBalance;      // 0..1 (0 = full B, 1 = full A)
+uniform int   u_isCatchupActive;        // 1 = render A as trail-blend over buffer
+uniform int   u_trailSampleCount;       // 4..16
+uniform int   u_trailStyle;             // 0=smear (weighted avg), 1=glitch (max)
+uniform int   u_bufferSize;             // ring-buffer wrap modulus
+uniform int   u_bufferWriteIndex;       // next-to-write slot
 
 // ============================================================================
 // helpers
 // ============================================================================
-
-float hash11(float p) {
-    p = fract(p * 0.1031);
-    p *= p + 33.33;
-    p *= p + p;
-    return fract(p);
-}
-
 float hash21(vec2 p) {
     p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
     return -1.0 + 2.0 * fract(p.x * p.y * (p.x + p.y));
 }
-
 float vnoise(vec2 p) {
     vec2 i = floor(p);
     vec2 f = fract(p);
@@ -108,101 +99,124 @@ float vnoise(vec2 p) {
         u.y
     );
 }
-
 float fbm(vec2 p) {
     float v = 0.0;
     float a = 0.5;
-    for (int i = 0; i < 4; i++) {
-        v += a * vnoise(p);
-        p *= 2.02;
-        a *= 0.5;
-    }
+    for (int i = 0; i < 4; i++) { v += a * vnoise(p); p *= 2.02; a *= 0.5; }
     return v;
 }
-
 float pseudoBlue(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
-
 float ease(float t, int curve) {
     if (curve == 0) return t;
     if (curve == 1) return 1.0 - pow(1.0 - t, 3.0);
     return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) * 0.5;
 }
+int wrapLayer(int idx) {
+    int s = max(u_bufferSize, 1);
+    return ((idx % s) + s) % s;
+}
+float lumaOf(vec3 rgb) { return dot(rgb, vec3(0.2126, 0.7152, 0.0722)); }
 
 // ============================================================================
-// temporal mix — luma blend between current frame and a frame N back
+// Two-Layer compositing — produces a single luma scalar that the threshold
+// pass operates on. Logic by phase:
+//
+//   not-catchup (sync / hold / resync):
+//     lumaA = luma(u_videoA)
+//     lumaB = luma(u_videoB)
+//     out   = blend(lumaA, lumaB) per layerBlendMode + balance
+//
+//   catchup:
+//     lumaA = trail-blend of N past A frames from u_buffer (smear or glitch)
+//     lumaB = luma(u_videoB)        (B is paused — its texture is its frozen frame)
+//     out   = blend(lumaA, lumaB) per layerBlendMode + balance
+//
+//   twoLayerEnabled = 0:
+//     out   = luma(u_videoA)        (full bypass — single layer pipeline)
 // ============================================================================
-//
-// The blend happens BEFORE the threshold pass — the threshold operates on the
-// pre-blended luma signal. This is what produces the "two figures dissolving
-// into themselves a few frames later" look from the orange reference clip.
-//
-// The shader returns luma directly (not RGB) — saves a redundant dot-product
-// downstream since the rest of the pipeline only uses luma.
-//
-float sampleMixedLuma(vec2 uv) {
-    vec3 cur = texture(u_video, uv).rgb;
-    float lumaCur = dot(cur, vec3(0.2126, 0.7152, 0.0722));
-
-    // Show-buffer-only debug: emit just the offset frame's luma
-    if (u_temporalShowBufferOnly == 1) {
-        vec3 dbg = texture(u_buffer, vec3(uv, float(u_offsetLayer))).rgb;
-        return dot(dbg, vec3(0.2126, 0.7152, 0.0722));
+float sampleTwoLayer(vec2 uv) {
+    if (u_twoLayerEnabled == 0) {
+        return lumaOf(texture(u_videoA, uv).rgb);
     }
 
-    // True bypass — JS sends 0 when mode=off or amount=0
-    if (u_temporalEffectiveMix < 0.001) {
-        return lumaCur;
+    // --- Layer A: live frame, OR trail-blend during catch-up ---
+    float lumaA;
+    if (u_isCatchupActive == 1 && u_trailSampleCount > 0) {
+        int liveLayer = wrapLayer(u_bufferWriteIndex - 1);
+        // Walk back through the most recent N buffer slots — these are A's
+        // frames captured during the active catch-up race. Newest = highest
+        // weight in smear; max() in glitch.
+        float accum  = (u_trailStyle == 1) ? 0.0 : 0.0;
+        float wsum   = 0.0;
+        for (int i = 0; i < 16; i++) {
+            if (i >= u_trailSampleCount) break;
+            int layer = wrapLayer(liveLayer - i);
+            float l   = lumaOf(texture(u_buffer, vec3(uv, float(layer))).rgb);
+            if (u_trailStyle == 1) {
+                // glitch — max in luma
+                accum = max(accum, l);
+            } else {
+                // smear — weighted avg, oldest 0.4, newest 1.0
+                float t  = 1.0 - float(i) / max(1.0, float(u_trailSampleCount - 1));
+                float w  = 0.4 + 0.6 * t;
+                accum   += l * w;
+                wsum    += w;
+            }
+        }
+        lumaA = (u_trailStyle == 1) ? accum : (accum / max(1e-4, wsum));
+    } else {
+        lumaA = lumaOf(texture(u_videoA, uv).rgb);
     }
 
-    vec3 off = texture(u_buffer, vec3(uv, float(u_offsetLayer))).rgb;
-    float lumaOff = dot(off, vec3(0.2126, 0.7152, 0.0722));
-    return mix(lumaCur, lumaOff, clamp(u_temporalEffectiveMix, 0.0, 1.0));
+    // --- Layer B: always live frame from videoB ---
+    float lumaB = lumaOf(texture(u_videoB, uv).rgb);
+
+    // --- Composite ---
+    float bal = clamp(u_layerBlendBalance, 0.0, 1.0);
+    float out_;
+    if (u_layerBlendMode == 1) {
+        // screen blend in luma
+        out_ = 1.0 - (1.0 - lumaA) * (1.0 - lumaB);
+        // bias toward A or B per balance — (1-bal)*B-leaning vs bal*A-leaning
+        out_ = mix(lumaB, mix(lumaA, out_, 0.6), bal);
+    } else if (u_layerBlendMode == 2) {
+        // multiply
+        out_ = lumaA * lumaB;
+        out_ = mix(lumaB, mix(lumaA, out_, 0.6), bal);
+    } else {
+        // luma 50/50 with balance — simple linear mix
+        out_ = mix(lumaB, lumaA, bal);
+    }
+    return clamp(out_, 0.0, 1.0);
 }
 
 // ============================================================================
-// per-pixel intro progress — module 2
+// per-pixel intro progress (unchanged)
 // ============================================================================
-//
-// Returns 0 (unaffected → black-out at intro start) ramping to 1 (live effect).
-// Mode 0: global scalar (existing develop intro).
-// Modes 1-3: spatial wavefront, fbm-perturbed for an organic boundary.
-//
 float computeIntroT(vec2 uv) {
     float t        = clamp(u_time / max(u_introDuration, 1e-4), 0.0, 1.0);
     float t_eased  = ease(t, u_introCurve);
+    if (u_introMode == 0) return t_eased;
 
-    if (u_introMode == 0) {
-        return t_eased;
-    }
-
-    // distance-from-front depending on mode
     float dist;
     if (u_introMode == 1) {
-        // radiance: outward from origin (optionally biased toward an angle)
         float radial = length(uv - u_introOrigin);
         vec2  dir    = vec2(cos(u_introAngle), sin(u_introAngle));
         float direct = dot(uv - u_introOrigin, dir) + 0.7;
         dist = mix(radial, direct, clamp(u_introDirectionality, 0.0, 1.0));
     } else if (u_introMode == 2) {
-        // aperture: contracts inward — far points "exposed" first, center last
         dist = 1.0 - length(uv - u_introOrigin);
     } else {
-        // scanline: linear wavefront along u_introAngle
         vec2 dir = vec2(cos(u_introAngle), sin(u_introAngle));
         dist = dot(uv - u_introOrigin, dir) + 0.7;
     }
-
-    // fbm perturbation — organic instead of mechanical
     dist += (fbm(uv * 3.0 + u_time * 0.15) - 0.5) * u_introTurbulence;
 
     float wavefront = t_eased * (1.0 + u_introSpread);
     float p = smoothstep(wavefront - u_introSpread, wavefront, dist);
     p = pow(max(p, 0.0), mix(1.0, 0.3, clamp(u_introFalloff, 0.0, 1.0)));
-
-    // p == 1 → not yet reached; p == 0 → fully exposed
-    // existing convention: introT == 0 means "intro start" (black-out)
     return 1.0 - p;
 }
 
@@ -212,41 +226,31 @@ float computeIntroT(vec2 uv) {
 void main() {
     vec2 uv = v_uv;
 
-    // slow ink-blob field
     vec2 p = uv * u_slowNoiseScale + u_time * u_slowNoiseSpeed;
     float slowField = fbm(p + fbm(p + fbm(p)));
 
-    // UV warp (morphism)
     vec2 warpVec = vec2(
         fbm(p + vec2(0.00, 0.00)),
         fbm(p + vec2(5.20, 1.30))
     ) * u_warpAmp;
     vec2 warpedUV = uv + warpVec;
 
-    // luma — sampled through temporal-mix pass at warpedUV
-    // (returns luma directly — the mix happens in luma space)
-    float luma = sampleMixedLuma(warpedUV);
+    // luma — composited from two video layers (with optional trail during catchup)
+    float luma = sampleTwoLayer(warpedUV);
 
-    // fast boil
     float ditherTime = float(u_frame) * 0.61803398875 * u_ditherSpeed;
     float fastNoise  = fract(pseudoBlue(uv * u_ditherScale) + ditherTime) - 0.5;
 
-    // LFO
     float lfo = u_thresholdLFOAmp * sin(6.28318530718 * u_thresholdLFOFreq * u_time);
 
-    // composite threshold
     float T = u_thresholdBase
             + lfo
             + slowField * u_slowAmp
             + fastNoise * u_ditherAmp;
 
-    // per-pixel intro
     float introT  = computeIntroT(uv);
     float T_final = mix(1.0, T, introT);
 
-    // soft edge
     float mask = smoothstep(T_final - u_softness, T_final + u_softness, luma);
-
-    // duotone
-    fragColor = vec4(mix(u_spotColor, vec3(0.0), 1.0 - mask), 1.0);
+    fragColor  = vec4(mix(u_spotColor, vec3(0.0), 1.0 - mask), 1.0);
 }
