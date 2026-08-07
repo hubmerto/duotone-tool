@@ -40,6 +40,7 @@ uniform int   u_frame;
 
 // ----- color --------------------------------------------------------------------
 uniform vec3  u_spotColor;
+uniform int   u_colorMode;            // 0=spot color, 1=original video colors
 
 // ----- threshold ----------------------------------------------------------------
 uniform float u_thresholdBase;
@@ -136,58 +137,68 @@ float lumaOf(vec3 rgb) { return dot(rgb, vec3(0.2126, 0.7152, 0.0722)); }
 //   twoLayerEnabled = 0:
 //     out   = luma(u_videoA)        (full bypass — single layer pipeline)
 // ============================================================================
-float sampleTwoLayer(vec2 uv) {
+// In spot mode (u_colorMode == 0) every sample collapses to vec3(luma) before
+// blending, so the per-channel math below is bit-identical to the old
+// luma-scalar path. In original mode (1) samples keep their RGB and the same
+// blends run per channel — the mask luma is taken from the composite.
+vec3 srcSample(sampler2D tex, vec2 uv) {
+    vec3 rgb = texture(tex, uv).rgb;
+    return (u_colorMode == 1) ? rgb : vec3(lumaOf(rgb));
+}
+
+vec3 sampleTwoLayer(vec2 uv) {
     if (u_twoLayerEnabled == 0) {
-        return lumaOf(texture(u_videoA, uv).rgb);
+        return srcSample(u_videoA, uv);
     }
 
     // --- Layer A: live frame, OR trail-blend during catch-up ---
-    float lumaA;
+    vec3 colA;
     if (u_isCatchupActive == 1 && u_trailSampleCount > 0) {
         int liveLayer = wrapLayer(u_bufferWriteIndex - 1);
         // Walk back through the most recent N buffer slots — these are A's
         // frames captured during the active catch-up race. Newest = highest
         // weight in smear; max() in glitch.
-        float accum  = (u_trailStyle == 1) ? 0.0 : 0.0;
+        vec3  accum  = vec3(0.0);
         float wsum   = 0.0;
         for (int i = 0; i < 16; i++) {
             if (i >= u_trailSampleCount) break;
             int layer = wrapLayer(liveLayer - i);
-            float l   = lumaOf(texture(u_buffer, vec3(uv, float(layer))).rgb);
+            vec3 s = texture(u_buffer, vec3(uv, float(layer))).rgb;
+            if (u_colorMode != 1) s = vec3(lumaOf(s));
             if (u_trailStyle == 1) {
-                // glitch — max in luma
-                accum = max(accum, l);
+                // glitch — max per channel (max in luma for spot mode)
+                accum = max(accum, s);
             } else {
                 // smear — weighted avg, oldest 0.4, newest 1.0
                 float t  = 1.0 - float(i) / max(1.0, float(u_trailSampleCount - 1));
                 float w  = 0.4 + 0.6 * t;
-                accum   += l * w;
+                accum   += s * w;
                 wsum    += w;
             }
         }
-        lumaA = (u_trailStyle == 1) ? accum : (accum / max(1e-4, wsum));
+        colA = (u_trailStyle == 1) ? accum : (accum / max(1e-4, wsum));
     } else {
-        lumaA = lumaOf(texture(u_videoA, uv).rgb);
+        colA = srcSample(u_videoA, uv);
     }
 
     // --- Layer B: always live frame from videoB ---
-    float lumaB = lumaOf(texture(u_videoB, uv).rgb);
+    vec3 colB = srcSample(u_videoB, uv);
 
     // --- Composite ---
     float bal = clamp(u_layerBlendBalance, 0.0, 1.0);
-    float out_;
+    vec3 out_;
     if (u_layerBlendMode == 1) {
-        // screen blend in luma
-        out_ = 1.0 - (1.0 - lumaA) * (1.0 - lumaB);
+        // screen blend
+        out_ = 1.0 - (1.0 - colA) * (1.0 - colB);
         // bias toward A or B per balance — (1-bal)*B-leaning vs bal*A-leaning
-        out_ = mix(lumaB, mix(lumaA, out_, 0.6), bal);
+        out_ = mix(colB, mix(colA, out_, 0.6), bal);
     } else if (u_layerBlendMode == 2) {
         // multiply
-        out_ = lumaA * lumaB;
-        out_ = mix(lumaB, mix(lumaA, out_, 0.6), bal);
+        out_ = colA * colB;
+        out_ = mix(colB, mix(colA, out_, 0.6), bal);
     } else {
-        // luma 50/50 with balance — simple linear mix
-        out_ = mix(lumaB, lumaA, bal);
+        // 50/50 with balance — simple linear mix
+        out_ = mix(colB, colA, bal);
     }
     return clamp(out_, 0.0, 1.0);
 }
@@ -226,17 +237,25 @@ float computeIntroT(vec2 uv) {
 void main() {
     vec2 uv = v_uv;
 
+    // Slow field + warp are pure ALU cost when their amps are 0 (the default
+    // preset ships both off) — skip the fbm stacks entirely in that case.
     vec2 p = uv * u_slowNoiseScale + u_time * u_slowNoiseSpeed;
-    float slowField = fbm(p + fbm(p + fbm(p)));
+    float slowField = 0.0;
+    if (u_slowAmp > 0.0001) {
+        slowField = fbm(p + fbm(p + fbm(p)));
+    }
 
-    vec2 warpVec = vec2(
-        fbm(p + vec2(0.00, 0.00)),
-        fbm(p + vec2(5.20, 1.30))
-    ) * u_warpAmp;
-    vec2 warpedUV = uv + warpVec;
+    vec2 warpedUV = uv;
+    if (u_warpAmp > 0.0001) {
+        warpedUV = uv + vec2(
+            fbm(p + vec2(0.00, 0.00)),
+            fbm(p + vec2(5.20, 1.30))
+        ) * u_warpAmp;
+    }
 
-    // luma — composited from two video layers (with optional trail during catchup)
-    float luma = sampleTwoLayer(warpedUV);
+    // composite from two video layers (with optional trail during catchup)
+    vec3  comp = sampleTwoLayer(warpedUV);
+    float luma = lumaOf(comp);
 
     float ditherTime = float(u_frame) * 0.61803398875 * u_ditherSpeed;
     float fastNoise  = fract(pseudoBlue(uv * u_ditherScale) + ditherTime) - 0.5;
@@ -252,5 +271,8 @@ void main() {
     float T_final = mix(1.0, T, introT);
 
     float mask = smoothstep(T_final - u_softness, T_final + u_softness, luma);
-    fragColor  = vec4(mix(u_spotColor, vec3(0.0), 1.0 - mask), 1.0);
+    // spot mode: flat spot color as the ink. original mode: the video's own
+    // colors as the ink — same threshold cut, black stays black.
+    vec3 ink   = (u_colorMode == 1) ? comp : u_spotColor;
+    fragColor  = vec4(mix(ink, vec3(0.0), 1.0 - mask), 1.0);
 }

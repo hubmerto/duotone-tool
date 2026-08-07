@@ -32,7 +32,9 @@ if (SPECIMEN) document.body.classList.add('specimen-mode');
 // -----------------------------------------------------------------------------
 // state
 // -----------------------------------------------------------------------------
-const params = { ...PRESETS[DEFAULT_PRESET] };
+// colorMode lives outside the presets on purpose: 0 = spot color (classic),
+// 1 = original video colors. Switching orange/green/blue won't reset it.
+const params = { colorMode: 0, ...PRESETS[DEFAULT_PRESET] };
 // Format is the single primary control; engine is derived from it.
 //   mp4         -> WebCodecs H.264 (Chrome/Firefox/Edge; not Safari)
 //   webm        -> MediaRecorder VP9 (real-time, all browsers)
@@ -182,14 +184,17 @@ const aPos = gl.getAttribLocation(program, 'a_position');
 gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-// video texture A (and image source — they share this slot)
+// video texture A (and image source — they share this slot).
+// RGBA, not RGB — RGB uploads force a CPU swizzle in most drivers and were a
+// measurable part of the per-frame cost. texState tracks allocated dims so
+// steady-state frames go through texSubImage2D (no realloc).
 const texture = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, texture);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,    gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,    gl.CLAMP_TO_EDGE);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
 
 // video texture B — Two Layer's secondary playhead
 const textureB = gl.createTexture();
@@ -198,7 +203,30 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,    gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,    gl.CLAMP_TO_EDGE);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+
+const texStateA = { w: 1, h: 1 };
+const texStateB = { w: 1, h: 1 };
+
+// Dirty flags: with rVFC available we only upload a video texture when the
+// element actually produced a new frame — not once per display frame. A 30fps
+// clip on a 120Hz display was uploading the same 1080p frame 4× over (× two
+// videos with Two Layer on), which is where most of the lag came from.
+let videoADirty = true;
+let videoBDirty = true;
+
+function uploadVideoFrame(unit, tex, state, vid) {
+  gl.activeTexture(unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  if (state.w !== vid.videoWidth || state.h !== vid.videoHeight) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vid);
+    state.w = vid.videoWidth;
+    state.h = vid.videoHeight;
+  } else {
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, vid);
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Temporal ring buffer — quarter-res past frames in a TEXTURE_2D_ARRAY. The
@@ -253,7 +281,7 @@ const twoLayer = {
 // uniforms
 const U = {};
 for (const name of [
-  'u_videoA','u_videoB','u_buffer','u_resolution','u_time','u_frame','u_spotColor',
+  'u_videoA','u_videoB','u_buffer','u_resolution','u_time','u_frame','u_spotColor','u_colorMode',
   'u_thresholdBase','u_thresholdLFOAmp','u_thresholdLFOFreq',
   'u_introMode','u_introDuration','u_introCurve',
   'u_introOrigin','u_introSpread','u_introFalloff',
@@ -341,6 +369,8 @@ function _loadBothVideos(srcURL, isBlob) {
   videoB.play().catch(() => {});
 
   currentSource     = 'video';
+  videoADirty       = true;
+  videoBDirty       = true;
   effectStart       = performance.now();
   frameCount        = 0;
   bufferWriteIndex  = 0;
@@ -371,7 +401,9 @@ async function loadImageFromFile(file) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, imageEl);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageEl);
+  texStateA.w = imageEl.naturalWidth;
+  texStateA.h = imageEl.naturalHeight;
 
   // pause & detach video so we don't keep blitting black frames over the image
   video.pause();
@@ -482,14 +514,14 @@ async function setModulationMode(next) {
 // -----------------------------------------------------------------------------
 function frameTick() {
   // upload current video frame to texture (only when source is a video —
-  // images are uploaded once on load and reused)
+  // images are uploaded once on load and reused). With rVFC, only when a new
+  // video frame actually arrived; without it, every render frame as before.
   if (currentSource === 'video'
+      && (videoADirty || !HAS_RVFC)
       && video.readyState >= video.HAVE_CURRENT_DATA
       && video.videoWidth > 0) {
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    uploadVideoFrame(gl.TEXTURE0, texture, texStateA, video);
+    videoADirty = false;
   }
 
   // ensure backing-store size matches latest source dims
@@ -522,14 +554,14 @@ function frameTick() {
   // rAF fallback when rVFC is unavailable
   if (!HAS_RVFC && currentSource === 'video') onVideoFrameWrite();
 
-  // Upload videoB to its own texture each render frame (when source is video
-  // and Two Layer is enabled — otherwise we don't need it)
+  // Upload videoB when it has a fresh frame (source is video and Two Layer is
+  // enabled — otherwise we don't need it). While B is paused mid-hold, rVFC
+  // stays quiet and we keep reusing the frozen frame already on the GPU.
   if (currentSource === 'video' && !!params.twoLayerEnabled
+      && (videoBDirty || !HAS_RVFC)
       && videoB.readyState >= 2 && videoB.videoWidth > 0) {
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, textureB);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, videoB);
+    uploadVideoFrame(gl.TEXTURE2, textureB, texStateB, videoB);
+    videoBDirty = false;
   }
 
   // ----- effect time + delta --------------------------------------------------
@@ -565,6 +597,7 @@ function frameTick() {
   gl.uniform1f(U.u_time, t);
   gl.uniform1i(U.u_frame, frameCount);
   gl.uniform3f(U.u_spotColor, c[0], c[1], c[2]);
+  gl.uniform1i(U.u_colorMode, params.colorMode | 0);
 
   gl.uniform1f(U.u_thresholdBase,    lp.thresholdBase);
   gl.uniform1f(U.u_thresholdLFOAmp,  lp.thresholdLFOAmp);
@@ -671,8 +704,14 @@ function onVideoFrameWrite() {
 }
 
 function videoFrameCallback() {
+  videoADirty = true;
   onVideoFrameWrite();
   if (HAS_RVFC) video.requestVideoFrameCallback(videoFrameCallback);
+}
+
+function videoBFrameCallback() {
+  videoBDirty = true;
+  if (HAS_RVFC) videoB.requestVideoFrameCallback(videoBFrameCallback);
 }
 
 // Speed Staging — three modes. Returns the smoothed currentSpeed.
@@ -828,6 +867,7 @@ const pane = new Pane({ title: 'DUOTONE', expanded: true });
 // preset-switch / preset-load can re-evaluate which params are visible.
 let updateIntroVis = () => {};
 let updateTempVis  = () => {};
+let updateColorVis = () => {};
 
 // --- Source ---
 let updateSpeedVis = () => {};
@@ -877,7 +917,27 @@ let updateSpeedVis = () => {};
 // --- Color ---
 {
   const f = pane.addFolder({ title: 'Color', expanded: true });
-  f.addBinding(params, 'spotColor', { label: 'spot' });
+  // colour mode is independent of the presets — switching orange/green/blue
+  // keeps whatever mode you're in.
+  const bSpot = f.addBinding(params, 'spotColor', { label: 'spot' });
+  const bMode = f.addBlade({
+    view: 'list',
+    label: 'colour mode',
+    options: [
+      { text: 'spot colour (1-bit)',      value: 0 },
+      { text: 'original video colours',   value: 1 },
+    ],
+    value: params.colorMode | 0,
+  });
+  bMode.on('change', (ev) => {
+    params.colorMode = ev.value | 0;
+    updateColorVis();
+  });
+  updateColorVis = function () {
+    bMode.value = params.colorMode | 0;
+    bSpot.hidden = (params.colorMode | 0) === 1;  // spot swatch is inert in original mode
+  };
+  updateColorVis();
   f.addBlade({
     view: 'list',
     label: 'preset',
@@ -1255,6 +1315,7 @@ presetPicker.addEventListener('change', async () => {
     updateIntroVis();
       updateSpeedVis();
     updateTempVis();
+    updateColorVis();
     saveStateToLocalStorage();
   } catch (e) {
     console.error('Preset load failed:', e);
@@ -1299,6 +1360,7 @@ window.addEventListener('drop', (e) => {
       updateIntroVis();
       updateSpeedVis();
       updateTempVis();
+      updateColorVis();
       saveStateToLocalStorage();
     });
   }
@@ -1327,6 +1389,7 @@ pane.refresh();
 updateIntroVis();
       updateSpeedVis();
 updateTempVis();
+updateColorVis();
 
 // Expose handles for automation / debugging / capture scripts.
 // This is a creative tool, not security-critical — making the state reachable
@@ -1358,6 +1421,7 @@ if (typeof window !== 'undefined') {
       updateIntroVis();
       updateSpeedVis();
       updateTempVis();
+      updateColorVis();
     },
   };
 }
@@ -1371,6 +1435,7 @@ video.addEventListener('loadedmetadata', resize);
 // src changes since it's bound to the video element, not the URL.
 if (HAS_RVFC) {
   video.requestVideoFrameCallback(videoFrameCallback);
+  videoB.requestVideoFrameCallback(videoBFrameCallback);
 }
 
 requestAnimationFrame(frameTick);
