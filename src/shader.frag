@@ -40,6 +40,7 @@ uniform int   u_frame;
 
 // ----- color --------------------------------------------------------------------
 uniform vec3  u_spotColor;
+uniform vec3  u_shadowColor;          // below-threshold color (classic: black)
 uniform int   u_colorMode;            // 0=spot color, 1=original video colors
 
 // ----- threshold ----------------------------------------------------------------
@@ -272,7 +273,8 @@ void main() {
 
     float mask = smoothstep(T_final - u_softness, T_final + u_softness, luma);
     // spot mode: flat spot color as the ink. original mode: the video's own
-    // colors as the ink — same threshold cut, black stays black.
+    // colors as the ink — same threshold cut. Shadow is the below-threshold
+    // color (classic look: black).
     vec3 ink   = (u_colorMode == 1) ? comp : u_spotColor;
-    fragColor  = vec4(mix(ink, vec3(0.0), 1.0 - mask), 1.0);
+    fragColor  = vec4(mix(ink, u_shadowColor, 1.0 - mask), 1.0);
 }

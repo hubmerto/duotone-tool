@@ -32,9 +32,11 @@ if (SPECIMEN) document.body.classList.add('specimen-mode');
 // -----------------------------------------------------------------------------
 // state
 // -----------------------------------------------------------------------------
-// colorMode lives outside the presets on purpose: 0 = spot color (classic),
-// 1 = original video colors. Switching orange/green/blue won't reset it.
-const params = { colorMode: 0, ...PRESETS[DEFAULT_PRESET] };
+// colorMode and shadowColor live outside the presets on purpose:
+// colorMode 0 = spot color (classic), 1 = original video colors.
+// shadowColor is the below-threshold color (classic: black).
+// Switching orange/green/blue won't reset either.
+const params = { colorMode: 0, shadowColor: '#000000', ...PRESETS[DEFAULT_PRESET] };
 // Format is the single primary control; engine is derived from it.
 //   mp4         -> WebCodecs H.264 (Chrome/Firefox/Edge; not Safari)
 //   webm        -> MediaRecorder VP9 (real-time, all browsers)
@@ -281,7 +283,7 @@ const twoLayer = {
 // uniforms
 const U = {};
 for (const name of [
-  'u_videoA','u_videoB','u_buffer','u_resolution','u_time','u_frame','u_spotColor','u_colorMode',
+  'u_videoA','u_videoB','u_buffer','u_resolution','u_time','u_frame','u_spotColor','u_shadowColor','u_colorMode',
   'u_thresholdBase','u_thresholdLFOAmp','u_thresholdLFOFreq',
   'u_introMode','u_introDuration','u_introCurve',
   'u_introOrigin','u_introSpread','u_introFalloff',
@@ -597,6 +599,8 @@ function frameTick() {
   gl.uniform1f(U.u_time, t);
   gl.uniform1i(U.u_frame, frameCount);
   gl.uniform3f(U.u_spotColor, c[0], c[1], c[2]);
+  const sh = hexToRgb(params.shadowColor ?? '#000000');
+  gl.uniform3f(U.u_shadowColor, sh[0], sh[1], sh[2]);
   gl.uniform1i(U.u_colorMode, params.colorMode | 0);
 
   gl.uniform1f(U.u_thresholdBase,    lp.thresholdBase);
@@ -920,6 +924,8 @@ let updateSpeedVis = () => {};
   // colour mode is independent of the presets — switching orange/green/blue
   // keeps whatever mode you're in.
   const bSpot = f.addBinding(params, 'spotColor', { label: 'spot' });
+  // shadow = below-threshold color, applies in both colour modes
+  f.addBinding(params, 'shadowColor', { label: 'shadow' });
   const bMode = f.addBlade({
     view: 'list',
     label: 'colour mode',
