@@ -18,6 +18,13 @@ export class AudioModulator {
     this.dataArray = null;
     this.bandIndices = null;
     this.audioEl = null;
+    this.srcNode = null;
+    // export support: original File (for offline decode into the mp4 path)
+    // and a MediaStreamDestination tap (for the real-time webm path)
+    this.file = null;
+    this._decoded = null;
+    this._decodedFile = null;
+    this.captureDest = null;
     this.lastBands = { bass: 0, mid: 0, treble: 0, rms: 0 };
     // Asymmetric envelope follower: fast attack so kicks punch, slow release
     // so they bleed out naturally instead of averaging into mush.
@@ -40,8 +47,8 @@ export class AudioModulator {
     this.audioEl = new Audio();
     this.audioEl.crossOrigin = 'anonymous';
     this.audioEl.loop = true;
-    const src = this.ctx.createMediaElementSource(this.audioEl);
-    src.connect(this.analyser);
+    this.srcNode = this.ctx.createMediaElementSource(this.audioEl);
+    this.srcNode.connect(this.analyser);
     this.analyser.connect(this.ctx.destination);
 
     this._computeBandIndices();
@@ -62,12 +69,50 @@ export class AudioModulator {
     this._ensureCtx();
     if (this.ctx.state === 'suspended') await this.ctx.resume();
     if (this.audioEl.src && this.audioEl.src.startsWith('blob:')) URL.revokeObjectURL(this.audioEl.src);
+    this.file = file;
+    this._decoded = null;
     this.audioEl.src = URL.createObjectURL(file);
     try { await this.audioEl.play(); } catch {}
   }
 
   pause() { try { this.audioEl?.pause(); } catch {} }
   resume() { try { this.audioEl?.play(); } catch {} }
+
+  hasAudio() { return !!this.file; }
+
+  // Restart the song from the top (used when an export begins, so the file
+  // and the live playback start together).
+  restart() {
+    if (!this.audioEl) return;
+    try {
+      this.audioEl.currentTime = 0;
+      this.audioEl.play().catch(() => {});
+    } catch {}
+  }
+
+  // Live audio tap for the real-time (MediaRecorder/webm) export path.
+  // Connecting the element source to a MediaStreamDestination doesn't affect
+  // what the user hears.
+  getCaptureStream() {
+    this._ensureCtx();
+    if (!this.captureDest) {
+      this.captureDest = this.ctx.createMediaStreamDestination();
+      this.srcNode.connect(this.captureDest);
+    }
+    return this.captureDest.stream;
+  }
+
+  // Full decode of the loaded file for the offline (WebCodecs/mp4) export
+  // path. Cached per file — first export pays the decode, repeats are free.
+  async getDecodedBuffer() {
+    if (!this.file) return null;
+    this._ensureCtx();
+    if (this._decoded && this._decodedFile === this.file) return this._decoded;
+    const ab = await this.file.arrayBuffer();
+    this._decoded = await this.ctx.decodeAudioData(ab);
+    this._decodedFile = this.file;
+    return this._decoded;
+  }
 
   setVolume(v) { if (this.audioEl) this.audioEl.volume = Math.max(0, Math.min(1, v)); }
 

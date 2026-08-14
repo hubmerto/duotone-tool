@@ -32,11 +32,18 @@ if (SPECIMEN) document.body.classList.add('specimen-mode');
 // -----------------------------------------------------------------------------
 // state
 // -----------------------------------------------------------------------------
-// colorMode and shadowColor live outside the presets on purpose:
+// colorMode, shadowColor and lockNormalSpeed live outside the presets:
 // colorMode 0 = spot color (classic), 1 = original video colors.
 // shadowColor is the below-threshold color (classic: black).
-// Switching orange/green/blue won't reset either.
-const params = { colorMode: 0, shadowColor: '#000000', ...PRESETS[DEFAULT_PRESET] };
+// lockNormalSpeed pins both playheads at 1.0× — no speed staging, no Two
+// Layer holds/races. Default ON: the source video always plays real-time.
+// Switching orange/green/blue won't reset any of them.
+const params = {
+  colorMode: 0,
+  shadowColor: '#000000',
+  lockNormalSpeed: true,
+  ...PRESETS[DEFAULT_PRESET],
+};
 // Format is the single primary control; engine is derived from it.
 //   mp4         -> WebCodecs H.264 (Chrome/Firefox/Edge; not Safari)
 //   webm        -> MediaRecorder VP9 (real-time, all browsers)
@@ -571,11 +578,29 @@ function frameTick() {
   const dt = Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
   lastFrameMs = performance.now();
 
-  // ----- speed state machine -> video.playbackRate ----------------------------
-  const currentSpeed = updateSpeed(t, dt);
-
-  // ----- Two Layer phase advancement (mutates twoLayer + sets video.playbackRate)
-  twoLayerAdvance(performance.now(), currentSpeed);
+  // ----- playback rate ---------------------------------------------------------
+  if (params.lockNormalSpeed && currentSource === 'video') {
+    // Normal-speed lock: both playheads at 1.0×, no phase machine. Two Layer
+    // still blends both layers — they just stay in sync. The play checkbox
+    // keeps working: rates are only enforced while playing.
+    if (sourceState.playing) {
+      _setRate(video, 1);
+      if (params.twoLayerEnabled) {
+        _setRate(videoB, 1);
+        // two <video> elements drift apart over minutes; snap B when it strays
+        if (videoB.duration > 0 && Math.abs(videoB.currentTime - video.currentTime) > 0.1) {
+          videoB.currentTime = video.currentTime;
+        }
+      }
+    }
+    twoLayer.phase = 'sync';
+    twoLayer.isCatchup = false;
+  } else {
+    // speed state machine -> video.playbackRate
+    const currentSpeed = updateSpeed(t, dt);
+    // Two Layer phase advancement (mutates twoLayer + sets video.playbackRate)
+    twoLayerAdvance(performance.now(), currentSpeed);
+  }
 
   // ----- draw -----------------------------------------------------------------
   gl.useProgram(program);
@@ -880,13 +905,19 @@ let updateSpeedVis = () => {};
   f.addButton({ title: 'Pick file… (video / image)' }).on('click', () => mediaPicker.click());
   f.addButton({ title: 'Use sample' }).on('click', () => loadVideoFromUrl('/samples/sample.mp4'));
   f.addBinding(sourceState, 'playing', { label: 'play' }).on('change', (ev) => {
-    if (ev.value) video.play(); else video.pause();
+    if (ev.value) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
+    else          { video.pause(); videoB.pause(); }
   });
-  f.addBinding(sourceState, 'loop').on('change', (ev) => { video.loop = ev.value; });
+  f.addBinding(sourceState, 'loop').on('change', (ev) => { video.loop = ev.value; videoB.loop = ev.value; });
+
+  // Normal-speed lock — the default. Source always plays at 1.0×; the whole
+  // speed staging + Two Layer time machinery below is bypassed while on.
+  f.addBinding(params, 'lockNormalSpeed', { label: 'normal speed' })
+    .on('change', () => updateSpeedVis());
 
   // Speed Staging — three modes (static / cycle / step). updateSpeed() in the
   // render loop turns these into video.playbackRate with smoothing.
-  f.addBlade({
+  const bSpMode = f.addBlade({
     view: 'list',
     label: 'speed mode',
     options: [
@@ -895,7 +926,8 @@ let updateSpeedVis = () => {};
       { text: 'step (random)',   value: 2 },
     ],
     value: params.speedMode | 0,
-  }).on('change', (ev) => { params.speedMode = ev.value | 0; updateSpeedVis(); });
+  });
+  bSpMode.on('change', (ev) => { params.speedMode = ev.value | 0; updateSpeedVis(); });
 
   const bStat   = f.addBinding(params, 'staticSpeed',     { label: 'static speed', min: 0.1, max: 2.0, step: 0.05 });
   const bSlow   = f.addBinding(params, 'slowSpeed',       { label: 'slow value',   min: 0.1, max: 1.0, step: 0.05 });
@@ -906,14 +938,16 @@ let updateSpeedVis = () => {};
   const bSm     = f.addBinding(params, 'speedSmoothing',  { label: 'smoothing',    min: 0,    max: 0.99, step: 0.01 });
 
   updateSpeedVis = function () {
+    const locked = !!params.lockNormalSpeed;
     const m = params.speedMode | 0;
-    bStat.hidden  = m !== 0;
-    bSlow.hidden  = m === 0;
-    bFast.hidden  = m === 0;
-    bCycle.hidden = m !== 1;
-    bStMin.hidden = m !== 2;
-    bStMax.hidden = m !== 2;
-    bSm.hidden    = false;  // smoothing useful in all modes
+    bSpMode.hidden = locked;
+    bStat.hidden  = locked || m !== 0;
+    bSlow.hidden  = locked || m === 0;
+    bFast.hidden  = locked || m === 0;
+    bCycle.hidden = locked || m !== 1;
+    bStMin.hidden = locked || m !== 2;
+    bStMax.hidden = locked || m !== 2;
+    bSm.hidden    = locked;  // smoothing useful in all non-locked modes
   };
   updateSpeedVis();
 }
@@ -1195,7 +1229,8 @@ let updateSpeedVis = () => {};
     resize();                                // re-cap backing store
   });
 
-  f.addBinding(exportSettings, 'durationSeconds',     { label: 'seconds',  min: 1, max: 120, step: 1 });
+  // videos always export one full loop (their own length); this only applies to images
+  f.addBinding(exportSettings, 'durationSeconds',     { label: 'seconds (image)', min: 1, max: 120, step: 1 });
   f.addBinding(exportSettings, 'fps',                 { label: 'fps',      min: 24, max: 60, step: 1 });
   f.addBinding(exportSettings, 'bitrateMbps',         { label: 'mp4 mbps', min: 2,  max: 80, step: 1 });
   f.addBinding(exportSettings, 'replayIntroOnRecord', { label: 'replay intro' });
@@ -1207,10 +1242,39 @@ let updateSpeedVis = () => {};
   recBtn.on('click', async () => {
     if (!isRecording) {
       const fmt = exportSettings.format;
+
+      // Song along for the ride: when audio modulation has a file loaded, the
+      // export carries it. Decode FIRST (cached after the first export) so the
+      // restart below isn't skewed by decode time.
+      const audioActive = modulation.mode === 'audio' && audioMod.hasAudio();
+      let audioBuffer = null;
+      if (audioActive && fmt === 'mp4') {
+        try { audioBuffer = await audioMod.getDecodedBuffer(); }
+        catch (e) { console.warn('Song decode failed — exporting without sound:', e); }
+      }
+
+      // Full-cycle export: a video source always restarts from 0 and records
+      // exactly one full loop; the song restarts with it.
       const opts = {
         fps: exportSettings.fps,
         durationSeconds: exportSettings.durationSeconds,
       };
+      if (currentSource === 'video' && isFinite(video.duration) && video.duration > 0) {
+        opts.durationSeconds = video.duration;
+        video.currentTime  = 0;
+        videoB.currentTime = 0;
+        video.play().catch(() => {});
+        videoB.play().catch(() => {});
+        twoLayer.phase = 'sync';
+        twoLayer.nextPhaseAt = performance.now() + 1500;
+        twoLayer.isCatchup = false;
+        // wait for the seek to land so frame 0 of the file is frame 0 of the clip
+        await new Promise((res) => {
+          const t = setTimeout(res, 500);
+          video.addEventListener('seeked', () => { clearTimeout(t); res(); }, { once: true });
+        });
+      }
+      if (audioActive) audioMod.restart();
 
       // reset effect time so the intro ramp is captured at the start of the file
       if (exportSettings.replayIntroOnRecord) {
@@ -1224,7 +1288,11 @@ let updateSpeedVis = () => {};
         if (fmt === 'mp4') {
           if (!WebCodecsMp4Path.isSupported()) {
             console.warn('WebCodecs unsupported in this browser. Falling back to webm.');
-            mediaPath.start({ ...opts, bitrate: q.webmMbps * 1_000_000 });
+            mediaPath.start({
+              ...opts,
+              bitrate: q.webmMbps * 1_000_000,
+              audioStream: audioActive ? audioMod.getCaptureStream() : null,
+            });
             recordingPath = mediaPath;
           } else {
             await mp4Path.start({
@@ -1232,11 +1300,16 @@ let updateSpeedVis = () => {};
               bitrate: exportSettings.bitrateMbps * 1_000_000,
               latencyMode: q.latencyMode,
               bitrateMode: q.bitrateMode,
+              audio: audioBuffer ? { buffer: audioBuffer, offset: 0 } : null,
             });
             recordingPath = mp4Path;
           }
         } else if (fmt === 'webm') {
-          mediaPath.start({ ...opts, bitrate: q.webmMbps * 1_000_000 });
+          mediaPath.start({
+            ...opts,
+            bitrate: q.webmMbps * 1_000_000,
+            audioStream: audioActive ? audioMod.getCaptureStream() : null,
+          });
           recordingPath = mediaPath;
         } else if (fmt === 'webm-locked') {
           await ccapPath.start({ ...opts, format: 'webm' });
@@ -1252,7 +1325,7 @@ let updateSpeedVis = () => {};
           isRecording = false;
           recordingPath = null;
           recBtn.title = '● record';
-        }, exportSettings.durationSeconds * 1000 + 400);
+        }, opts.durationSeconds * 1000 + 400);
       } catch (e) {
         console.error('Recording failed:', e);
         isRecording = false;

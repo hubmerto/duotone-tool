@@ -18,19 +18,33 @@ export class MediaRecorderPath {
     this.recording = false;
   }
 
-  start({ fps = 60, durationSeconds = 0, bitrate = 40_000_000 } = {}) {
+  start({ fps = 60, durationSeconds = 0, bitrate = 40_000_000, audioStream = null } = {}) {
     if (this.recording) return;
     const stream = this.canvas.captureStream(fps);
+    if (audioStream) {
+      for (const t of audioStream.getAudioTracks()) stream.addTrack(t);
+    }
 
-    // pick the best codec the browser supports
-    const candidates = [
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8',
-      'video/webm',
-    ];
+    // pick the best codec the browser supports (opus variants when we carry audio)
+    const candidates = audioStream
+      ? [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9',
+        'video/webm',
+      ]
+      : [
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+      ];
     const mimeType = candidates.find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
 
-    this.recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: bitrate });
+    this.recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: bitrate,
+      audioBitsPerSecond: 192_000,
+    });
     this.chunks = [];
     this.recorder.ondataavailable = (e) => { if (e.data.size > 0) this.chunks.push(e.data); };
     this.recorder.onstop = () => this._finalize(mimeType);
@@ -92,6 +106,7 @@ export class WebCodecsMp4Path {
     bitrate = 25_000_000,
     latencyMode = 'quality',     // 'quality' (better) | 'realtime' (faster)
     bitrateMode = 'variable',    // 'variable' (VBR, better q@same kbps) | 'constant'
+    audio = null,                // { buffer: AudioBuffer, offset: seconds } — muxed in at stop()
   } = {}) {
     if (this.recording) return;
     if (!WebCodecsMp4Path.isSupported()) {
@@ -102,10 +117,37 @@ export class WebCodecsMp4Path {
     const w = this.canvas.width  & ~1;
     const h = this.canvas.height & ~1;
 
+    // Audio track: pick a supported encoder config up front (the muxer needs
+    // the track declared at construction). AAC is the universal choice;
+    // opus-in-mp4 is the fallback. No support → video-only, never a failure.
+    this._audio = null;
+    if (audio && audio.buffer && typeof window.AudioEncoder !== 'undefined') {
+      const sr = audio.buffer.sampleRate;
+      const ch = Math.min(2, audio.buffer.numberOfChannels);
+      for (const codec of ['mp4a.40.2', 'opus']) {
+        const cfg = { codec, sampleRate: sr, numberOfChannels: ch, bitrate: 192_000 };
+        // eslint-disable-next-line no-await-in-loop
+        const support = await AudioEncoder.isConfigSupported(cfg).catch(() => null);
+        if (support && support.supported) {
+          this._audio = { buffer: audio.buffer, offset: audio.offset || 0, cfg };
+          break;
+        }
+      }
+      if (!this._audio) console.warn('No supported audio encoder (AAC/opus) — exporting without sound.');
+    }
+
     this.muxer = new Muxer({
       target: new ArrayBufferTarget(),
       video: { codec: 'avc', width: w, height: h, frameRate: fps },
+      ...(this._audio ? {
+        audio: {
+          codec: this._audio.cfg.codec === 'opus' ? 'opus' : 'aac',
+          numberOfChannels: this._audio.cfg.numberOfChannels,
+          sampleRate: this._audio.cfg.sampleRate,
+        },
+      } : {}),
       fastStart: 'in-memory', // small enough; metadata at start = playable on social platforms
+      firstTimestampBehavior: 'offset', // wall-clock stamps don't start at exactly 0
     });
 
     this.encoder = new VideoEncoder({
@@ -153,23 +195,35 @@ export class WebCodecsMp4Path {
     this._inFlight = 0;
     this._startedAt = performance.now();
     this._endAt = durationSeconds > 0 ? this._startedAt + durationSeconds * 1000 : Infinity;
+    this._lastTsUs = 0;
+    this._lastKeyUs = -Infinity;
     this.recording = true;
   }
 
   // Called from render loop AFTER the canvas is drawn for this frame.
+  // Paced by WALL CLOCK, not by render frames: rAF fires per display frame
+  // (120Hz on ProMotion), so counting frames at 1/fps timestamps produced
+  // 2× slow-motion files on 120Hz screens — and audio could never stay in
+  // sync. Frames are stamped with real elapsed time; ticks that arrive ahead
+  // of the fps schedule are skipped.
   capture() {
     if (!this.recording) return;
-    if (performance.now() >= this._endAt) { this.stop(); return; }
+    const nowMs = performance.now();
+    if (nowMs >= this._endAt) { this.stop(); return; }
 
-    const ts = (this.frameIdx * 1_000_000) / this.fps; // microseconds
+    const elapsedUs = Math.round((nowMs - this._startedAt) * 1000);
+    if (elapsedUs < this.frameIdx * (1_000_000 / this.fps)) return; // ahead of schedule
+
     const frame = new VideoFrame(this.canvas, {
-      timestamp: ts,
+      timestamp: elapsedUs,
       duration: 1_000_000 / this.fps,
     });
-    const keyFrame = (this.frameIdx % (this.fps * 2)) === 0; // key every 2s
+    const keyFrame = elapsedUs - this._lastKeyUs >= 2_000_000 || this.frameIdx === 0; // key every 2s
     try {
       this.encoder.encode(frame, { keyFrame });
       this._inFlight++;
+      if (keyFrame) this._lastKeyUs = elapsedUs;
+      this._lastTsUs = elapsedUs;
     } catch (e) {
       console.warn('encode failed:', e);
     } finally {
@@ -184,6 +238,10 @@ export class WebCodecsMp4Path {
     try {
       await this.encoder.flush();
       this.encoder.close();
+      if (this._audio && this.frameIdx > 0) {
+        try { await this._muxAudio(); }
+        catch (e) { console.warn('audio mux failed — exporting video only:', e); }
+      }
       this.muxer.finalize();
       const buffer = this.muxer.target.buffer;
       const blob = new Blob([buffer], { type: 'video/mp4' });
@@ -198,6 +256,51 @@ export class WebCodecsMp4Path {
     }
     this.encoder = null;
     this.muxer = null;
+  }
+
+  // Encode the song into the mp4's audio track. Runs offline at stop() from
+  // the decoded AudioBuffer: slice from `offset` for exactly the recorded
+  // video duration, looping if the song is shorter than the export.
+  async _muxAudio() {
+    const { buffer, offset, cfg } = this._audio;
+    const durSec = this._lastTsUs / 1_000_000 + 1 / this.fps;
+    const sr = cfg.sampleRate;
+    const ch = cfg.numberOfChannels;
+
+    const encoder = new AudioEncoder({
+      output: (chunk, meta) => this.muxer.addAudioChunk(chunk, meta),
+      error: (e) => console.error('AudioEncoder error:', e),
+    });
+    encoder.configure(cfg);
+
+    const startFrame = Math.floor(offset * sr);
+    const totalFrames = Math.ceil(durSec * sr);
+    const srcLen = buffer.length;
+    const CHUNK = 4096;
+    let written = 0;
+    while (written < totalFrames) {
+      const n = Math.min(CHUNK, totalFrames - written);
+      const data = new Float32Array(n * ch);
+      for (let c = 0; c < ch; c++) {
+        const chan = buffer.getChannelData(Math.min(c, buffer.numberOfChannels - 1));
+        for (let i = 0; i < n; i++) {
+          data[c * n + i] = chan[(startFrame + written + i) % srcLen]; // loop past end
+        }
+      }
+      const ad = new AudioData({
+        format: 'f32-planar',
+        sampleRate: sr,
+        numberOfFrames: n,
+        numberOfChannels: ch,
+        timestamp: Math.round((written / sr) * 1_000_000),
+        data,
+      });
+      encoder.encode(ad);
+      ad.close();
+      written += n;
+    }
+    await encoder.flush();
+    encoder.close();
   }
 }
 
