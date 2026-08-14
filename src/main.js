@@ -81,6 +81,7 @@ const sourceState = {
 const modulation = {
   mode: 'none',     // 'none' | 'audio' | 'camera'
   audio: {
+    startSeconds: 0,      // export cue point — where in the song recording starts
     volume:      0.6,
     intensity:   1.0,     // master multiplier on every audio routing (0..3)
     // each value is the max effect at signal=1 with intensity=1
@@ -1159,6 +1160,10 @@ let updateSpeedVis = () => {};
 
   // ---- audio sub-section
   f.addButton({ title: 'Pick audio file…' }).on('click', () => audioPicker.click());
+  // export cue point — drag the number and the song jumps there live, so you
+  // can find the drop by ear. Recording starts the song from this position.
+  f.addBinding(modulation.audio, 'startSeconds', { label: 'song start (s)', min: 0, step: 0.5 })
+    .on('change', (ev) => { if (audioMod.hasAudio()) audioMod.seekTo(ev.value || 0); });
   f.addBinding(modulation.audio, 'volume',       { label: 'audio vol',   min: 0, max: 1,    step: 0.01  })
     .on('change', (ev) => audioMod.setVolume(ev.value));
   // master intensity — turn this up to make EVERYTHING crazier at once
@@ -1274,7 +1279,8 @@ let updateSpeedVis = () => {};
           video.addEventListener('seeked', () => { clearTimeout(t); res(); }, { once: true });
         });
       }
-      if (audioActive) audioMod.restart();
+      // cue the song to the chosen start point — the file records from here
+      if (audioActive) audioMod.seekTo(modulation.audio.startSeconds || 0);
 
       // reset effect time so the intro ramp is captured at the start of the file
       if (exportSettings.replayIntroOnRecord) {
@@ -1300,7 +1306,7 @@ let updateSpeedVis = () => {};
               bitrate: exportSettings.bitrateMbps * 1_000_000,
               latencyMode: q.latencyMode,
               bitrateMode: q.bitrateMode,
-              audio: audioBuffer ? { buffer: audioBuffer, offset: 0 } : null,
+              audio: audioBuffer ? { buffer: audioBuffer, offset: modulation.audio.startSeconds || 0 } : null,
             });
             recordingPath = mp4Path;
           }

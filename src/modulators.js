@@ -80,12 +80,15 @@ export class AudioModulator {
 
   hasAudio() { return !!this.file; }
 
-  // Restart the song from the top (used when an export begins, so the file
-  // and the live playback start together).
-  restart() {
+  // Seek the song to an absolute position (seconds), wrapping past the end.
+  // Used for the export cue point and for live preview while dialing it in.
+  seekTo(seconds) {
     if (!this.audioEl) return;
     try {
-      this.audioEl.currentTime = 0;
+      const dur = this.audioEl.duration;
+      this.audioEl.currentTime = (isFinite(dur) && dur > 0)
+        ? ((seconds % dur) + dur) % dur
+        : Math.max(0, seconds);
       this.audioEl.play().catch(() => {});
     } catch {}
   }
