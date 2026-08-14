@@ -111,7 +111,6 @@ export const SECTION_DEFS = {
     rows: [
       // For specimen 06 we show the audio routing depths since those are what's "active".
       { key: 'bassToSlow',   label: 'BASS → SLOW',  min: 0, max: 1,    fmt: (v) => v.toFixed(2),  fromObj: 'modulation.audio' },
-      { key: 'bassToWarp',   label: 'BASS → WARP',  min: 0, max: 0.12, fmt: (v) => v.toFixed(3), fromObj: 'modulation.audio' },
       { key: 'bassToFlash',  label: 'BASS → FLASH', min: 0, max: 0.5,  fmt: (v) => v.toFixed(2), fromObj: 'modulation.audio' },
       { key: 'rmsToBoil',    label: 'RMS → BOIL',   min: 0, max: 0.4,  fmt: (v) => v.toFixed(2), fromObj: 'modulation.audio' },
     ],

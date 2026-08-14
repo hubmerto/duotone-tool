@@ -84,16 +84,15 @@ const modulation = {
     startSeconds: 0,      // export cue point — where in the song recording starts
     volume:      0.6,
     intensity:   1.0,     // master multiplier on every audio routing (0..3)
-    // each value is the max effect at signal=1 with intensity=1
+    // each value is the max effect at signal=1 with intensity=1.
+    // No warp routings — modulation never displaces the image (reads as
+    // camera shake); it only drives color/threshold/grain.
     bassToSlow:   0.45,   // bass kick -> slowAmp (ink blob swell)
-    bassToWarp:   0.05,   // bass kick -> warpAmp (image punches sideways)
     bassToFlash:  0.22,   // bass kick -> threshold drops -> frame flashes color
     midToSpeed:   0.45,   // mids      -> slowNoiseSpeed (field accelerates)
-    trebleToWarp: 0.04,   // hi-hat    -> warpAmp (ripple)
     rmsToBoil:    0.14,   // loudness  -> ditherAmp (grainier when loud)
   },
   camera: {
-    warpDepth:   0.05,    // motion -> warpAmp           (+)
     lfoDepth:    0.08,    // motion -> thresholdLFOAmp   (+)
     flashDepth:  0.15,    // motion -> threshold flash   (-)
   },
@@ -478,11 +477,8 @@ function computeLiveParams() {
     monitor.treble = m.treble; monitor.rms = m.rms;
     const A = modulation.audio;
     const k = A.intensity;
-    // bass: fattest routing — swell + punch + flash
+    // bass: fattest routing — swell + flash (no warp: image never shakes)
     lp.slowAmp        = clamp(lp.slowAmp        + m.bass   * A.bassToSlow   * k, 0, 1.20);
-    lp.warpAmp        = clamp((lp.warpAmp ?? 0)
-                              + m.bass   * A.bassToWarp   * k
-                              + m.treble * A.trebleToWarp * k,                  0, 0.15);
     lp.thresholdBase  = clamp(lp.thresholdBase  - m.bass   * A.bassToFlash  * k, 0, 1.0 );
     // mid: blob field accelerates
     lp.slowNoiseSpeed = clamp(lp.slowNoiseSpeed + m.mid    * A.midToSpeed   * k, 0, 2.0 );
@@ -492,7 +488,6 @@ function computeLiveParams() {
     const m = cameraMod.update();
     monitor.motion = m.motion;
     const C = modulation.camera;
-    lp.warpAmp         = clamp((lp.warpAmp ?? 0) + m.motion * C.warpDepth,   0, 0.15);
     lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.motion * C.lfoDepth,   0, 0.30);
     lp.thresholdBase   = clamp(lp.thresholdBase   - m.motion * C.flashDepth, 0, 1.0 );
   } else {
@@ -905,6 +900,22 @@ let updateSpeedVis = () => {};
   const f = pane.addFolder({ title: 'Source', expanded: true });
   f.addButton({ title: 'Pick file… (video / image)' }).on('click', () => mediaPicker.click());
   f.addButton({ title: 'Use sample' }).on('click', () => loadVideoFromUrl('/samples/sample.mp4'));
+  // Restart video + song together: video back to frame 0, song to its cue
+  // point ('song start'), intro replayed — a live preview of exactly what an
+  // export will capture.
+  f.addButton({ title: '↺ Start over (video + song)' }).on('click', () => {
+    if (currentSource === 'video') {
+      video.currentTime  = 0;
+      videoB.currentTime = 0;
+      if (sourceState.playing) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
+      twoLayer.phase = 'sync';
+      twoLayer.nextPhaseAt = performance.now() + 1500;
+      twoLayer.isCatchup = false;
+    }
+    if (audioMod.hasAudio()) audioMod.seekTo(modulation.audio.startSeconds || 0);
+    effectStart = performance.now();
+    frameCount = 0;
+  });
   f.addBinding(sourceState, 'playing', { label: 'play' }).on('change', (ev) => {
     if (ev.value) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
     else          { video.pause(); videoB.pause(); }
@@ -1169,10 +1180,8 @@ let updateSpeedVis = () => {};
   // master intensity — turn this up to make EVERYTHING crazier at once
   f.addBinding(modulation.audio, 'intensity',    { label: 'INTENSITY',   min: 0, max: 3,    step: 0.05  });
   f.addBinding(modulation.audio, 'bassToSlow',   { label: 'bass→swell',  min: 0, max: 1.0,  step: 0.01  });
-  f.addBinding(modulation.audio, 'bassToWarp',   { label: 'bass→warp',   min: 0, max: 0.12, step: 0.002 });
   f.addBinding(modulation.audio, 'bassToFlash',  { label: 'bass→flash',  min: 0, max: 0.50, step: 0.01  });
   f.addBinding(modulation.audio, 'midToSpeed',   { label: 'mid→speed',   min: 0, max: 1.0,  step: 0.01  });
-  f.addBinding(modulation.audio, 'trebleToWarp', { label: 'tre→warp',    min: 0, max: 0.10, step: 0.001 });
   f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
 
   // ---- camera sub-section
@@ -1185,7 +1194,6 @@ let updateSpeedVis = () => {};
       catch (e) { console.warn('camera failed', e); }
     }
   });
-  f.addBinding(modulation.camera, 'warpDepth',  { label: 'mot→warp',  min: 0, max: 0.15, step: 0.001 });
   f.addBinding(modulation.camera, 'lfoDepth',   { label: 'mot→lfo',   min: 0, max: 0.30, step: 0.005 });
   f.addBinding(modulation.camera, 'flashDepth', { label: 'mot→flash', min: 0, max: 0.40, step: 0.005 });
 
