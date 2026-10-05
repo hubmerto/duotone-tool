@@ -134,7 +134,7 @@ const app = SPECIMEN ? null : window.LabUI.shell({
 });
 if (app) {
   app.hint('drop a video, image or audio file anywhere · <kbd>space</kbd> play / pause');
-  app.docRef = app.doc({ title: 'Boiler Eggs – sample', right: '', unit: 50 });
+  app.docRef = app.doc({ title: 'Boiler Eggs – sample', right: '', unit: 50, zoom: true });
   app.setStatus([{ text: 'GLSL ES 300 · single pass', id: 'lab-status-left' }, { spacer: true }, { text: '', id: 'sbRes', cell: true }, { text: 'Boiler Eggs', cell: true }]);
 }
 
