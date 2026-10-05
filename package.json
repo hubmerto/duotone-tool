@@ -3,15 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Real-time animated 1-bit duotone web tool — boiling-threshold effect over video, single-pass GLSL.",
+  "description": "Real-time animated 1-bit duotone web tool \u2014 boiling-threshold effect over video, single-pass GLSL.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "mp4-muxer": "^5.2.2",
-    "tweakpane": "^4.0.4"
+    "mp4-muxer": "^5.2.2"
   },
   "devDependencies": {
     "vite": "^5.4.10"

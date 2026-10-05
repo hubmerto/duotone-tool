@@ -3,7 +3,7 @@
 // All effect math is in shader.frag — this file is plumbing.
 // =============================================================================
 
-import { Pane } from 'tweakpane';
+const { Pane } = window.LabUI;
 import vertSrc from './shader.vert?raw';
 import fragSrc from './shader.frag?raw';
 import {
@@ -115,6 +115,15 @@ const videoB      = document.getElementById('source-video-b');
 const imageEl     = document.getElementById('source-image');
 const dropOverlay = document.getElementById('dropzone-overlay');
 const hint        = document.getElementById('hint');
+// lab-ui shell: top bar, properties column, viewport. Skipped in specimen mode,
+// where the canvas is positioned by the composite CSS instead.
+const app = SPECIMEN ? null : window.LabUI.shell({
+  title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
+});
+if (app) {
+  app.hint('drop a video, image or audio file anywhere · <kbd>space</kbd> play / pause');
+  app.setStatus([{ text: 'GLSL ES 300 · single pass', id: 'lab-status-left' }, { spacer: true }, { text: 'Boiler Eggs' }]);
+}
 
 // Which source the texture is currently bound to. Video uploads each frame;
 // image uploads once on load and the texture is reused.
@@ -334,7 +343,8 @@ function resize() {
   }
 
   // CSS layout: letterbox inside viewport at native AR
-  const winW = window.innerWidth, winH = window.innerHeight;
+  const host = app ? canvas.parentElement : null;
+  const winW = host ? host.clientWidth : window.innerWidth, winH = host ? host.clientHeight : window.innerHeight;
   const ar  = bw / bh;
   const winAR = winW / winH;
   let cw, ch;
@@ -886,7 +896,7 @@ function _sampleHoldMs() {
 // -----------------------------------------------------------------------------
 // Tweakpane UI
 // -----------------------------------------------------------------------------
-const pane = new Pane({ title: 'DUOTONE', expanded: true });
+const pane = new Pane({ title: 'DUOTONE', container: app ? app.side : null });
 
 // Hoisted visibility updaters — assigned inside their folder blocks so
 // preset-switch / preset-load can re-evaluate which params are visible.

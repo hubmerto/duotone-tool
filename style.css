@@ -84,44 +84,10 @@ html, body {
 .hint.visible { opacity: 1; }
 .hint.hidden { opacity: 0; }
 
-/* Tweakpane theme overrides — minimal black/green */
-:root {
-  --tp-base-background-color: #000;
-  --tp-base-shadow-color: rgba(0, 0, 0, 0);
-  --tp-button-background-color: #001a00;
-  --tp-button-background-color-active: #0DFF00;
-  --tp-button-background-color-focus: #0a8a00;
-  --tp-button-background-color-hover: #0a8a00;
-  --tp-button-foreground-color: #0DFF00;
-  --tp-container-background-color: #000;
-  --tp-container-background-color-active: #0a3d00;
-  --tp-container-background-color-focus: #0a3d00;
-  --tp-container-background-color-hover: #001a00;
-  --tp-container-foreground-color: #0DFF00;
-  --tp-groove-foreground-color: #0DFF00;
-  --tp-input-background-color: #001a00;
-  --tp-input-background-color-active: #0a3d00;
-  --tp-input-background-color-focus: #0a3d00;
-  --tp-input-background-color-hover: #002800;
-  --tp-input-foreground-color: #0DFF00;
-  --tp-label-foreground-color: #0DFF00;
-  --tp-monitor-background-color: #001a00;
-  --tp-monitor-foreground-color: #0DFF00;
-}
-
-.tp-dfwv {
-  /* Tweakpane root container — square it off */
-  --tp-base-border-radius: 0px !important;
-  border: 2px solid var(--fg) !important;
-  font-family: var(--mono) !important;
-  z-index: 100;
-}
-.tp-dfwv * {
-  border-radius: 0 !important;
-  font-family: var(--mono) !important;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
+/* inside the lab-ui shell the canvas is laid out by resize() within .lab-view */
+body.lab #stage { position: absolute; }
+body.lab #hint { position: absolute; }
+body.lab .lab-view { background: #000; }
 
 /* =============================================================================
    Specimen mode — diagrammatic composite for portfolio captures.
@@ -138,7 +104,6 @@ body.specimen-mode {
 }
 
 /* Hide the live UI chrome (panel, hint, drop overlay) */
-body.specimen-mode .tp-dfwv,
 body.specimen-mode #hint,
 body.specimen-mode #dropzone-overlay { display: none !important; }
 
