@@ -86,7 +86,7 @@ html, body {
 
 /* inside the lab-ui shell the canvas is laid out by resize() within .lab-view */
 body.lab #stage { position: absolute; }
-body.lab #hint { position: absolute; }
+body.lab #hint { position: absolute; bottom: 32px; }
 body.lab .lab-view { background: #000; }
 
 /* =============================================================================
