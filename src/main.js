@@ -119,10 +119,23 @@ const hint        = document.getElementById('hint');
 // where the canvas is positioned by the composite CSS instead.
 const app = SPECIMEN ? null : window.LabUI.shell({
   title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
+  menus: [
+    { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }] },
+    { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
+    { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
+  ],
+  tools: [
+    [{ icon: 'folder', tip: 'Pick file (video / image)', click: '#bPick' }, { icon: 'sample', tip: 'Use sample', click: '#bSample' }, { icon: 'restart', tip: 'Start over (video + song)', click: '#bStartOver' }],
+    [{ icon: 'play', text: 'pause', tip: 'Play / pause', kbd: 'space', key: 'play', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { icon: 'reset', tip: 'Replay intro', click: '#bReplay' }, { icon: 'bolt', tip: 'Trigger two-layer now', click: '#bTrigger' }],
+    [{ icon: 'audio', tip: 'Pick audio file', click: '#bAudioPick' }, { icon: 'webcam', tip: 'Start / stop webcam', click: '#bCamToggle' }],
+    { spacer: true },
+    [{ icon: 'undo', tip: 'Reset to default', click: '#bResetDefault' }, { icon: 'record', text: 'record', tip: 'Record one loop', rec: true, key: 'rec', click: '#bRecord' }],
+  ],
 });
 if (app) {
   app.hint('drop a video, image or audio file anywhere · <kbd>space</kbd> play / pause');
-  app.setStatus([{ text: 'GLSL ES 300 · single pass', id: 'lab-status-left' }, { spacer: true }, { text: 'Boiler Eggs' }]);
+  app.docRef = app.doc({ title: 'Boiler Eggs – sample', right: '', unit: 50 });
+  app.setStatus([{ text: 'GLSL ES 300 · single pass', id: 'lab-status-left' }, { spacer: true }, { text: '', id: 'sbRes', cell: true }, { text: 'Boiler Eggs', cell: true }]);
 }
 
 // Which source the texture is currently bound to. Video uploads each frame;
@@ -344,7 +357,8 @@ function resize() {
 
   // CSS layout: letterbox inside viewport at native AR
   const host = app ? canvas.parentElement : null;
-  const winW = host ? host.clientWidth : window.innerWidth, winH = host ? host.clientHeight : window.innerHeight;
+  const padTop = host ? (parseFloat(getComputedStyle(host).paddingTop) || 0) : 0;
+  const winW = host ? host.clientWidth : window.innerWidth, winH = host ? host.clientHeight - padTop : window.innerHeight;
   const ar  = bw / bh;
   const winAR = winW / winH;
   let cw, ch;
@@ -353,7 +367,8 @@ function resize() {
   canvas.style.width  = `${cw}px`;
   canvas.style.height = `${ch}px`;
   canvas.style.left   = `${(winW - cw) / 2}px`;
-  canvas.style.top    = `${(winH - ch) / 2}px`;
+  canvas.style.top    = `${padTop + (winH - ch) / 2}px`;
+  if (app) { const c = document.getElementById('sbRes'); if (c) c.textContent = `${bw}×${bh}`; if (app.docRef) app.docRef.setRight(`${bw}×${bh}`); }
 
   gl.viewport(0, 0, bw, bh);
 }
@@ -908,12 +923,12 @@ let updateColorVis = () => {};
 let updateSpeedVis = () => {};
 {
   const f = pane.addFolder({ title: 'Source', expanded: true });
-  f.addButton({ title: 'Pick file… (video / image)' }).on('click', () => mediaPicker.click());
-  f.addButton({ title: 'Use sample' }).on('click', () => loadVideoFromUrl('/samples/sample.mp4'));
+  f.addButton({ title: 'Pick file… (video / image)', id: 'bPick' }).on('click', () => mediaPicker.click());
+  f.addButton({ title: 'Use sample', id: 'bSample' }).on('click', () => { loadVideoFromUrl('/samples/sample.mp4'); if (app && app.docRef) app.docRef.setTitle('Boiler Eggs – sample.mp4'); });
   // Restart video + song together: video back to frame 0, song to its cue
   // point ('song start'), intro replayed — a live preview of exactly what an
   // export will capture.
-  f.addButton({ title: '↺ Start over (video + song)' }).on('click', () => {
+  f.addButton({ title: '↺ Start over (video + song)', id: 'bStartOver' }).on('click', () => {
     if (currentSource === 'video') {
       video.currentTime  = 0;
       videoB.currentTime = 0;
@@ -926,7 +941,10 @@ let updateSpeedVis = () => {};
     effectStart = performance.now();
     frameCount = 0;
   });
-  f.addBinding(sourceState, 'playing', { label: 'play' }).on('change', (ev) => {
+  const bPlaying = f.addBinding(sourceState, 'playing', { label: 'play' });
+  window.__labTogglePlay = () => { bPlaying._commit(!sourceState.playing, true); };
+  bPlaying.on('change', (ev) => { if (app && app.tool.play) window.LabUI.setLabel(app.tool.play, ev.value ? 'pause' : 'play'); });
+  bPlaying.on('change', (ev) => {
     if (ev.value) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
     else          { video.pause(); videoB.pause(); }
   });
@@ -1086,7 +1104,7 @@ let updateSpeedVis = () => {};
   updateIntroVis();
       updateSpeedVis();
 
-  f.addButton({ title: 'Replay intro' }).on('click', () => {
+  f.addButton({ title: 'Replay intro', id: 'bReplay' }).on('click', () => {
     effectStart = performance.now();
     frameCount = 0;
   });
@@ -1148,7 +1166,7 @@ let updateSpeedVis = () => {};
   const bBal    = f.addBinding(params, 'layerBlendBalance', { label: 'blend balance', min: 0, max: 1, step: 0.01 });
   const bPhase  = f.addBinding(params, 'phaseLockToSpeed',  { label: 'phase lock to speed' });
   const bSeed   = f.addBinding(params, 'twoLayerSeed',      { label: 'seed', min: 0, max: 9999, step: 1 });
-  f.addButton({ title: 'Trigger now' }).on('click', () => { twoLayer.triggerNow = true; });
+  f.addButton({ title: 'Trigger now', id: 'bTrigger' }).on('click', () => { twoLayer.triggerNow = true; });
 
   updateTempVis = function () {
     const enabled = !!params.twoLayerEnabled;
@@ -1180,7 +1198,7 @@ let updateSpeedVis = () => {};
   }).on('change', (ev) => { setModulationMode(ev.value); });
 
   // ---- audio sub-section
-  f.addButton({ title: 'Pick audio file…' }).on('click', () => audioPicker.click());
+  f.addButton({ title: 'Pick audio file…', id: 'bAudioPick' }).on('click', () => audioPicker.click());
   // export cue point — drag the number and the song jumps there live, so you
   // can find the drop by ear. Recording starts the song from this position.
   f.addBinding(modulation.audio, 'startSeconds', { label: 'song start (s)', min: 0, step: 0.5 })
@@ -1195,7 +1213,7 @@ let updateSpeedVis = () => {};
   f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
 
   // ---- camera sub-section
-  f.addButton({ title: 'Start / stop webcam' }).on('click', async () => {
+  f.addButton({ title: 'Start / stop webcam', id: 'bCamToggle' }).on('click', async () => {
     if (cameraMod.isActive()) {
       cameraMod.stop();
       if (modulation.mode === 'camera') setModulationMode('none');
@@ -1258,7 +1276,7 @@ let updateSpeedVis = () => {};
   f.addBinding(exportSettings, 'bitrateMbps',         { label: 'mp4 mbps', min: 2,  max: 80, step: 1 });
   f.addBinding(exportSettings, 'replayIntroOnRecord', { label: 'replay intro' });
 
-  const recBtn = f.addButton({ title: '● record' });
+  const recBtn = f.addButton({ title: '● record', id: 'bRecord' });
   let isRecording = false;
   let recordingPath = null;
 
@@ -1343,18 +1361,18 @@ let updateSpeedVis = () => {};
           recordingPath = ccapPath;
         }
         isRecording = true;
-        recBtn.title = '■ stop';
+        recBtn.title = '■ stop'; if (app && app.tool.rec) { app.tool.rec.classList.add('rec'); window.LabUI.setLabel(app.tool.rec, 'stop'); }
         // auto-flip back when duration elapses (path stops itself)
         setTimeout(() => {
           isRecording = false;
           recordingPath = null;
-          recBtn.title = '● record';
+          recBtn.title = '● record'; if (app && app.tool.rec) { app.tool.rec.classList.remove('rec'); window.LabUI.setLabel(app.tool.rec, 'record'); }
         }, opts.durationSeconds * 1000 + 400);
       } catch (e) {
         console.error('Recording failed:', e);
         isRecording = false;
         recordingPath = null;
-        recBtn.title = '● record';
+        recBtn.title = '● record'; if (app && app.tool.rec) { app.tool.rec.classList.remove('rec'); window.LabUI.setLabel(app.tool.rec, 'record'); }
       }
     } else {
       // manual stop
@@ -1362,11 +1380,11 @@ let updateSpeedVis = () => {};
       mediaPath.stop(); ccapPath.stop(); mp4Path.stop();
       isRecording = false;
       recordingPath = null;
-      recBtn.title = '● record';
+      recBtn.title = '● record'; if (app && app.tool.rec) { app.tool.rec.classList.remove('rec'); window.LabUI.setLabel(app.tool.rec, 'record'); }
     }
   });
 
-  f.addButton({ title: 'Reset to default' }).on('click', () => {
+  f.addButton({ title: 'Reset to default', id: 'bResetDefault' }).on('click', () => {
     applyPreset(params, PRESETS[DEFAULT_PRESET]);
     sourceState.preset = DEFAULT_PRESET;
     pane.refresh();
@@ -1388,6 +1406,7 @@ let updateSpeedVis = () => {};
 // File pickers
 // -----------------------------------------------------------------------------
 mediaPicker.addEventListener('change', () => {
+  if (app && app.docRef && mediaPicker.files && mediaPicker.files[0]) app.docRef.setTitle('Boiler Eggs – ' + mediaPicker.files[0].name);
   const f = mediaPicker.files?.[0];
   if (!f) return;
   if (f.type.startsWith('video/'))      loadVideoFromFile(f);
