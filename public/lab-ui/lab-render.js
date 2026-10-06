@@ -47,10 +47,10 @@
       if (!this.rangeSet) { this.in = 0; this.out = d; }
       else { this.in = clamp(this.in, 0, d); this.out = clamp(this.out, Math.min(d, this.in + 1 / this.fps), d); }
       this.t = this.media && this.media.getTime ? clamp(this.media.getTime(), 0, d) : clamp(this.t, 0, d);
-      this.emit('range'); this.emit('time');
+      this.emit('range', { silent: true }); this.emit('time');   // a media change is not a user edit
     }
     setLength(s) { this.length = Math.max(0.1, +s || 0.1); if (!this.media) { if (!this.rangeSet) this.out = this.length; this.out = Math.min(this.out, this.length); this.in = Math.min(this.in, this.out); } this.emit('range'); }
-    setFps(f) { this.fps = clamp(Math.round(+f || 30), 1, 240); this.emit('range'); }
+    setFps(f, o) { this.fps = clamp(Math.round(+f || 30), 1, 240); this.emit('range', o && o.silent ? { silent: true } : undefined); }   // { silent } = not a user edit (boot applying a preference)
     // called once per live frame
     tick(nowMs) {
       if (this.offline) return;
@@ -208,6 +208,9 @@
       const s = String(tpl || this.DEFAULT_NAME).replace(/\{(\w+)\}/g, (m, k) => (k in map ? String(map[k]) : m));
       return s.replace(/[^\w.\-]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'render';
     },
+    // a tool or the preferences can route finished files into a folder (File System Access); else the browser download
+    saveHook: null,
+    async deliver(blob, name) { if (Render.saveHook) { try { if (await Render.saveHook(blob, name)) return true; } catch (e) { console.warn('render folder:', e); } } Render.download(blob, name); return false; },
     download(blob, name) { const a = doc.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; doc.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000); },
     toBlob(canvas) { return new Promise((res, rej) => { if (canvas.convertToBlob) canvas.convertToBlob({ type: 'image/png' }).then(res, rej); else canvas.toBlob((b) => b ? res(b) : rej(new Error('toBlob failed')), 'image/png'); }); },
     // the given seconds of an AudioBuffer from offset, looping a shorter song, as a new AudioBuffer
@@ -389,7 +392,7 @@
         const name = Render.fileName(item.job.nameTpl, item.job) + '.' + res.ext;
         item.stat.textContent = 'done · ' + (res.blob.size / 1e6).toFixed(1) + ' MB · ' + ((performance.now() - t0) / 1000).toFixed(0) + ' s';
         item.fill.style.width = '100%';
-        if (this.o.download !== false) Render.download(res.blob, name);
+        if (this.o.download !== false) await Render.deliver(res.blob, name);
         this.emit('done', { item, name });
       } catch (e) {
         if (e && e.name === 'AbortError') { item.state = 'cancelled'; item.stat.textContent = 'cancelled'; }
