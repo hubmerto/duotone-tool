@@ -125,8 +125,19 @@ const modulation = {
 const monitor = { bass: 0, mid: 0, treble: 0, rms: 0, motion: 0 };
 
 // effect time is separate from wallclock — "Replay intro" resets this
-let effectStart = performance.now();
+let effectStart = performance.now();   // kept for reference; effect time is clock.t
 let frameCount = 0;
+// One time axis for the effect (lab-render.js): live it free-runs while playing, offline the queue steps it.
+// The two video playheads are real elements live and simulated numbers (head.A / head.B) while a job renders.
+const clock = new window.LabUI.Clock({ fps: 30, length: 10 });
+const head = { sim: false, A: 0, B: 0, rateA: 1, rateB: 1 };
+const offline = { job: null };
+const fitPreview = { aspect: null, mode: 'cover' };   // a placement previewed live: canvas ratio + fit
+function posOf(side) { return head.sim ? head[side] : (side === 'A' ? video : videoB).currentTime; }
+function setPos(side, t) { if (head.sim) head[side] = t; else (side === 'A' ? video : videoB).currentTime = t; }
+function setRate(side, r) { if (head.sim) head['rate' + side] = Math.max(0, Math.min(16, r)); else _setRate(side === 'A' ? video : videoB, r); }
+function restartEffect() { clock.seek(0); frameCount = 0; }
+function srcAspect() { return currentSource === 'image' && imageEl.naturalWidth ? imageEl.naturalWidth / imageEl.naturalHeight : (video.videoWidth > 0 ? video.videoWidth / video.videoHeight : 16 / 9); }
 
 // -----------------------------------------------------------------------------
 // DOM
@@ -273,10 +284,11 @@ function uploadVideoFrame(unit, tex, state, vid) {
   gl.activeTexture(unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  if (state.w !== vid.videoWidth || state.h !== vid.videoHeight) {
+  const vw = vid.videoWidth || vid.width, vh = vid.videoHeight || vid.height;
+  if (state.w !== vw || state.h !== vh) {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vid);
-    state.w = vid.videoWidth;
-    state.h = vid.videoHeight;
+    state.w = vw;
+    state.h = vh;
   } else {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, vid);
   }
@@ -361,7 +373,7 @@ for (const name of [
   'u_fieldMode','u_edgeMode','u_bleedPx','u_haloPx','u_haloStrength','u_edgeRoughPx','u_edgeTemporal',
   'u_introModel','u_introInduction','u_introFrom','u_scanLampGain','u_scanLampPx','u_scanLinesPerFrame',
   'u_trailMode','u_trailFrames','u_colorModel','u_inkB','u_inkOpacity','u_misregPx','u_alphaMode',
-  'u_bufferSize','u_bufferWriteIndex',
+  'u_bufferSize','u_bufferWriteIndex','u_fit',
   'u_twoLayerEnabled','u_layerBlendMode','u_layerBlendBalance',
   'u_isCatchupActive','u_trailSampleCount','u_trailStyle',
 ]) U[name] = gl.getUniformLocation(program, name);
@@ -381,6 +393,8 @@ function resize() {
     vh = video.videoHeight;
   }
 
+  if (offline.job) { const j = offline.job; if (canvas.width !== j.w || canvas.height !== j.h) { canvas.width = j.w; canvas.height = j.h; } gl.viewport(0, 0, j.w, j.h); return; }
+  if (fitPreview.aspect) { const a = fitPreview.aspect; if (a >= vw / vh) { vw = Math.round(vh * a); } else { vh = Math.round(vw / a); } }
   // Cap backing-store HEIGHT to the active quality preset (preview=720,
   // standard/high=1080, archival=2160). Width follows source AR. This is
   // both the rendered viewport AND the export resolution — bumping
@@ -438,6 +452,7 @@ function _loadBothVideos(srcURL, isBlob) {
 
   video.src  = srcURL;
   videoB.src = srcURL;
+  clock.setMedia(null);
   video.loop  = sourceState.loop;
   videoB.loop = sourceState.loop;
   video.play().catch(() => {});
@@ -446,13 +461,12 @@ function _loadBothVideos(srcURL, isBlob) {
   currentSource     = 'video';
   videoADirty       = true;
   videoBDirty       = true;
-  effectStart       = performance.now();
-  frameCount        = 0;
+  restartEffect();
   bufferWriteIndex  = 0;
   imageBufferFilled = false;
   // Reset Two Layer state machine for the new clip
   twoLayer.phase            = 'sync';
-  twoLayer.nextPhaseAt      = performance.now() + 1500;
+  twoLayer.nextPhaseAt = clock.t * 1000 + 1500;
   twoLayer.holdSide         = 'A';
   twoLayer.isCatchup        = false;
   twoLayer.catchupHoldPosA  = 0;
@@ -487,9 +501,9 @@ async function loadImageFromFile(file) {
   video.load();
 
   currentSource = 'image';
+  clock.setMedia(null);
   imageBufferFilled = false;          // re-fill ring buffer on next tick
-  effectStart = performance.now();
-  frameCount = 0;
+  restartEffect();
   resize();
 }
 
@@ -529,6 +543,7 @@ const cameraMod  = new CameraModulator();
 // reasonably dial in manually. That's where the drama comes from.
 function computeLiveParams() {
   const lp = { ...pane.effective(params) };   // bypassed folders contribute their identity values
+  if (head.sim) return lp;                     // offline: modulators wait for the bake (PR 6)
   if (modulation.mode === 'audio') {
     // Specimen 06: synthetic peak signals instead of real audio analyzer.
     // Lets a still capture show what the effect looks like at audio peak.
@@ -549,7 +564,7 @@ function computeLiveParams() {
     // hats / loudness: finer, heavier grain
     lp.ditherAmp      = clamp(lp.ditherAmp      + Math.max(m.rms, m.hats * 0.6) * A.rmsToBoil * k, 0, 0.50);
     // a kick forces the next boil drawing
-    if (A.kickToBoil && m.kickOnset) lastKickEffectTime = (performance.now() - effectStart) / 1000;
+    if (A.kickToBoil && m.kickOnset) lastKickEffectTime = clock.t;
   } else if (modulation.mode === 'camera') {
     const m = cameraMod.update(liveDtMs);
     monitor.motion = m.motion;
@@ -589,10 +604,18 @@ async function setModulationMode(next, prev) {
 // render loop
 // -----------------------------------------------------------------------------
 function frameTick() {
+  if (!offline.job) renderOnce();
+  requestAnimationFrame(frameTick);
+}
+function renderOnce(tOv, dtOv) {
   // upload current video frame to texture (only when source is a video —
   // images are uploaded once on load and reused). With rVFC, only when a new
   // video frame actually arrived; without it, every render frame as before.
-  if (currentSource === 'video'
+  if (head.sim) {
+    // offline: decoded frames for the simulated playheads; the ring buffer takes every A frame
+    if (offline.frameA) { uploadVideoFrame(gl.TEXTURE0, texture, texStateA, offline.frameA); if (offline.first) { fillRing(offline.frameA); offline.first = false; } else onVideoFrameWrite(offline.frameA); }
+    if (offline.frameB && params.twoLayerEnabled) uploadVideoFrame(gl.TEXTURE2, textureB, texStateB, offline.frameB);
+  } else if (currentSource === 'video'
       && (videoADirty || !HAS_RVFC)
       && video.readyState >= video.HAVE_CURRENT_DATA
       && video.videoWidth > 0) {
@@ -628,12 +651,12 @@ function frameTick() {
     imageBufferFilled = true;
   }
   // rAF fallback when rVFC is unavailable
-  if (!HAS_RVFC && currentSource === 'video') onVideoFrameWrite();
+  if (!HAS_RVFC && currentSource === 'video' && !head.sim) onVideoFrameWrite();
 
   // Upload videoB when it has a fresh frame (source is video and Two Layer is
   // enabled — otherwise we don't need it). While B is paused mid-hold, rVFC
   // stays quiet and we keep reusing the frozen frame already on the GPU.
-  if (currentSource === 'video' && !!params.twoLayerEnabled
+  if (!head.sim && currentSource === 'video' && !!params.twoLayerEnabled
       && (videoBDirty || !HAS_RVFC)
       && videoB.readyState >= 2 && videoB.videoWidth > 0) {
     uploadVideoFrame(gl.TEXTURE2, textureB, texStateB, videoB);
@@ -641,8 +664,9 @@ function frameTick() {
   }
 
   // ----- effect time + delta --------------------------------------------------
-  const t  = (performance.now() - effectStart) / 1000;
-  const dt = Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
+  if (tOv == null) clock.tick(performance.now());
+  const t  = tOv != null ? tOv : clock.t;
+  const dt = dtOv != null ? dtOv : Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
   liveDtMs = dt * 1000;
   lastFrameMs = performance.now();
 
@@ -651,13 +675,13 @@ function frameTick() {
     // Normal-speed lock: both playheads at 1.0×, no phase machine. Two Layer
     // still blends both layers — they just stay in sync. The play checkbox
     // keeps working: rates are only enforced while playing.
-    if (sourceState.playing) {
-      _setRate(video, 1);
+    if (sourceState.playing || head.sim) {
+      setRate('A', 1);
       if (params.twoLayerEnabled) {
-        _setRate(videoB, 1);
+        setRate('B', 1);
         // two <video> elements drift apart over minutes; snap B when it strays
-        if (videoB.duration > 0 && Math.abs(videoB.currentTime - video.currentTime) > 0.1) {
-          videoB.currentTime = video.currentTime;
+        if ((head.sim || videoB.duration > 0) && Math.abs(posOf('B') - posOf('A')) > 0.1) {
+          setPos('B', posOf('A'));
         }
       }
     }
@@ -667,7 +691,7 @@ function frameTick() {
     // speed state machine -> video.playbackRate
     const currentSpeed = updateSpeed(t, dt);
     // Two Layer phase advancement (mutates twoLayer + sets video.playbackRate)
-    twoLayerAdvance(performance.now(), currentSpeed);
+    twoLayerAdvance(t * 1000, currentSpeed);
   }
 
   // ----- draw -----------------------------------------------------------------
@@ -746,7 +770,14 @@ function frameTick() {
   { const depthNow = bufferDepth; const wrote = ((bufferWriteIndex - catchupStartWrite) % depthNow + depthNow) % depthNow;
     gl.uniform1f(U.u_trailFrames, Math.max(1, Math.round(wrote * clamp(params.trailShutter, 0, 1)))); }
   gl.uniform1i(U.u_colorModel, params.colorModel | 0);
-  gl.uniform1i(U.u_alphaMode, params.alphaMode | 0);
+  gl.uniform1i(U.u_alphaMode, offline.job ? (offline.job.alpha ? ((params.alphaMode | 0) || 1) : 0) : (params.alphaMode | 0));
+  { // placement fit: cover crops, contain letterboxes (paper / transparent outside the picture)
+    const sw = texStateA.w, sh = texStateA.h, ca = canvas.width / canvas.height, ta = (sw > 1 && sh > 1) ? sw / sh : ca;
+    const contain = offline.job ? offline.job.fit === 'contain' : fitPreview.mode === 'contain';
+    let sx = 1, sy = 1;
+    if (contain) { if (ta > ca) sy = ta / ca; else sx = ca / ta; } else { if (ta > ca) sx = ca / ta; else sy = ta / ca; }
+    gl.uniform4f(U.u_fit, sx, sy, (1 - sx) / 2, (1 - sy) / 2);
+  }
   { const ib = hexToRgb(params.inkB ?? '#1a1a1a'); gl.uniform3f(U.u_inkB, ib[0], ib[1], ib[2]); }
   gl.uniform1f(U.u_inkOpacity, params.inkOpacity); gl.uniform1f(U.u_misregPx, params.misregPx);
 
@@ -799,7 +830,6 @@ function frameTick() {
   if (ccapPath.recording) ccapPath.capture();
   if (mp4Path.recording)  mp4Path.capture();
   frameCount++;
-  requestAnimationFrame(frameTick);
 }
 
 // =============================================================================
@@ -809,12 +839,12 @@ function frameTick() {
 // Per-rVFC video-frame buffer write. Captures A's frames into the ring buffer.
 // The buffer fills fastest during catch-up (when A's playbackRate is high),
 // which is exactly when the shader needs the recent-frame trail.
-function onVideoFrameWrite() {
+function onVideoFrameWrite(srcEl) {
   if (currentSource !== 'video') return;
-  if (!(video.readyState >= 2 && video.videoWidth > 0)) return;
+  if (!srcEl) { if (!(video.readyState >= 2 && video.videoWidth > 0)) return; srcEl = video; }
   if (!params.twoLayerEnabled) return;
 
-  tempCtx.drawImage(video, 0, 0, TEMPORAL_W, TEMPORAL_H);
+  tempCtx.drawImage(srcEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
@@ -826,6 +856,16 @@ function onVideoFrameWrite() {
     Math.max(32, (params.trailSampleCount ?? 10) + 22)
   );
   bufferWriteIndex = (bufferWriteIndex + 1) % depth;
+}
+
+// every ring layer holds one frame: an offline run starts from a known trail
+function fillRing(srcEl) {
+  tempCtx.drawImage(srcEl, 0, 0, TEMPORAL_W, TEMPORAL_H);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, bufferTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  for (let i = 0; i < TEMPORAL_SIZE_MAX; i++) gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, TEMPORAL_W, TEMPORAL_H, 1, gl.RGBA, gl.UNSIGNED_BYTE, tempCanvas);
+  bufferWriteIndex = 0;
 }
 
 function videoFrameCallback() {
@@ -867,9 +907,10 @@ function updateSpeed(t, dt) {
   _currentSpeed += (target - _currentSpeed) * k;
 
   // Two Layer owns playback rate when enabled — don't fight it.
-  if (currentSource === 'video' && video.duration > 0 && !params.twoLayerEnabled) {
+  if (currentSource === 'video' && (head.sim || video.duration > 0) && !params.twoLayerEnabled) {
     const clamped = Math.max(0.1, Math.min(2.0, _currentSpeed));
-    if (Math.abs(video.playbackRate - clamped) > 0.005) video.playbackRate = clamped;
+    if (head.sim) { head.rateA = clamped; head.rateB = clamped; }
+    else if (Math.abs(video.playbackRate - clamped) > 0.005) video.playbackRate = clamped;
   }
   return _currentSpeed;
 }
@@ -895,7 +936,7 @@ function twoLayerAdvance(nowMs) {
 
   // Initialize first phase boundary
   if (twoLayer.nextPhaseAt === 0) {
-    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs();
+    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs(nowMs);
   }
 
   if (twoLayer.triggerNow) {
@@ -913,17 +954,17 @@ function twoLayerAdvance(nowMs) {
   const baseRate = phaseLocked ? slowS : stat;
 
   if (twoLayer.phase === 'sync' || twoLayer.phase === 'resync') {
-    _setRate(video,  baseRate);
-    _setRate(videoB, baseRate);
+    setRate('A', baseRate);
+    setRate('B', baseRate);
   } else if (twoLayer.phase === 'holding') {
-    if (twoLayer.holdSide === 'A') { _setRate(video, 0); _setRate(videoB, baseRate); }
-    else                            { _setRate(videoB, 0); _setRate(video, baseRate); }
+    if (twoLayer.holdSide === 'A') { setRate('A', 0); setRate('B', baseRate); }
+    else                            { setRate('B', 0); setRate('A', baseRate); }
   } else { // catchup — held side races, other side stops
     const dt = Math.max(0.05, params.catchUpDuration ?? 0.45);
     const distance = Math.max(0.05, twoLayer.catchupTargetPos - twoLayer.catchupHoldPosA);
     const rate = Math.max(0.1, Math.min(16, distance / dt));
-    if (twoLayer.holdSide === 'A') { _setRate(videoB, 0); _setRate(video,  rate); }
-    else                            { _setRate(video,  0); _setRate(videoB, rate); }
+    if (twoLayer.holdSide === 'A') { setRate('B', 0); setRate('A', rate); }
+    else                            { setRate('A', 0); setRate('B', rate); }
   }
 }
 
@@ -935,24 +976,20 @@ function _twoLayerNextPhase(nowMs) {
     twoLayer.holdSide = (r < (1 - bias)) ? 'A' : 'B';
     twoLayer.phase = 'holding';
     twoLayer.isCatchup = false;
-    twoLayer.nextPhaseAt = nowMs + _beatQuant(_sampleHoldMs() / 1000, 1) * 1000;
+    twoLayer.nextPhaseAt = nowMs + _beatQuant(_sampleHoldMs(nowMs) / 1000, 1) * 1000;
   } else if (twoLayer.phase === 'holding') {
     // Save catchup positions: held side at hold pos, other (moving) at its current
-    const heldVid  = twoLayer.holdSide === 'A' ? video  : videoB;
-    const otherVid = twoLayer.holdSide === 'A' ? videoB : video;
-    twoLayer.catchupHoldPosA  = heldVid.currentTime;
-    twoLayer.catchupTargetPos = otherVid.currentTime;
+    const held = twoLayer.holdSide, other = held === 'A' ? 'B' : 'A';
+    twoLayer.catchupHoldPosA  = posOf(held);
+    twoLayer.catchupTargetPos = posOf(other);
     twoLayer.phase = 'catchup';
     twoLayer.isCatchup = true;
     catchupStartWrite = bufferWriteIndex;
     twoLayer.nextPhaseAt = nowMs + _beatQuant(params.catchUpDuration ?? 0.45, 0.5) * 1000;
   } else if (twoLayer.phase === 'catchup') {
     // Resync: force B to A (don't trust drift)
-    if (twoLayer.holdSide === 'A') {
-      videoB.currentTime = video.currentTime;
-    } else {
-      video.currentTime  = videoB.currentTime;
-    }
+    if (twoLayer.holdSide === 'A') setPos('B', posOf('A'));
+    else                            setPos('A', posOf('B'));
     twoLayer.phase = 'resync';
     twoLayer.isCatchup = false;
     // resync lands on the next downbeat when the beat clock is confident, capped by resyncDuration
@@ -960,7 +997,7 @@ function _twoLayerNextPhase(nowMs) {
     twoLayer.nextPhaseAt = nowMs + (_beatBpm() ? Math.min(resyncMs, _msToNextDownbeat(nowMs)) : resyncMs);
   } else { // resync → sync
     twoLayer.phase = 'sync';
-    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs();
+    twoLayer.nextPhaseAt = nowMs + _sampleSyncMs(nowMs);
   }
 }
 
@@ -976,28 +1013,28 @@ function _setRate(vid, rate) {
 }
 
 // beat clock from the audio modulator: phases quantise to beats / bars when the tempo is confident
-function _beatBpm() { return (params.beatSync && modulation.mode === 'audio' && audioMod.clock && audioMod.clock.confident()) ? audioMod.clock.bpm : 0; }
+function _beatBpm() { if (head.sim) return 0; return (params.beatSync && modulation.mode === 'audio' && audioMod.clock && audioMod.clock.confident()) ? audioMod.clock.bpm : 0; }
 function _beatQuant(seconds, unitBeats) { const bpm = _beatBpm(); if (!bpm) return seconds; const u = unitBeats * 60 / bpm; return Math.max(u, Math.round(seconds / u) * u); }
 function _msToNextDownbeat(nowMs) {
   const bpm = _beatBpm(); if (!bpm) return 0;
   const tA = audioMod._t / 1000;                      // the clock runs on the modulator's own time base
   return Math.max(0, (audioMod.clock.nextDownbeat(tA) - tA) * 1000);
 }
-function _sampleSyncMs() {
+function _sampleSyncMs(nowMs) {
   const base = (params.syncDuration ?? 1.0) * 1000;
   const jit  = (params.syncJitter   ?? 0.4) * 1000;
   const bpm = _beatBpm();
   if (bpm) {
     const bar = 240 / bpm * 1000;
-    const bars = Math.max(1, Math.round(base / bar) + Math.round((hash01(performance.now() * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit / bar));
-    return bars * bar + _msToNextDownbeat(performance.now());
+    const bars = Math.max(1, Math.round(base / bar) + Math.round((hash01(nowMs * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit / bar));
+    return bars * bar + _msToNextDownbeat(nowMs);
   }
-  return base + (hash01(performance.now() * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
+  return base + (hash01(nowMs * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
 }
-function _sampleHoldMs() {
+function _sampleHoldMs(nowMs) {
   const base = (params.holdDuration ?? 0.5) * 1000;
   const jit  = (params.holdJitter   ?? 0.2) * 1000;
-  return base + (hash01(performance.now() * 0.0009 + 0.371 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
+  return base + (hash01(nowMs * 0.0009 + 0.371 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
 }
 
 // -----------------------------------------------------------------------------
@@ -1048,15 +1085,16 @@ let updateSpeedVis = () => {};
       videoB.currentTime = 0;
       if (sourceState.playing) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
       twoLayer.phase = 'sync';
-      twoLayer.nextPhaseAt = performance.now() + 1500;
+      twoLayer.nextPhaseAt = clock.t * 1000 + 1500;
       twoLayer.isCatchup = false;
     }
     if (audioMod.hasAudio()) audioMod.seekTo(modulation.audio.startSeconds || 0);
-    effectStart = performance.now();
-    frameCount = 0;
+    restartEffect();
   });
   const bPlaying = f.addBinding(sourceState, 'playing', { label: 'play' });
-  window.__labTogglePlay = () => { bPlaying._commit(!sourceState.playing, true); };
+  window.__labTogglePlay = () => clock.toggle();
+  bPlaying.on('change', (ev) => { if (ev.value) clock.play(); else clock.pause(); });
+  clock.on('play', () => { if (sourceState.playing !== clock.playing) bPlaying._commit(clock.playing, true); });
   bPlaying.on('change', (ev) => { if (app && app.tool.play) window.LabUI.setLabel(app.tool.play, ev.value ? 'pause' : 'play'); });
   bPlaying.on('change', (ev) => {
     if (ev.value) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
@@ -1146,7 +1184,7 @@ let updateSpeedVis = () => {};
       pane.history.transaction('Preset ' + ev.value, () => { applyPreset(params, PRESETS[ev.value]); }, { amend: true });
       pane.refresh(); updateIntroVis(); updateSpeedVis(); updateTempVis(); updateColorVis();
       // restart intro on preset change so spatial wavefronts re-play
-      effectStart = performance.now(); frameCount = 0;
+      restartEffect();
     }
   });
 }
@@ -1222,8 +1260,7 @@ let updateSpeedVis = () => {};
       updateSpeedVis();
 
   f.addButton({ title: 'Replay intro', id: 'bReplay' }).on('click', () => {
-    effectStart = performance.now();
-    frameCount = 0;
+    restartEffect();
   });
 }
 
@@ -1384,7 +1421,7 @@ let updateSpeedVis = () => {};
 
 // --- Export ---
 {
-  const f = pane.addFolder({ title: 'Export', expanded: false });
+  const f = pane.addFolder({ title: 'Record (live)', expanded: false });
 
   const formatOptions = [
     { text: 'mp4 (h.264, in-browser)' + (WebCodecsMp4Path.isSupported() ? '' : ' — UNSUPPORTED'),
@@ -1466,7 +1503,7 @@ let updateSpeedVis = () => {};
         video.play().catch(() => {});
         videoB.play().catch(() => {});
         twoLayer.phase = 'sync';
-        twoLayer.nextPhaseAt = performance.now() + 1500;
+        twoLayer.nextPhaseAt = clock.t * 1000 + 1500;
         twoLayer.isCatchup = false;
         // wait for the seek to land so frame 0 of the file is frame 0 of the clip
         await new Promise((res) => {
@@ -1479,8 +1516,7 @@ let updateSpeedVis = () => {};
 
       // reset effect time so the intro ramp is captured at the start of the file
       if (exportSettings.replayIntroOnRecord) {
-        effectStart = performance.now();
-        frameCount = 0;
+        restartEffect();
       }
 
       const q = QUALITY_PRESETS[exportSettings.quality];
@@ -1546,7 +1582,7 @@ let updateSpeedVis = () => {};
   f.addButton({ title: 'Reset to default', id: 'bResetDefault' }).on('click', () => {
     pane.history.transaction('Reset to default', () => { applyPreset(params, PRESETS[DEFAULT_PRESET]); sourceState.preset = DEFAULT_PRESET; });
     pane.refresh(); updateIntroVis(); updateTempVis(); updateSpeedVis(); updateColorVis();
-    effectStart = performance.now(); frameCount = 0;
+    restartEffect();
   });
 
   f.addButton({ title: 'Save preset (json)' }).on('click', () => {
@@ -1683,6 +1719,54 @@ const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boi
     label: (d) => (d.name || d.kind) + (d.w ? ` (${d.w}×${d.h}${d.duration ? ' · ' + d.duration.toFixed(1) + 's' : ''})` : ''),
   } }) : null;
 
+
+// -----------------------------------------------------------------------------
+// offline render: placements -> queue (lab-render.js). Effect time and the two
+// playheads are stepped per frame, so a render is the same twice.
+// -----------------------------------------------------------------------------
+video.addEventListener('loadedmetadata', () => { if (currentSource === 'video' && isFinite(video.duration) && video.duration > 0) clock.setMedia({ duration: video.duration }); });
+const renderer_ = {
+  canvas, fallback: false,
+  media: () => { if (currentSource !== 'video') return null; const f = project ? project.sourceFile() : null; return f ? { blob: f } : { url: video.currentSrc || video.src }; },
+  async audio() {
+    if (modulation.mode === 'audio' && audioMod.hasAudio()) { try { const b = await audioMod.getDecodedBuffer(); return b ? { buffer: b, offset: modulation.audio.startSeconds || 0, loop: true } : null; } catch (e) { console.warn('song decode:', e); } }
+    return null;
+  },
+  async prepare(job) {
+    clock.pause(); clock.offline = true; offline.job = job; head.sim = true;
+    offline.saved = { phase: { ...twoLayer }, bufferWriteIndex, catchupStartWrite, speed: _currentSpeed, kick: lastKickEffectTime, A: video.currentTime, B: videoB.currentTime, t: clock.t, frame: frameCount };
+    head.A = head.B = job.in; head.rateA = head.rateB = 1;   // both axes start together at the in point
+    Object.assign(twoLayer, { phase: 'sync', nextPhaseAt: job.in * 1000 + 1500, holdSide: 'A', isCatchup: false, catchupHoldPosA: 0, catchupTargetPos: 0, triggerNow: false });
+    _currentSpeed = params.staticSpeed ?? 1.0; lastKickEffectTime = -1; bufferWriteIndex = 0; catchupStartWrite = 0; frameCount = 0;
+    offline.cA = job.src ? job.src.cursor() : null; offline.cB = (job.src && params.twoLayerEnabled) ? job.src.cursor() : null;
+    offline.frameA = offline.frameB = null; offline.first = true;
+    if (!job.src && currentSource === 'video') { video.pause(); videoB.pause(); }
+    resize();
+  },
+  async frame(i, t, job) {
+    if (offline.cA) {
+      const dur = job.src.duration, wrap = (x) => sourceState.loop ? ((x % dur) + dur) % dur : Math.min(x, dur - 1e-3);
+      offline.frameA = await offline.cA.at(wrap(head.A));
+      if (offline.cB) offline.frameB = await offline.cB.at(wrap(head.B));
+    }
+    clock.t = t;
+    renderOnce(t, 1 / job.fps);
+    head.A += head.rateA / job.fps; head.B += head.rateB / job.fps;   // the rates set this frame carry the heads to the next
+  },
+  async finish() {
+    const s = offline.saved; offline.job = null; head.sim = false; offline.cA = offline.cB = null; offline.frameA = offline.frameB = null;
+    Object.assign(twoLayer, s.phase); bufferWriteIndex = s.bufferWriteIndex; catchupStartWrite = s.catchupStartWrite; _currentSpeed = s.speed; lastKickEffectTime = s.kick; clock.t = s.t; frameCount = s.frame;
+    texStateA.w = texStateA.h = 1; texStateB.w = texStateB.h = 1;
+    if (currentSource === 'video') { try { video.currentTime = s.A; videoB.currentTime = s.B; } catch (_) {} videoADirty = videoBDirty = true; if (sourceState.playing) { video.play().catch(() => {}); videoB.play().catch(() => {}); } }
+    imageBufferFilled = false; clock.offline = false; resize();
+  },
+  preview(p) { fitPreview.aspect = p.ratio === 'source' ? null : window.LabUI.Render.aspect(p, srcAspect()); fitPreview.mode = p.fit; resize(); },
+};
+if (app && app.docRef && app.docRef.foot) clock.transport(app.docRef.foot);
+if (project) project.register('clock', { get: () => clock.getState(), set: (s) => clock.setState(s) });
+const renderUI = app ? window.LabUI.Render.folder(pane, { tool: 'boiler', renderer: renderer_, clock, project, srcAspect }) : null;
+clock.on('range', () => { if (project) project.touch(); });
+
 // -----------------------------------------------------------------------------
 // boot
 // -----------------------------------------------------------------------------
@@ -1699,6 +1783,7 @@ if (typeof window !== 'undefined') {
   window.boiler = {
     params, sourceState, modulation, exportSettings, monitor,
     pane, mediaPicker, audioPicker, presetPicker, project,
+    clock, head, renderer: renderer_, renderUI, offline,
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {
@@ -1709,13 +1794,11 @@ if (typeof window !== 'undefined') {
       updateIntroVis();
       updateSpeedVis();
       updateTempVis();
-      effectStart = performance.now();
-      frameCount = 0;
+      restartEffect();
       return true;
     },
     replayIntro() {
-      effectStart = performance.now();
-      frameCount = 0;
+      restartEffect();
     },
     refresh() {
       pane.refresh();
@@ -1777,8 +1860,7 @@ function activateSpecimen(spec) {
   loadVideoFromUrl('/samples/sample.mp4');
 
   // Replay the intro so the captured frame is past the develop ramp
-  effectStart = performance.now();
-  frameCount = 0;
+  restartEffect();
 
   // Build the panel fragment + caption + line
   buildSpecimenPanel(spec);
