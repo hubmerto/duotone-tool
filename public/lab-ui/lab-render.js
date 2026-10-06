@@ -55,6 +55,7 @@
     tick(nowMs) {
       if (this.offline) return;
       const dt = this._last ? clamp((nowMs - this._last) / 1000, 0, 0.25) : 0; this._last = nowMs;
+      this._frameNo = (this._frameNo | 0) + 1;
       const m = this.media;
       if (m && m.getTime) {
         this.playing = !m.paused();

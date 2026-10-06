@@ -644,7 +644,7 @@
       return this;
     }
     _add(ctrl) { this._children.push(ctrl); this.body.appendChild(ctrl.element); return ctrl; }
-    addBinding(obj, key, o) { const b = this._add(new Binding(this, obj, key, o)); b.on('change', (ev) => this._bubble(ev)); return b; }
+    addBinding(obj, key, o) { const pn = this.pane; if (pn) pn._byPath = null; const b = this._add(new Binding(this, obj, key, o)); b.on('change', (ev) => this._bubble(ev)); return b; }
     addButton(o) { return this._add(new ButtonControl(this, o || {})); }
     addButtons(items, o) { return this._add(new ButtonsControl(this, items, o)); }
     addBlade(o) {
@@ -708,6 +708,7 @@
     get pane() { return this; }
     // declare a state root: primitive keys of obj (at call time, plus include, minus exclude) are tracked
     track(name, obj, o) {
+      this._byPath = null;
       o = o || {};
       const ex = new Set(o.exclude || []);
       const ks = Object.keys(obj).filter((k) => !ex.has(k) && isPrim(obj[k])).concat((o.include || []).filter((k) => !ex.has(k)));
@@ -724,6 +725,7 @@
     // apply a (partial) state: {root: {key: value}}; one history entry unless noHistory; emits 'state' with the changed paths
     setState(state, o) {
       o = o || {};
+      if (state && state.keys && this.timeline) { Object.keys(state.keys).forEach((p) => this.timeline.setKeysFor(p, state.keys[p])); const rest = Object.assign({}, state); delete rest.keys; if (!Object.keys(rest).length) { this.emit('state', { paths: Object.keys(state.keys).map((p) => 'keys.' + p), source: o.source || 'set', keys: [] }); return Object.keys(state.keys).map((p) => 'keys.' + p); } state = rest; }
       const before = {}, after = {}, paths = [];
       this._roots.forEach((r) => {
         const part = state && state[r.name]; if (!part) return;
@@ -1909,7 +1911,16 @@
     },
     bypassActive() { const m = this._bypass || {}; return Object.keys(m).some((k) => m[k]); },
     // the object the renderer should read: the root itself when nothing is bypassed, else a copy with the identity values applied
-    effective(obj) { if (!this.bypassActive()) return obj; const r = this._rootName(obj); const ov = r && this._overrides()[r]; return ov ? Object.assign({}, obj, ov) : obj; },
+    // keyed value replaces the base, modulators add on top (scaled, clamped), a bypassed folder's identity wins last
+    effective(obj) {
+      const r = this._rootName(obj); if (!r) return obj;
+      let ov = null; const t = this.clock ? this.clock.t : 0;
+      if (this.timeline && this.timeline.has(r)) ov = this.timeline.resolve(r, t);
+      if (this.mod && this.mod.active()) { const base = ov ? Object.assign({}, obj, ov) : obj; const d = this.mod.apply(r, base, t); if (Object.keys(d).length) ov = Object.assign(ov || {}, d); }
+      if (this.bypassActive()) { const o = this._overrides()[r]; if (o) ov = Object.assign(ov || {}, o); }
+      return ov ? Object.assign({}, obj, ov) : obj;
+    },
+    byPath(path) { if (!this._byPath) { this._byPath = {}; this.bindings().forEach((b) => { const p = b.path; if (p && !this._byPath[p]) this._byPath[p] = b; }); } return this._byPath[path] || null; },
     getEffectiveState() { const s = this.getState(); const ov = this._overrides(); Object.keys(ov).forEach((r) => { if (s[r]) Object.assign(s[r], ov[r]); }); return s; },
     solo(folder) {
       const m = this._bypass || {}; const ids = this.folders().filter((f) => f.identity);
@@ -1936,5 +1947,5 @@
     },
   });
 
-  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, Viewer, History, Project, LabStore, keys, flash, lerpState, mulberry32, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, Viewer, History, Project, LabStore, keys, flash, normalizeOptions, contextMenu, lerpState, mulberry32, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);

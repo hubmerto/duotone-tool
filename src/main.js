@@ -137,6 +137,9 @@ function posOf(side) { return head.sim ? head[side] : (side === 'A' ? video : vi
 function setPos(side, t) { if (head.sim) head[side] = t; else (side === 'A' ? video : videoB).currentTime = t; }
 function setRate(side, r) { if (head.sim) head['rate' + side] = Math.max(0, Math.min(16, r)); else _setRate(side === 'A' ? video : videoB, r); }
 function restartEffect() { clock.seek(0); frameCount = 0; }
+// Modulation goes through the kit's matrix: sources are the analyser signals (live) or baked tracks (offline),
+// routes add to the params at draw time. The old fixed table lives on as the default routes.
+/* the modulation matrix is created with the pane below */
 function srcAspect() { return currentSource === 'image' && imageEl.naturalWidth ? imageEl.naturalWidth / imageEl.naturalHeight : (video.videoWidth > 0 ? video.videoWidth / video.videoHeight : 16 / 9); }
 
 // -----------------------------------------------------------------------------
@@ -155,6 +158,7 @@ const app = SPECIMEN ? null : window.LabUI.shell({
   menus: [
     { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }] },
     { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
+    { title: 'Control', items: [{ title: 'Command palette', kbd: '⌘K', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open() }, { title: 'Filter panel', kbd: '/', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open('filter') }, { sep: true }, { title: 'Key focused control', kbd: 'K', onClick: () => window.boiler && window.boiler.timeline.keyFocused() }, { title: 'Arm keyframes', kbd: '⇧A', onClick: () => window.boiler && window.boiler.timeline.setArmed(!window.boiler.timeline.armed) }, { sep: true }, { title: 'MIDI learn', kbd: '⇧M', onClick: () => window.boiler && window.boiler.midi.toggle() }] },
     { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
     { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
   ],
@@ -541,9 +545,33 @@ const cameraMod  = new CameraModulator();
 // Upper clamps here are *higher than the slider maxes* on purpose —
 // modulation peaks should be allowed to overshoot the values you'd
 // reasonably dial in manually. That's where the drama comes from.
+const sig = { bass: 0, mid: 0, treble: 0, rms: 0, sub: 0, kick: 0, snare: 0, hats: 0, onset: 0, kickOnset: 0, motion: 0, flowPx: 0 };
+function tickModulators(dtMs) {
+  sig.onset = 0; sig.kickOnset = 0;
+  if (modulation.mode === 'audio') {
+    const m = (SPECIMEN && SPECIMEN.forceModulationPeak)
+      ? { bass: 1.0, mid: 1.0, treble: 1.0, rms: 1.0, sub: 1.0, kick: 1.0, snare: 1.0, hats: 1.0, onset: false, kickOnset: false, bpm: 0 }
+      : audioMod.update(dtMs);
+    sig.bass = m.bass; sig.mid = m.mid; sig.treble = m.treble; sig.rms = m.rms; sig.sub = m.sub; sig.kick = m.kick; sig.snare = m.snare; sig.hats = m.hats; sig.onset = m.onset ? 1 : 0; sig.kickOnset = m.kickOnset ? 1 : 0;
+    monitor.bass = m.bass; monitor.mid = m.mid; monitor.treble = m.treble; monitor.rms = m.rms;
+  } else if (modulation.mode === 'camera') {
+    const m = cameraMod.update(dtMs); sig.motion = m.motion; sig.flowPx = m.flowPx; monitor.motion = m.motion;
+  } else {
+    sig.bass = sig.mid = sig.treble = sig.rms = sig.sub = sig.kick = sig.snare = sig.hats = sig.motion = sig.flowPx = 0;
+    monitor.bass = monitor.mid = monitor.treble = monitor.rms = monitor.motion = 0;
+  }
+}
 function computeLiveParams() {
-  const lp = { ...pane.effective(params) };   // bypassed folders contribute their identity values
-  if (head.sim) return lp;                     // offline: modulators wait for the bake (PR 6)
+  const lp = { ...pane.effective(params) };   // keys, then matrix routes, then bypassed folders' identity
+  const m = pane.mod;
+  // a kick forces the next boil drawing (live: the onset detector; offline: the baked onset track)
+  if (modulation.audio.kickToBoil && m && m.sample('kickOnset', clock.t) > 0.5) lastKickEffectTime = clock.t;
+  // motion drives the drawing rate, not the threshold: still on 4s, moving on 2s
+  if (!head.sim && modulation.mode === 'camera' && modulation.camera.toBoilRate && params.boilHold) lp._boilHoldOverride = sig.flowPx < 0.05 ? 4 : sig.flowPx < 0.3 ? 3 : 2;
+  return lp;
+}
+function _oldComputeLiveParams() {
+  const lp = { ...pane.effective(params) };
   if (modulation.mode === 'audio') {
     // Specimen 06: synthetic peak signals instead of real audio analyzer.
     // Lets a still capture show what the effect looks like at audio peak.
@@ -668,6 +696,7 @@ function renderOnce(tOv, dtOv) {
   const t  = tOv != null ? tOv : clock.t;
   const dt = dtOv != null ? dtOv : Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
   liveDtMs = dt * 1000;
+  if (!head.sim) tickModulators(liveDtMs);
   lastFrameMs = performance.now();
 
   // ----- playback rate ---------------------------------------------------------
@@ -1013,10 +1042,11 @@ function _setRate(vid, rate) {
 }
 
 // beat clock from the audio modulator: phases quantise to beats / bars when the tempo is confident
-function _beatBpm() { if (head.sim) return 0; return (params.beatSync && modulation.mode === 'audio' && audioMod.clock && audioMod.clock.confident()) ? audioMod.clock.bpm : 0; }
+function _beatBpm() { if (head.sim) return (params.beatSync && clock.beat && clock.beat.bpm) ? clock.beat.bpm : 0; return (params.beatSync && modulation.mode === 'audio' && audioMod.clock && audioMod.clock.confident()) ? audioMod.clock.bpm : 0; }
 function _beatQuant(seconds, unitBeats) { const bpm = _beatBpm(); if (!bpm) return seconds; const u = unitBeats * 60 / bpm; return Math.max(u, Math.round(seconds / u) * u); }
 function _msToNextDownbeat(nowMs) {
   const bpm = _beatBpm(); if (!bpm) return 0;
+  if (head.sim) { const b = clock.beat, bar = 240 / bpm, t = nowMs / 1000; const next = (b.t0 || 0) + Math.ceil((t - (b.t0 || 0)) / bar) * bar; return Math.max(0, (next - t) * 1000); }
   const tA = audioMod._t / 1000;                      // the clock runs on the modulator's own time base
   return Math.max(0, (audioMod.clock.nextDownbeat(tA) - tA) * 1000);
 }
@@ -1041,6 +1071,18 @@ function _sampleHoldMs(nowMs) {
 // Tweakpane UI
 // -----------------------------------------------------------------------------
 const pane = new Pane({ title: 'DUOTONE', container: app ? app.side : null });
+const mod = new window.LabUI.ModMatrix(pane, { clock, tool: 'boiler' });
+mod.addSource('bass',  { label: 'bass',  group: 'audio', live: () => sig.bass,  enabled: () => modulation.mode === 'audio' });
+mod.addSource('mid',   { label: 'mid',   group: 'audio', live: () => sig.mid,   enabled: () => modulation.mode === 'audio' });
+mod.addSource('treble',{ label: 'treble',group: 'audio', live: () => sig.treble,enabled: () => modulation.mode === 'audio' });
+mod.addSource('rms',   { label: 'rms',   group: 'audio', live: () => sig.rms,   enabled: () => modulation.mode === 'audio' });
+mod.addSource('sub',   { label: 'sub',   group: 'audio', live: () => sig.sub,   enabled: () => modulation.mode === 'audio' });
+mod.addSource('kick',  { label: 'kick',  group: 'audio', live: () => sig.kick,  enabled: () => modulation.mode === 'audio' });
+mod.addSource('snare', { label: 'snare', group: 'audio', live: () => sig.snare, enabled: () => modulation.mode === 'audio' });
+mod.addSource('hats',  { label: 'hats',  group: 'audio', live: () => sig.hats,  enabled: () => modulation.mode === 'audio' });
+mod.addSource('onset', { label: 'onset', group: 'audio', live: () => sig.onset, enabled: () => modulation.mode === 'audio' });
+mod.addSource('kickOnset', { label: 'kick onset', group: 'audio', live: () => sig.kickOnset, enabled: () => modulation.mode === 'audio' });
+mod.addSource('motion',{ label: 'motion',group: 'camera', live: () => sig.motion, enabled: () => modulation.mode === 'camera', recordable: true });
 // instrument rows: two numeric bindings become one half-width XY pad at the top of the folder.
 // The bindings stay (hidden) so pane.refresh, presets and visibility updaters keep working.
 function padPair(f, obj, bx, by, xKey, yKey, xr, yr, label, xl, yl, full) {
@@ -1385,16 +1427,6 @@ let updateSpeedVis = () => {};
     .on('change', (ev) => { if (audioMod.hasAudio()) audioMod.seekTo(ev.value || 0); });
   f.addBinding(modulation.audio, 'volume',       { label: 'audio vol',   min: 0, max: 1,    step: 0.01  })
     .on('change', (ev) => audioMod.setVolume(ev.value));
-  // master intensity — turn this up to make EVERYTHING crazier at once
-  const bIn = f.addBinding(modulation.audio, 'intensity',    { label: 'INTENSITY',   min: 0, max: 3,    step: 0.05  });
-  const bB1 = f.addBinding(modulation.audio, 'bassToSlow',   { label: 'bass→swell',  min: 0, max: 1.0,  step: 0.01  });
-  const bB2 = f.addBinding(modulation.audio, 'bassToFlash',  { label: 'bass→flash',  min: 0, max: 0.50, step: 0.01  });
-  f.addSubhead('routing');
-  const bM1 = f.addBinding(modulation.audio, 'midToSpeed',   { label: 'mid→speed',   min: 0, max: 1.0,  step: 0.01  });
-  const bR1 = f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
-  const bS1 = f.addBinding(modulation.audio, 'snareToLFO',   { label: 'snare→lfo',   min: 0, max: 0.30, step: 0.005 });
-  const bS2 = f.addBinding(modulation.audio, 'subToWarp',    { label: 'sub→warp',    min: 0, max: 0.06, step: 0.001 });
-  padPair(f, modulation.audio, bB1, bB2, 'bassToSlow', 'bassToFlash', [0, 1.0, 0.01], [0, 0.5, 0.01], 'bass', 'swell', 'flash', true);
   f.addBinding(modulation.audio, 'kickToBoil',   { label: 'kick→drawing' });
 
   // ---- camera sub-section
@@ -1407,8 +1439,6 @@ let updateSpeedVis = () => {};
       catch (e) { console.warn('camera failed', e); }
     }
   });
-  f.addBinding(modulation.camera, 'lfoDepth',   { label: 'mot→lfo',   min: 0, max: 0.30, step: 0.005 });
-  f.addBinding(modulation.camera, 'flashDepth', { label: 'mot→flash', min: 0, max: 0.40, step: 0.005 });
   f.addBinding(modulation.camera, 'toBoilRate',  { label: 'mot→drawing rate' });
 
   // ---- live monitors (graphs)
@@ -1417,6 +1447,9 @@ let updateSpeedVis = () => {};
   f.addBinding(monitor, 'mid',    { ...gOpts, label: 'mid'    });
   f.addBinding(monitor, 'treble', { ...gOpts, label: 'treble' });
   f.addBinding(monitor, 'motion', { ...gOpts, label: 'motion' });
+  // routes: source → param, amount as a share of the param's range; the old table seeds the defaults
+  f.addSubhead('routing');
+  mod.folder({ folder: f });
 }
 
 // --- Export ---
@@ -1733,6 +1766,7 @@ const renderer_ = {
     return null;
   },
   async prepare(job) {
+    await mod.ensureBaked({ force: modulation.mode === 'audio' });
     clock.pause(); clock.offline = true; offline.job = job; head.sim = true;
     offline.saved = { phase: { ...twoLayer }, bufferWriteIndex, catchupStartWrite, speed: _currentSpeed, kick: lastKickEffectTime, A: video.currentTime, B: videoB.currentTime, t: clock.t, frame: frameCount };
     head.A = head.B = job.in; head.rateA = head.rateB = 1;   // both axes start together at the in point
@@ -1766,6 +1800,35 @@ if (app && app.docRef && app.docRef.foot) clock.transport(app.docRef.foot);
 if (project) project.register('clock', { get: () => clock.getState(), set: (s) => clock.setState(s) });
 const renderUI = app ? window.LabUI.Render.folder(pane, { tool: 'boiler', renderer: renderer_, clock, project, srcAspect }) : null;
 clock.on('range', () => { if (project) project.touch(); });
+// keys, modulation bake, MIDI, palette (lab-mod.js)
+pane.clock = clock;
+const pct = (path, abs) => { const b = pane.byPath(path); return b && typeof b.opts.max === 'number' ? Math.round(abs / ((b.opts.max - b.opts.min) || 1) * 100) : 0; };
+const DEFAULT_ROUTES = [
+  { src: 'bass',   dst: 'params.slowAmp',         amt: pct('params.slowAmp', 0.45) },
+  { src: 'bass',   dst: 'params.thresholdBase',   amt: -pct('params.thresholdBase', 0.22) },
+  { src: 'mid',    dst: 'params.slowNoiseSpeed',  amt: pct('params.slowNoiseSpeed', 0.45) },
+  { src: 'rms',    dst: 'params.ditherAmp',       amt: pct('params.ditherAmp', 0.14) },
+  { src: 'snare',  dst: 'params.thresholdLFOAmp', amt: pct('params.thresholdLFOAmp', 0.10) },
+  { src: 'motion', dst: 'params.thresholdLFOAmp', amt: pct('params.thresholdLFOAmp', 0.08) },
+  { src: 'motion', dst: 'params.thresholdBase',   amt: -pct('params.thresholdBase', 0.15) },
+].filter((r) => r.amt);
+if (!mod.routes.length) DEFAULT_ROUTES.forEach((r) => mod.addRoute(r));
+async function bakeAudio(fps, t0, dur, prog) {
+  const BANDS = { bass: [0, 150, 30, 300], mid: [150, 2000, 30, 250], treble: [2000, 0, 20, 200], rms: [0, 0, 20, 300], sub: [20, 60, 30, 400], kick: [60, 120, 5, 150], snare: [150, 250, 5, 150], hats: [5000, 0, 2, 80] };
+  const ON = { onset: [20, 0], kickOnset: [50, 140] };
+  let buf = null, off = 0;
+  if (audioMod.hasAudio()) { try { buf = await audioMod.getDecodedBuffer(); off = modulation.audio.startSeconds || 0; } catch (e) { console.warn('song decode:', e); } }
+  if (!buf) { const m = renderer_.media(); if (!m) return null; const fs = await window.LabUI.Render.FrameSource.open(m.blob || m.url); try { if (!fs.audioTrack) return null; buf = await fs.audio(0, dur); } finally { fs.close(); } }
+  if (!buf) return null;
+  const r = await window.LabUI.Bake.audio(buf, { fps, t0: off, dur, bands: BANDS, onsets: ON, onProgress: prog });
+  clock.beat = r.bpm ? { bpm: r.bpm, t0: ((r.onsets.onset && r.onsets.onset[0]) || off) - off } : null;
+  return r.tracks;
+}
+mod.o.bake = bakeAudio; mod.o.bakeKey = () => { const d = project && project.sourceDesc; return (d ? (d.fp || d.name || d.kind || '') : '') + '|' + (audioMod.file ? audioMod.file.name + audioMod.file.size : '') + '|' + (modulation.audio.startSeconds || 0); };
+if (project) { mod.o.project = project; project.register('mod', { get: () => mod.getState(), set: (st) => mod.setState(st) }); }
+const timeline = new window.LabUI.Timeline(pane, { clock, host: app ? app.view : null, project, tool: 'boiler' });
+const midi = new window.LabUI.MidiLearn(pane, { tool: 'boiler' });
+const palette = app ? new window.LabUI.Palette(pane, { host: app.side, presets: window.__boilerLooks }) : null;
 
 // -----------------------------------------------------------------------------
 // boot
@@ -1783,7 +1846,7 @@ if (typeof window !== 'undefined') {
   window.boiler = {
     params, sourceState, modulation, exportSettings, monitor,
     pane, mediaPicker, audioPicker, presetPicker, project,
-    clock, head, renderer: renderer_, renderUI, offline,
+    clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, sig,
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {
