@@ -143,7 +143,7 @@ const app = SPECIMEN ? null : window.LabUI.shell({
   title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
   menus: [
     { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }] },
-    { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
+    { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
     { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
     { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
   ],
@@ -1023,6 +1023,16 @@ let updateTempVis  = () => {};
 let updateColorVis = () => {};
 let updateColorVis0 = () => {};
 
+// --- Looks: built-in recipes as swatch tiles plus user presets saved with a thumbnail ---
+const LOOK_EXCLUDE = ['source.loop', 'modulation.', 'modAudio.', 'modCamera.'];
+{
+  const f = pane.addFolder({ title: 'Looks', expanded: true });
+  const grid = f.addPresets(Object.keys(PRESETS).filter((k) => k !== 'default'), { cols: 3, thumbs: true, aspect: '16/9', thumbWidth: 192, thumbHeight: 108 });
+  grid.render((name, cv) => { const x = cv.getContext('2d'); x.fillStyle = PRESETS[name].spotColor; x.fillRect(0, 0, cv.width, cv.height); x.fillStyle = '#000'; for (let i = 0; i < 6; i++) x.fillRect(0, cv.height * (0.55 + i * 0.075), cv.width * (1 - i * 0.12), 4); });
+  grid.addUser({ pane, tool: 'boiler', canvas, exclude: LOOK_EXCLUDE, resolve: (name) => { const p = PRESETS[name]; if (!p) return null; const params = { ...p }; delete params.name; return { params, source: { preset: name } }; } });
+  window.__boilerLooks = grid;
+}
+
 // --- Source ---
 let updateSpeedVis = () => {};
 {
@@ -1656,7 +1666,7 @@ pane.track('modAudio', modulation.audio);
 pane.track('modCamera', modulation.camera);
 pane.on('state', (ev) => { if (ev.source === 'control') return; window.__boiler.refreshVis(); });
 pane.addHistory();
-const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app,
+const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app, lookExclude: LOOK_EXCLUDE,
   source: {
     restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadImageFromFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
     label: (d) => (d.name || d.kind) + (d.w ? ` (${d.w}×${d.h}${d.duration ? ' · ' + d.duration.toFixed(1) + 's' : ''})` : ''),
