@@ -58,6 +58,7 @@ const params = {
   trailShutter: 1,        // fraction of the catch-up window integrated (1 = 360 degrees)
   beatSync: true,         // quantise Two Layer phases to the beat clock when audio has a confident tempo
   colorModel: 0,          // 0 replace, 1 ink over paper, 2 duotone, 3 riso
+  alphaMode: 0,           // 0 opaque, 1 key paper (keep ink), 2 key ink (keep paper)
   inkB: '#1a1a1a', inkOpacity: 1, misregPx: 0,
   ...PRESETS[DEFAULT_PRESET],
 };
@@ -189,7 +190,7 @@ function showFatal(message) {
 const gl = canvas.getContext('webgl2', {
   preserveDrawingBuffer: true,   // needed for canvas.captureStream + ccapture
   antialias: false,
-  alpha: false,
+  alpha: true,                   // transparent export (alpha key in the Export folder)
   premultipliedAlpha: false,
 });
 if (!gl) {
@@ -358,7 +359,7 @@ for (const name of [
   'u_blueNoise','u_lumaMode','u_ditherMode','u_boilHold','u_boilCycle','u_boilKick','u_lpi','u_printHeightIn','u_screenAngle',
   'u_fieldMode','u_edgeMode','u_bleedPx','u_haloPx','u_haloStrength','u_edgeRoughPx','u_edgeTemporal',
   'u_introModel','u_introInduction','u_introFrom','u_scanLampGain','u_scanLampPx','u_scanLinesPerFrame',
-  'u_trailMode','u_trailFrames','u_colorModel','u_inkB','u_inkOpacity','u_misregPx',
+  'u_trailMode','u_trailFrames','u_colorModel','u_inkB','u_inkOpacity','u_misregPx','u_alphaMode',
   'u_bufferSize','u_bufferWriteIndex',
   'u_twoLayerEnabled','u_layerBlendMode','u_layerBlendBalance',
   'u_isCatchupActive','u_trailSampleCount','u_trailStyle',
@@ -747,6 +748,7 @@ function frameTick() {
   { const depthNow = bufferDepth; const wrote = ((bufferWriteIndex - catchupStartWrite) % depthNow + depthNow) % depthNow;
     gl.uniform1f(U.u_trailFrames, Math.max(1, Math.round(wrote * clamp(params.trailShutter, 0, 1)))); }
   gl.uniform1i(U.u_colorModel, params.colorModel | 0);
+  gl.uniform1i(U.u_alphaMode, params.alphaMode | 0);
   { const ib = hexToRgb(params.inkB ?? '#1a1a1a'); gl.uniform3f(U.u_inkB, ib[0], ib[1], ib[2]); }
   gl.uniform1f(U.u_inkOpacity, params.inkOpacity); gl.uniform1f(U.u_misregPx, params.misregPx);
 
@@ -1416,6 +1418,16 @@ let updateSpeedVis = () => {};
     options: formatOptions,
     value: exportSettings.format,
   }).on('change', (ev) => { exportSettings.format = ev.value; });
+
+  // alpha key: png sequence / save png carry transparency; mp4 and webm flatten over black
+  const applyAlpha = () => { canvas.classList.toggle('lab-alpha', (params.alphaMode | 0) > 0); };
+  f.addBlade({ view: 'list', label: 'alpha', options: [
+      { text: 'opaque', value: 0 }, { text: 'key paper (keep ink)', value: 1 }, { text: 'key ink (keep paper)', value: 2 },
+    ], value: params.alphaMode | 0 }).on('change', (ev) => { params.alphaMode = ev.value | 0; applyAlpha(); });
+  applyAlpha();
+  f.addButton({ title: 'Save PNG', id: 'bPng' }).on('click', () => {
+    canvas.toBlob((b) => { if (!b) return; const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = `boiler-eggs-${Date.now()}.png`; a.click(); }, 'image/png');
+  });
 
   f.addBlade({
     view: 'list',
