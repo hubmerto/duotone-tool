@@ -1021,6 +1021,7 @@ window.__boiler = { params, modulation, pane, twoLayer, refreshVis: () => { upda
 let updateIntroVis = () => {};
 let updateTempVis  = () => {};
 let updateColorVis = () => {};
+let updateColorVis0 = () => {};
 
 // --- Source ---
 let updateSpeedVis = () => {};
@@ -1104,11 +1105,13 @@ let updateSpeedVis = () => {};
   const bSpot = f.addBinding(params, 'spotColor', { label: 'spot' });
   // shadow = below-threshold color, applies in both colour modes
   f.addBinding(params, 'shadowColor', { label: 'shadow' });
-  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'replace (legacy)', value: 0 }, { text: 'ink over paper', value: 1 }, { text: 'duotone, two screens', value: 2 }, { text: 'riso two-ink', value: 3 }], value: params.colorModel | 0 }).on('change', (ev) => { params.colorModel = ev.value | 0; });
+  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'replace (legacy)', value: 0 }, { text: 'ink over paper', value: 1 }, { text: 'duotone, two screens', value: 2 }, { text: 'riso two-ink', value: 3 }], value: params.colorModel | 0 }).on('change', (ev) => { params.colorModel = ev.value | 0; updateColorVis0(); });
   f.addBinding(params, 'inkB', { label: 'second ink' });
+  const duoCurve = f.addCurve(params, { label: 'duotone curves', xLabel: 'lightness', yLabel: 'coverage', readout: () => 'spot · black',
+    fn: (L) => { const sm = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); }; return [1 - Math.pow(L, 0.8), Math.pow(sm((0.55 - L) / 0.55), 1.2)]; } });
+  updateColorVis0 = () => { duoCurve.hidden = (params.colorModel | 0) !== 2; }; updateColorVis0();
   const bIO = f.addBinding(params, 'inkOpacity', { label: 'ink opacity', min: 0, max: 1, step: 0.01 });
   const bMr = f.addBinding(params, 'misregPx', { label: 'misregister px', min: 0, max: 12, step: 0.5 });
-  padPair(f, params, bIO, bMr, 'inkOpacity', 'misregPx', [0, 1, 0.01], [0, 12, 0.5], 'ink', 'opacity', 'misreg px', true);
   const bMode = f.addBlade({
     view: 'list',
     label: 'colour mode',
@@ -1157,10 +1160,15 @@ let updateSpeedVis = () => {};
 // --- Threshold ---
 {
   const f = pane.addFolder({ title: 'Threshold', expanded: false, cols: 2 });
+  f.addSubhead('threshold');
   const bTB = f.addBinding(params, 'thresholdBase',    { label: 'base',    min: 0,    max: 1,   step: 0.005 });
   const bTA = f.addBinding(params, 'thresholdLFOAmp',  { label: 'lfo amp', min: 0,    max: 0.3, step: 0.005 });
   const bTF = f.addBinding(params, 'thresholdLFOFreq', { label: 'lfo hz',  min: 0.01, max: 1.0, step: 0.01  });
-  padPair(f, params, bTB, bTA, 'thresholdBase', 'thresholdLFOAmp', [0, 1, 0.005], [0, 0.3, 0.005], 'cut', 'base', 'lfo amp');
+  // the cut itself: ink coverage against lightness, second trace at the LFO peak; drag x = base, y = softness
+  const cutCurve = f.addCurve(params, { label: 'cut', xLabel: 'lightness', yLabel: 'ink', xKey: 'thresholdBase', yKey: 'softness', xmin: 0, xmax: 1, ymin: 0, ymax: 0.05, yDigits: 3, xStep: 0.005, yStep: 0.001,
+    fn: (L, P) => { const T = P.thresholdBase, w = Math.max(P.softness, 0.002); const sm = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); };
+      return [sm((L - (T - w)) / (2 * w)), sm((L - (T + P.thresholdLFOAmp - w)) / (2 * w))]; } });
+  f.body.insertBefore(cutCurve.element, f.body.firstChild);
   f.addBlade({ view: 'list', label: 'luma', options: [{ text: "Y' (legacy)", value: 0 }, { text: 'L* perceptual', value: 1 }], value: params.lumaMode | 0 }).on('change', (ev) => { params.lumaMode = ev.value | 0; });
 }
 
@@ -1207,13 +1215,16 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'scanLampPx', { label: 'lamp px', min: 1, max: 40, step: 1 });
   f.addBinding(params, 'scanLinesPerFrame', { label: 'fax lines', min: 0, max: 1200, step: 1 });
 
+  const devCurve = f.addCurve(params, { label: 'develop', xLabel: 'time', yLabel: 'density', xKey: 'introInduction', xmin: 0, xmax: 0.6, xStep: 0.01,
+    fn: (x, P) => { if (P.introModel | 0) { const ti = Math.min(0.9, P.introInduction), k = (1 - ti) / 3.9; return x < ti ? 0 : 1 - Math.exp(-(x - ti) / k); }
+      const c = P.introCurve | 0; return c === 0 ? x : c === 1 ? 1 - Math.pow(1 - x, 3) : (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2); } });
+  f.body.insertBefore(devCurve.element, f.body.firstChild);
   const pOrg = padPair(f, params, bOriginX, bOriginY, 'introOriginX', 'introOriginY', [0, 1, 0.005], [0, 1, 0.005], 'origin', 'x', 'y');
   const pSpr = padPair(f, params, bSpread, bFalloff, 'introSpread', 'introFalloff', [0.05, 1.0, 0.005], [0, 1, 0.01], 'front', 'spread', 'falloff');
-  const pDur = padPair(f, params, bDur, bTurb, 'introDuration', 'introTurbulence', [0, 6, 0.05], [0, 1, 0.01], 'timing', 'duration s', 'turbulence');
   updateIntroVis = function () {
     const m = params.introMode | 0;
     const spatial = m !== 0;
-    bOriginX.hidden = true; bOriginY.hidden = true; bSpread.hidden = true; bFalloff.hidden = true; bTurb.hidden = true; bDur.hidden = true;
+    bOriginX.hidden = true; bOriginY.hidden = true; bSpread.hidden = true; bFalloff.hidden = true; bTurb.hidden = !spatial;
     pOrg.hidden = !spatial; pSpr.hidden = !spatial;
     bDir.hidden     = m !== 1;                 // directionality only meaningful in radiance
     bAngle.hidden   = (m === 0 || m === 2);    // not used in develop or aperture
@@ -1232,11 +1243,11 @@ let updateSpeedVis = () => {};
   const f = pane.addFolder({ title: 'Slow Field', expanded: false, cols: 2 });
   const bFS = f.addBinding(params, 'slowNoiseScale', { label: 'scale',  min: 0.5, max: 12,   step: 0.1   });
   const bFV = f.addBinding(params, 'slowNoiseSpeed', { label: 'speed',  min: 0,   max: 1,    step: 0.005 });
+  f.addSubhead('amount');
   const bFA = f.addBinding(params, 'slowAmp',        { label: 'amp',    min: 0,   max: 0.6,  step: 0.005 });
   // morphism knob — UV warp by the same field; tiny values go a long way
   const bFW = f.addBinding(params, 'warpAmp',        { label: 'warp',   min: 0,   max: 0.06, step: 0.001 });
   padPair(f, params, bFS, bFV, 'slowNoiseScale', 'slowNoiseSpeed', [0.5, 12, 0.1], [0, 1, 0.005], 'field', 'scale', 'speed');
-  padPair(f, params, bFA, bFW, 'slowAmp', 'warpAmp', [0, 0.6, 0.005], [0, 0.06, 0.001], 'ink', 'amp', 'warp');
   f.addBlade({ view: 'list', label: 'field', options: [{ text: 'value fbm (legacy)', value: 0 }, { text: 'simplex, vector warp', value: 1 }, { text: 'simplex, curl warp', value: 2 }], value: params.fieldMode | 0 }).on('change', (ev) => { params.fieldMode = ev.value | 0; });
 }
 
@@ -1245,15 +1256,16 @@ let updateSpeedVis = () => {};
   const f = pane.addFolder({ title: 'Boil', expanded: false, cols: 2 });
   const bBS = f.addBinding(params, 'ditherScale', { label: 'scale', min: 50,  max: 1500, step: 5    });
   const bBV = f.addBinding(params, 'ditherSpeed', { label: 'speed', min: 0,   max: 1,    step: 0.01 });
+  f.addSubhead('boil');
   const bBA = f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
   f.addBlade({ view: 'list', label: 'grain', options: [{ text: 'white noise (legacy)', value: 0 }, { text: 'blue noise', value: 1 }, { text: 'halftone screen', value: 2 }, { text: 'Bayer 8x8', value: 3 }, { text: 'interleaved gradient', value: 4 }], value: params.ditherMode | 0 }).on('change', (ev) => { params.ditherMode = ev.value | 0; });
   f.addBinding(params, 'boilHold',  { label: 'hold drawings (2s/3s)' });
   const bBC = f.addBinding(params, 'boilCycle', { label: 'drawings in loop', min: 1, max: 8, step: 1 });
+  f.addSubhead('halftone');
   const bLp = f.addBinding(params, 'lpi', { label: 'screen lpi', min: 45, max: 200, step: 1 });
   f.addBinding(params, 'printHeightIn', { label: 'print height in', min: 1, max: 20, step: 0.5 });
   const bAn = f.addBinding(params, 'screenAngle', { label: 'screen angle', min: 0, max: 90, step: 1 });
   padPair(f, params, bBS, bBV, 'ditherScale', 'ditherSpeed', [50, 1500, 5], [0, 1, 0.01], 'grain', 'cells', 'rate');
-  padPair(f, params, bBA, bBC, 'ditherAmp', 'boilCycle', [0, 0.3, 0.005], [1, 8, 1], 'boil', 'amp', 'drawings');
   padPair(f, params, bLp, bAn, 'lpi', 'screenAngle', [45, 200, 1], [0, 90, 1], 'screen', 'lpi', 'angle');
 }
 
@@ -1274,6 +1286,7 @@ let updateSpeedVis = () => {};
   const bHoldJ  = f.addBinding(params, 'holdJitter',      { label: 'hold jitter',  min: 0,   max: 0.5, step: 0.02 });
   const bCatch  = f.addBinding(params, 'catchUpDuration', { label: 'catch-up (s)', min: 0.2, max: 1.5, step: 0.05 });
   const bResy   = f.addBinding(params, 'resyncDuration',  { label: 'resync (s)',   min: 0,   max: 1.0, step: 0.05 });
+  f.addSubhead('trail');
   const bBias   = f.addBinding(params, 'pauseBias',       { label: 'pause bias',   min: 0,   max: 1,   step: 0.01 });
   const bTSamp  = f.addBinding(params, 'trailSampleCount',{ label: 'trail samples',min: 4,   max: 16,  step: 1    });
   const bTStyle = f.addBlade({
@@ -1302,14 +1315,12 @@ let updateSpeedVis = () => {};
     padPair(f, params, bSync, bHold, 'syncDuration', 'holdDuration', [0.5, 6.0, 0.05], [0.2, 2.0, 0.05], 'sync / hold', 'sync s', 'hold s'),
     padPair(f, params, bCatch, bResy, 'catchUpDuration', 'resyncDuration', [0.2, 1.5, 0.05], [0, 1.0, 0.05], 'catch-up', 'catch s', 'resync s'),
     padPair(f, params, bSyncJ, bHoldJ, 'syncJitter', 'holdJitter', [0, 1.0, 0.05], [0, 0.5, 0.02], 'jitter', 'sync', 'hold'),
-    padPair(f, params, bBias, bTSamp, 'pauseBias', 'trailSampleCount', [0, 1, 0.01], [4, 16, 1], 'trail', 'pause bias', 'samples'),
-    padPair(f, params, bBal, bShut, 'layerBlendBalance', 'trailShutter', [0, 1, 0.01], [0.1, 1, 0.05], 'blend', 'balance', 'shutter'),
   ];
   f.addButton({ title: 'Trigger now', id: 'bTrigger' }).on('click', () => { twoLayer.triggerNow = true; });
 
   updateTempVis = function () {
     const enabled = !!params.twoLayerEnabled;
-    [bTStyle, bMode, bPhase, bSeed].forEach((b) => { b.hidden = !enabled; });
+    [bTStyle, bMode, bPhase, bSeed, bBias, bTSamp, bBal, bShut].forEach((b) => { b.hidden = !enabled; });
     tlPads.forEach((c) => { c.hidden = !enabled; });
   };
   updateTempVis();
@@ -1318,16 +1329,16 @@ let updateSpeedVis = () => {};
 // --- Edge ---
 {
   const f = pane.addFolder({ title: 'Edge', expanded: false, cols: 2 });
+  f.addSubhead('cut');
   const bSo = f.addBinding(params, 'softness', { label: 'softness', min: 0, max: 0.05, step: 0.001 });
   f.addBlade({ view: 'list', label: 'edge', options: [{ text: 'luma width (legacy)', value: 0 }, { text: 'pixel distance', value: 1 }], value: params.edgeMode | 0 }).on('change', (ev) => { params.edgeMode = ev.value | 0; });
   const bBl = f.addBinding(params, 'bleedPx', { label: 'bleed px', min: 0, max: 2, step: 0.05 });
   const bHp = f.addBinding(params, 'haloPx', { label: 'halo px', min: 0, max: 4, step: 0.1 });
   const bHs = f.addBinding(params, 'haloStrength', { label: 'halo', min: 0, max: 0.5, step: 0.01 });
+  f.addSubhead('paper');
   const bRo = f.addBinding(params, 'edgeRoughPx', { label: 'rough px', min: 0, max: 2, step: 0.05 });
   const bTe = f.addBinding(params, 'edgeTemporal', { label: 'temporal', min: 0, max: 0.5, step: 0.01 });
-  padPair(f, params, bSo, bBl, 'softness', 'bleedPx', [0, 0.05, 0.001], [0, 2, 0.05], 'cut', 'soft', 'bleed px');
   padPair(f, params, bHp, bHs, 'haloPx', 'haloStrength', [0, 4, 0.1], [0, 0.5, 0.01], 'halo', 'px', 'strength');
-  padPair(f, params, bRo, bTe, 'edgeRoughPx', 'edgeTemporal', [0, 2, 0.05], [0, 0.5, 0.01], 'grain', 'rough px', 'temporal');
 }
 
 // --- Modulation ---
@@ -1357,13 +1368,12 @@ let updateSpeedVis = () => {};
   const bIn = f.addBinding(modulation.audio, 'intensity',    { label: 'INTENSITY',   min: 0, max: 3,    step: 0.05  });
   const bB1 = f.addBinding(modulation.audio, 'bassToSlow',   { label: 'bass→swell',  min: 0, max: 1.0,  step: 0.01  });
   const bB2 = f.addBinding(modulation.audio, 'bassToFlash',  { label: 'bass→flash',  min: 0, max: 0.50, step: 0.01  });
+  f.addSubhead('routing');
   const bM1 = f.addBinding(modulation.audio, 'midToSpeed',   { label: 'mid→speed',   min: 0, max: 1.0,  step: 0.01  });
   const bR1 = f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
   const bS1 = f.addBinding(modulation.audio, 'snareToLFO',   { label: 'snare→lfo',   min: 0, max: 0.30, step: 0.005 });
   const bS2 = f.addBinding(modulation.audio, 'subToWarp',    { label: 'sub→warp',    min: 0, max: 0.06, step: 0.001 });
   padPair(f, modulation.audio, bB1, bB2, 'bassToSlow', 'bassToFlash', [0, 1.0, 0.01], [0, 0.5, 0.01], 'bass', 'swell', 'flash');
-  padPair(f, modulation.audio, bM1, bR1, 'midToSpeed', 'rmsToBoil', [0, 1.0, 0.01], [0, 0.4, 0.005], 'mid / loud', 'speed', 'boil');
-  padPair(f, modulation.audio, bS1, bS2, 'snareToLFO', 'subToWarp', [0, 0.3, 0.005], [0, 0.06, 0.001], 'snare / sub', 'lfo', 'warp');
   f.addBinding(modulation.audio, 'kickToBoil',   { label: 'kick→drawing' });
 
   // ---- camera sub-section

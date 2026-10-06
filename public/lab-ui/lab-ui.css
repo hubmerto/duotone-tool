@@ -893,3 +893,6 @@ html.lab-root, html.lab-root body { height: 100%; }
 .lab-row.lab-half .lab-pad-ax { font-size: 8px; max-width: 46%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .lab-row.lab-half .lab-pad-y { text-align: left; } .lab-row.lab-half .lab-pad-x { text-align: right; }
 .lab-row.lab-full .lab-pad { width: 100%; }
+.lab-pad.lab-curve { cursor: ew-resize; }
+.lab-pad.lab-curve.lab-curve-ro { cursor: default; }
+.lab-curve-cv { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
