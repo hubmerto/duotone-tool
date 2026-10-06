@@ -39,7 +39,13 @@
       this.fps = o.fps || 30; this.length = o.length || 10;
       this.in = 0; this.out = this.length; this.loop = true; this.rangeSet = false;
       this.t = 0; this.playing = o.playing !== false; this.media = null; this.offline = false; this._last = 0;
+      this.markers = []; this._acc = 0;   // markers: [{ id, t, name }]; _acc: unquantised free-running time (t itself is always on a frame)
     }
+    // ---- frames are the truth: t is always k / fps, so seeking to a frame and playing into it evaluate identically
+    get frame() { return Math.round(this.t * this.fps); }
+    frameTime(f) { return Math.max(0, Math.round(+f || 0)) / this.fps; }
+    quantise(t) { return Math.round((+t || 0) * this.fps) / this.fps; }
+    seekFrame(f) { this.seek(this.frameTime(f)); }
     get duration() { return (this.media && this.media.duration > 0 && isFinite(this.media.duration)) ? this.media.duration : this.length; }
     get hasRange() { return this.rangeSet; }
     setMedia(m) {
@@ -63,22 +69,34 @@
         if (this.rangeSet && this.playing && (t >= this.out - 0.02 || t < this.in - 0.5)) {
           if (this.loop) { m.seek(this.in); t = this.in; } else { m.pause(); this.playing = false; this.emit('play'); }
         }
-        this.t = t;
+        this.t = this.quantise(t); this._acc = this.t;
       } else if (this.playing) {
-        let t = this.t + dt;
+        let t = this._acc + dt;
         if (this.rangeSet && t >= this.out) {
           if (this.loop) t = this.in + ((t - this.in) % Math.max(1e-6, this.out - this.in));
           else { t = this.out; this.playing = false; this.emit('play'); }
+        } else if (!this.rangeSet && this.media && t >= this.duration) {   // media without its own transport (a looping video): the clock wraps with it, so every played frame is one a seek can reach
+          if (this.loop) t = t % Math.max(1e-6, this.duration); else { t = this.duration; this.playing = false; this.emit('play'); }
         } else if (!this.rangeSet && !this.loop && t >= this.length) { t = this.length; this.playing = false; this.emit('play'); }   // free-running + loop: no wrap, no seam
-        this.t = t;
+        this._acc = t; this.t = this.quantise(t);
       }
       this.emit('time');
     }
-    seek(t) { t = clamp(+t || 0, 0, this.duration); this.t = t; if (this.media && this.media.seek) this.media.seek(t); this.emit('seek', { t }); this.emit('time'); }
-    play() { if (this.playing) return; if (this.media && this.media.play) this.media.play(); else if (this.t >= this.out - 1e-6) this.t = this.in; this.playing = true; this._last = 0; this.emit('play'); }
+    seek(t) { t = this.quantise(clamp(+t || 0, 0, this.duration)); this.t = t; this._acc = t; if (this.media && this.media.seek) this.media.seek(t); this.emit('seek', { t }); this.emit('time'); }
+    play() { if (this.playing) return; if (this.media && this.media.play) this.media.play(); else if (this.t >= this.out - 1e-6) { this.t = this.quantise(this.in); this._acc = this.t; } this.playing = true; this._last = 0; this.emit('play'); }
     pause() { if (!this.playing) return; if (this.media && this.media.pause) this.media.pause(); this.playing = false; this.emit('play'); }
     toggle() { if (this.playing) this.pause(); else this.play(); }
-    step(n) { this.pause(); this.seek(this.t + n / this.fps); }
+    step(n) { this.pause(); this.seekFrame(this.frame + n); }
+    // ---- markers: named points on the clock; keys and in/out snap to them
+    addMarker(t, name) { const m = { id: uid(), t: this.quantise(clamp(+t || 0, 0, this.duration)), name: name || ('M' + (this.markers.length + 1)) }; this.markers.push(m); this.markers.sort((a, b) => a.t - b.t); this.emit('markers'); return m; }
+    removeMarker(id) { const n = this.markers.length; this.markers = this.markers.filter((m) => m.id !== id); if (this.markers.length !== n) this.emit('markers'); }
+    renameMarker(id, name) { const m = this.markers.find((x) => x.id === id); if (m) { m.name = name || m.name; this.emit('markers'); } }
+    moveMarker(id, t) { const m = this.markers.find((x) => x.id === id); if (m) { m.t = this.quantise(clamp(+t || 0, 0, this.duration)); this.markers.sort((a, b) => a.t - b.t); this.emit('markers'); } }
+    markerAt(t) { return this.markers.find((m) => Math.abs(m.t - t) < 0.5 / this.fps) || null; }
+    toggleMarker(t, name) { const m = this.markerAt(t == null ? this.t : t); if (m) { this.removeMarker(m.id); return null; } return this.addMarker(t == null ? this.t : t, name); }
+    nextMarker(dir) { const t = this.t; let best = null; this.markers.forEach((m) => { const d = (m.t - t) * dir; if (d > 0.5 / this.fps && (best == null || d < best.d)) best = { d, m }; }); return best ? best.m : null; }
+    // snap t to the nearest marker / in / out within tol seconds, else to the frame grid
+    snap(t, tol) { let best = null; const cands = this.markers.map((m) => m.t); if (this.rangeSet) cands.push(this.in, this.out); cands.forEach((c) => { const d = Math.abs(c - t); if (d <= tol && (best == null || d < best.d)) best = { d, c }; }); return best ? best.c : this.quantise(t); }
     setIn(t) { const d = this.duration; this.in = clamp(t, 0, d); if (this.out <= this.in) this.out = Math.min(d, this.in + 1 / this.fps); this.rangeSet = true; this.emit('range'); }
     setOut(t) { const d = this.duration; this.out = clamp(t, 0, d); if (this.in >= this.out) this.in = Math.max(0, this.out - 1 / this.fps); this.rangeSet = true; this.emit('range'); }
     setRange(a, b) { const d = this.duration; this.in = clamp(Math.min(a, b), 0, d); this.out = clamp(Math.max(a, b), this.in + 1 / this.fps, d); this.rangeSet = true; this.emit('range'); }
@@ -86,8 +104,8 @@
     frames() { return Math.max(1, Math.round((this.out - this.in) * this.fps)); }
     timecode(t) { const fps = this.fps; const f = Math.max(0, Math.round((+t || 0) * fps)); const s = Math.floor(f / fps); return pad(Math.floor(s / 60), 2) + ':' + pad(s % 60, 2) + ':' + pad(f % fps, 2); }
     parse(tc) { const m = String(tc).trim().match(/^(?:(\d+):)?(\d+)(?::(\d+))?(?:\.(\d+))?$/); if (!m) return NaN; const mm = +(m[1] || 0), ss = +m[2], ff = +(m[3] || 0), ms = m[4] ? +('0.' + m[4]) : 0; return mm * 60 + ss + ff / this.fps + ms; }
-    getState() { return { in: this.in, out: this.out, loop: this.loop, fps: this.fps, length: this.length, rangeSet: this.rangeSet, t: this.t }; }
-    setState(s) { if (!s) return; if (s.fps) this.fps = s.fps; if (s.length) this.length = s.length; this.loop = s.loop !== false; this.rangeSet = !!s.rangeSet; if (this.rangeSet) { this.in = +s.in || 0; this.out = +s.out || this.duration; } else { this.in = 0; this.out = this.duration; } this.emit('range'); }
+    getState() { return { in: this.in, out: this.out, loop: this.loop, fps: this.fps, length: this.length, rangeSet: this.rangeSet, t: this.t, markers: this.markers.map((m) => ({ id: m.id, t: m.t, name: m.name })) }; }
+    setState(s) { if (!s) return; if (s.fps) this.fps = s.fps; if (s.length) this.length = s.length; this.loop = s.loop !== false; this.rangeSet = !!s.rangeSet; if (this.rangeSet) { this.in = +s.in || 0; this.out = +s.out || this.duration; } else { this.in = 0; this.out = this.duration; } this.markers = (s.markers || []).map((m) => ({ id: m.id || uid(), t: +m.t || 0, name: m.name || 'M' })).sort((a, b) => a.t - b.t); this.t = this.quantise(this.t); this._acc = this.t; this.emit('range'); this.emit('markers'); }
 
     // transport strip: in/step/play/step/out, timecode, range bar, loop, fps
     transport(host, o) {
@@ -104,7 +122,16 @@
       const tc = el('input', 'lab-tp-tc'); tc.type = 'text'; tc.spellcheck = false; tc.title = 'timecode  mm:ss:ff';
       const dur = el('span', 'lab-tp-dur');
       const bar = el('div', 'lab-range'); const sel = el('div', 'lab-range-sel'), hIn = el('div', 'lab-range-in'), hOut = el('div', 'lab-range-out'), head = el('div', 'lab-range-head');
-      bar.append(sel, hIn, hOut, head); bar.title = 'click: seek · drag handles: in / out · I / O: set at playhead · shift+I / shift+O: clear';
+      bar.append(sel, hIn, hOut, head); bar.title = 'click: seek · drag handles: in / out · I / O: set at playhead · shift+I / shift+O: clear · M: marker · [ ]: jump markers';
+      const marks = el('div', 'lab-range-marks'); bar.appendChild(marks);
+      const drawMarks = () => { marks.textContent = ''; const d = Math.max(1e-6, self.duration); self.markers.forEach((m) => { const k = el('i', 'lab-range-mark'); k.style.left = (m.t / d * 100) + '%'; k.dataset.id = m.id; k.title = m.name + ' · ' + self.timecode(m.t) + ' · right-click for options'; marks.appendChild(k); }); };
+      this.on('markers', drawMarks); this.on('range', drawMarks);
+      bar.addEventListener('contextmenu', (e) => {
+        const k = e.target.closest('.lab-range-mark'); e.preventDefault();
+        if (k) { const m = self.markers.find((x) => x.id === k.dataset.id); if (!m) return; LabUI.contextMenu(e.clientX, e.clientY, [{ title: 'Go to ' + m.name, onClick: () => self.seek(m.t) }, { title: 'Set in here', onClick: () => self.setIn(m.t) }, { title: 'Set out here', onClick: () => self.setOut(m.t) }, { title: 'Rename…', onClick: () => { const n = global.prompt ? global.prompt('Marker name', m.name) : null; if (n != null) self.renameMarker(m.id, n.trim()); } }, { sep: true }, { title: 'Delete marker', danger: true, onClick: () => self.removeMarker(m.id) }]); return; }
+        const t = self.quantise(frac(e) * self.duration);
+        LabUI.contextMenu(e.clientX, e.clientY, [{ title: 'Add marker here', onClick: () => self.addMarker(t) }, { title: 'Set in here', onClick: () => self.setIn(t) }, { title: 'Set out here', onClick: () => self.setOut(t) }, { sep: true }, { title: 'Clear range', onClick: () => self.clearRange() }]);
+      });
       const bLoop = btn('lab-tp-loop', '<path d="M17 4l3 3-3 3M7 20l-3-3 3-3M20 7H9a4 4 0 0 0-4 4v1M4 17h11a4 4 0 0 0 4-4v-1"/>', 'Loop the range', 'L');
       const bMark = el('div', 'lab-tgroup'); const bI = el('button', 'lab-tool lab-tp-txt', 'I'), bO = el('button', 'lab-tool lab-tp-txt', 'O'); bI.type = bO.type = 'button'; LabUI.bindTip(bI, 'Set in at playhead', 'I'); LabUI.bindTip(bO, 'Set out at playhead', 'O'); bMark.append(bI, bO);
       const fpsW = el('div', 'lab-widget lab-select lab-tp-fps'); const fpsS = el('select'); [24, 25, 30, 50, 60].forEach((f) => { const op = el('option', null, f + ' fps'); op.value = String(f); fpsS.appendChild(op); }); fpsW.appendChild(fpsS); fpsW.title = 'frame rate of the clock and of renders';
@@ -157,7 +184,11 @@
         keys.bind('KeyO', 'shift', () => { self.clearRange(); flash('range cleared'); }, { label: 'Clear range' });
         keys.bind('KeyL', '', () => { self.loop = !self.loop; self.emit('range'); flash(self.loop ? 'loop on' : 'loop off'); }, { label: 'Toggle loop' });
         keys.bind('Home', '', () => self.seek(self.in), { label: 'Go to in' }); keys.bind('End', '', () => self.seek(self.out), { label: 'Go to out' });
+        keys.bind('KeyM', '', () => { const m = self.toggleMarker(); flash(m ? 'marker ' + m.name + ' @ ' + self.timecode(m.t) : 'marker removed'); }, { label: 'Add / remove marker at playhead' });
+        keys.bind('BracketLeft', '', () => { const m = self.nextMarker(-1); if (m) { self.pause(); self.seek(m.t); flash(m.name); } else flash('no previous marker'); }, { label: 'Previous marker' });
+        keys.bind('BracketRight', '', () => { const m = self.nextMarker(1); if (m) { self.pause(); self.seek(m.t); flash(m.name); } else flash('no next marker'); }, { label: 'Next marker' });
       }
+      drawMarks();
       drawRange(); drawTime(); playSvg();
       this.transportEl = root;
       return root;
