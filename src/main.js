@@ -11,6 +11,7 @@ import {
 } from './presets.js';
 import { MediaRecorderPath, CCapturePath, WebCodecsMp4Path } from './recorder.js';
 import { AudioModulator, CameraModulator } from './modulators.js';
+import { blueNoiseBytes, BLUE_NOISE_SIZE } from './bluenoise.js';
 import { SPECIMENS, SECTION_DEFS } from './specimens.js';
 
 // =============================================================================
@@ -42,6 +43,22 @@ const params = {
   colorMode: 0,
   shadowColor: '#000000',
   lockNormalSpeed: true,
+  // research modes (0 = legacy path)
+  lumaMode: 0,            // 0 Y' on encoded RGB, 1 CIE L* from linear Y
+  ditherMode: 0,          // 0 white noise, 1 blue-noise tile, 2 halftone, 3 Bayer 8x8, 4 interleaved gradient
+  boilHold: false,        // hold each drawing for N frames of a 24 fps drawing clock (N from ditherSpeed)
+  boilCycle: 3,           // distinct drawings in the boil loop
+  lpi: 133, printHeightIn: 4, screenAngle: 45,
+  fieldMode: 0,           // 0 value fbm, 1 simplex3 + vector warp, 2 + curl warp
+  edgeMode: 0,            // 0 luma smoothstep, 1 pixel-distance edge
+  bleedPx: 0, haloPx: 0, haloStrength: 0, edgeRoughPx: 0, edgeTemporal: 0,
+  introModel: 0,          // 0 legacy, 1 develop curve / round iris / scanner lamp
+  introInduction: 0.17, introFrom: 1, scanLampGain: 0, scanLampPx: 6, scanLinesPerFrame: 0,
+  trailMode: 0,           // 0 newest-heavy, 1 box exposure over the catch-up window
+  trailShutter: 1,        // fraction of the catch-up window integrated (1 = 360 degrees)
+  beatSync: true,         // quantise Two Layer phases to the beat clock when audio has a confident tempo
+  colorModel: 0,          // 0 replace, 1 ink over paper, 2 duotone, 3 riso
+  inkB: '#1a1a1a', inkOpacity: 1, misregPx: 0,
   ...PRESETS[DEFAULT_PRESET],
 };
 // Format is the single primary control; engine is derived from it.
@@ -91,10 +108,14 @@ const modulation = {
     bassToFlash:  0.22,   // bass kick -> threshold drops -> frame flashes color
     midToSpeed:   0.45,   // mids      -> slowNoiseSpeed (field accelerates)
     rmsToBoil:    0.14,   // loudness  -> ditherAmp (grainier when loud)
+    subToWarp:    0.0,    // sub       -> warpAmp (ink swell; off by default, warps displace the image)
+    snareToLFO:   0.10,   // snare body-> thresholdLFOAmp (short exposure kick)
+    kickToBoil:   true,   // kick onset-> force a new boil drawing
   },
   camera: {
     lfoDepth:    0.08,    // motion -> thresholdLFOAmp   (+)
     flashDepth:  0.15,    // motion -> threshold flash   (-)
+    toBoilRate:  true,    // motion -> drawing rate (still: on 4s, moving: on 2s) when boil hold is on
   },
 };
 
@@ -284,7 +305,21 @@ gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, TEMPORAL_W, TEMPORAL_H, TEMPOR
 gl.activeTexture(gl.TEXTURE0); // restore default unit
 
 let bufferWriteIndex   = 0;
-let imageBufferFilled  = false;  // for static images: write to all layers once
+let imageBufferFilled  = false;
+let catchupStartWrite  = 0;      // ring write index when the current catch-up began (box-exposure window)
+
+// blue-noise dither tile (unit 3): 64x64 R8, nearest, read with texelFetch and a bit-masked wrap
+const blueTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE3);
+gl.bindTexture(gl.TEXTURE_2D, blueTex);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, BLUE_NOISE_SIZE, BLUE_NOISE_SIZE, 0, gl.RED, gl.UNSIGNED_BYTE, blueNoiseBytes());
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+gl.activeTexture(gl.TEXTURE0);  // for static images: write to all layers once
 
 // rVFC fires once per real video frame (vs rAF which fires per display frame).
 // Using rVFC means the offset slider counts in *video* frames, which is what
@@ -320,6 +355,10 @@ for (const name of [
   'u_slowNoiseScale','u_slowNoiseSpeed','u_slowAmp','u_warpAmp',
   'u_ditherScale','u_ditherSpeed','u_ditherAmp',
   'u_softness',
+  'u_blueNoise','u_lumaMode','u_ditherMode','u_boilHold','u_boilCycle','u_boilKick','u_lpi','u_printHeightIn','u_screenAngle',
+  'u_fieldMode','u_edgeMode','u_bleedPx','u_haloPx','u_haloStrength','u_edgeRoughPx','u_edgeTemporal',
+  'u_introModel','u_introInduction','u_introFrom','u_scanLampGain','u_scanLampPx','u_scanLinesPerFrame',
+  'u_trailMode','u_trailFrames','u_colorModel','u_inkB','u_inkOpacity','u_misregPx',
   'u_bufferSize','u_bufferWriteIndex',
   'u_twoLayerEnabled','u_layerBlendMode','u_layerBlendBalance',
   'u_isCatchupActive','u_trailSampleCount','u_trailStyle',
@@ -496,25 +535,31 @@ function computeLiveParams() {
     // Specimen 06: synthetic peak signals instead of real audio analyzer.
     // Lets a still capture show what the effect looks like at audio peak.
     const m = (SPECIMEN && SPECIMEN.forceModulationPeak)
-      ? { bass: 1.0, mid: 1.0, treble: 1.0, rms: 1.0 }
-      : audioMod.update();
+      ? { bass: 1.0, mid: 1.0, treble: 1.0, rms: 1.0, sub: 1.0, snare: 1.0, hats: 1.0, kickOnset: false, bpm: 0 }
+      : audioMod.update(liveDtMs);
     monitor.bass = m.bass; monitor.mid = m.mid;
     monitor.treble = m.treble; monitor.rms = m.rms;
     const A = modulation.audio;
     const k = A.intensity;
-    // bass: fattest routing — swell + flash (no warp: image never shakes)
+    // sub + kick: swell + flash (warp only if routed: a warp displaces the image)
     lp.slowAmp        = clamp(lp.slowAmp        + m.bass   * A.bassToSlow   * k, 0, 1.20);
     lp.thresholdBase  = clamp(lp.thresholdBase  - m.bass   * A.bassToFlash  * k, 0, 1.0 );
-    // mid: blob field accelerates
+    lp.warpAmp        = clamp((lp.warpAmp ?? 0) + m.sub    * A.subToWarp    * k, 0, 0.12);
+    // snare body: short exposure kick on the LFO; blob field accelerates
+    lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.snare * A.snareToLFO  * k, 0, 0.30);
     lp.slowNoiseSpeed = clamp(lp.slowNoiseSpeed + m.mid    * A.midToSpeed   * k, 0, 2.0 );
-    // rms: grainier when loud
-    lp.ditherAmp      = clamp(lp.ditherAmp      + m.rms    * A.rmsToBoil    * k, 0, 0.50);
+    // hats / loudness: finer, heavier grain
+    lp.ditherAmp      = clamp(lp.ditherAmp      + Math.max(m.rms, m.hats * 0.6) * A.rmsToBoil * k, 0, 0.50);
+    // a kick forces the next boil drawing
+    if (A.kickToBoil && m.kickOnset) lastKickEffectTime = (performance.now() - effectStart) / 1000;
   } else if (modulation.mode === 'camera') {
-    const m = cameraMod.update();
+    const m = cameraMod.update(liveDtMs);
     monitor.motion = m.motion;
     const C = modulation.camera;
     lp.thresholdLFOAmp = clamp(lp.thresholdLFOAmp + m.motion * C.lfoDepth,   0, 0.30);
     lp.thresholdBase   = clamp(lp.thresholdBase   - m.motion * C.flashDepth, 0, 1.0 );
+    // motion drives the drawing rate, not the threshold: still on 4s, moving on 2s
+    if (C.toBoilRate && params.boilHold) lp._boilHoldOverride = m.flowPx < 0.05 ? 4 : m.flowPx < 0.3 ? 3 : 2;
   } else {
     monitor.bass = monitor.mid = monitor.treble = monitor.rms = monitor.motion = 0;
   }
@@ -522,6 +567,8 @@ function computeLiveParams() {
 }
 
 function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+let liveDtMs = 16.7;            // frame delta for the ms-based followers
+let lastKickEffectTime = -1;    // effect-time of the last kick onset (-1 = none)
 
 async function setModulationMode(next) {
   // teardown current
@@ -597,6 +644,7 @@ function frameTick() {
   // ----- effect time + delta --------------------------------------------------
   const t  = (performance.now() - effectStart) / 1000;
   const dt = Math.min(0.1, Math.max(0.001, (performance.now() - lastFrameMs) / 1000));
+  liveDtMs = dt * 1000;
   lastFrameMs = performance.now();
 
   // ----- playback rate ---------------------------------------------------------
@@ -677,6 +725,31 @@ function frameTick() {
 
   gl.uniform1f(U.u_softness, lp.softness);
 
+  // research modes
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, blueTex); gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1i(U.u_blueNoise, 3);
+  gl.uniform1i(U.u_lumaMode,   params.lumaMode | 0);
+  gl.uniform1i(U.u_ditherMode, params.ditherMode | 0);
+  // boil hold: N frames per drawing on a 24 fps clock; ditherSpeed 1 = on 2s, 0.67 = on 3s, 0 = frozen
+  const holdN = lp._boilHoldOverride ?? (lp.ditherSpeed <= 0 ? 1e6 : Math.min(8, Math.max(1, Math.round(2 / (lp.ditherSpeed * 2)))));
+  gl.uniform1i(U.u_boilHold,   params.boilHold ? holdN : 0);
+  gl.uniform1f(U.u_boilCycle,  params.boilCycle);
+  gl.uniform1f(U.u_boilKick,   lastKickEffectTime);
+  gl.uniform1f(U.u_lpi, params.lpi); gl.uniform1f(U.u_printHeightIn, params.printHeightIn); gl.uniform1f(U.u_screenAngle, params.screenAngle);
+  gl.uniform1i(U.u_fieldMode,  params.fieldMode | 0);
+  gl.uniform1i(U.u_edgeMode,   params.edgeMode | 0);
+  gl.uniform1f(U.u_bleedPx, params.bleedPx); gl.uniform1f(U.u_haloPx, params.haloPx); gl.uniform1f(U.u_haloStrength, params.haloStrength);
+  gl.uniform1f(U.u_edgeRoughPx, params.edgeRoughPx); gl.uniform1f(U.u_edgeTemporal, params.edgeTemporal);
+  gl.uniform1i(U.u_introModel, params.introModel | 0);
+  gl.uniform1f(U.u_introInduction, params.introInduction); gl.uniform1f(U.u_introFrom, params.introFrom);
+  gl.uniform1f(U.u_scanLampGain, params.scanLampGain); gl.uniform1f(U.u_scanLampPx, params.scanLampPx); gl.uniform1f(U.u_scanLinesPerFrame, params.scanLinesPerFrame);
+  gl.uniform1i(U.u_trailMode,  params.trailMode | 0);
+  { const depthNow = bufferDepth; const wrote = ((bufferWriteIndex - catchupStartWrite) % depthNow + depthNow) % depthNow;
+    gl.uniform1f(U.u_trailFrames, Math.max(1, Math.round(wrote * clamp(params.trailShutter, 0, 1)))); }
+  gl.uniform1i(U.u_colorModel, params.colorModel | 0);
+  { const ib = hexToRgb(params.inkB ?? '#1a1a1a'); gl.uniform3f(U.u_inkB, ib[0], ib[1], ib[2]); }
+  gl.uniform1f(U.u_inkOpacity, params.inkOpacity); gl.uniform1f(U.u_misregPx, params.misregPx);
+
   // Two Layer
   gl.uniform1i(U.u_bufferSize,         bufferDepth);
   gl.uniform1i(U.u_bufferWriteIndex,   bufferWriteIndex);
@@ -684,7 +757,9 @@ function frameTick() {
   gl.uniform1i(U.u_layerBlendMode,     lp.layerBlendMode | 0);
   gl.uniform1f(U.u_layerBlendBalance,  lp.layerBlendBalance ?? 0.5);
   gl.uniform1i(U.u_isCatchupActive,    twoLayer.phase === 'catchup' ? 1 : 0);
-  gl.uniform1i(U.u_trailSampleCount,   Math.max(1, Math.min(16, lp.trailSampleCount | 0 || 10)));
+  { let n = lp.trailSampleCount | 0 || 10;
+    if (params.trailMode === 1) { const depthNow = bufferDepth; const wrote = ((bufferWriteIndex - catchupStartWrite) % depthNow + depthNow) % depthNow; n = Math.max(4, Math.min(16, Math.round(wrote * clamp(params.trailShutter, 0, 1)))); }
+    gl.uniform1i(U.u_trailSampleCount, Math.max(1, Math.min(16, n))); }
   gl.uniform1i(U.u_trailStyle,         lp.trailStyle | 0);
 
   // Specimen 05 split-render: draw left half with leftConfig, right with right.
@@ -860,7 +935,7 @@ function _twoLayerNextPhase(nowMs) {
     twoLayer.holdSide = (r < (1 - bias)) ? 'A' : 'B';
     twoLayer.phase = 'holding';
     twoLayer.isCatchup = false;
-    twoLayer.nextPhaseAt = nowMs + _sampleHoldMs();
+    twoLayer.nextPhaseAt = nowMs + _beatQuant(_sampleHoldMs() / 1000, 1) * 1000;
   } else if (twoLayer.phase === 'holding') {
     // Save catchup positions: held side at hold pos, other (moving) at its current
     const heldVid  = twoLayer.holdSide === 'A' ? video  : videoB;
@@ -869,7 +944,8 @@ function _twoLayerNextPhase(nowMs) {
     twoLayer.catchupTargetPos = otherVid.currentTime;
     twoLayer.phase = 'catchup';
     twoLayer.isCatchup = true;
-    twoLayer.nextPhaseAt = nowMs + (params.catchUpDuration ?? 0.45) * 1000;
+    catchupStartWrite = bufferWriteIndex;
+    twoLayer.nextPhaseAt = nowMs + _beatQuant(params.catchUpDuration ?? 0.45, 0.5) * 1000;
   } else if (twoLayer.phase === 'catchup') {
     // Resync: force B to A (don't trust drift)
     if (twoLayer.holdSide === 'A') {
@@ -879,7 +955,9 @@ function _twoLayerNextPhase(nowMs) {
     }
     twoLayer.phase = 'resync';
     twoLayer.isCatchup = false;
-    twoLayer.nextPhaseAt = nowMs + (params.resyncDuration ?? 0.1) * 1000;
+    // resync lands on the next downbeat when the beat clock is confident, capped by resyncDuration
+    const resyncMs = (params.resyncDuration ?? 0.1) * 1000;
+    twoLayer.nextPhaseAt = nowMs + (_beatBpm() ? Math.min(resyncMs, _msToNextDownbeat(nowMs)) : resyncMs);
   } else { // resync → sync
     twoLayer.phase = 'sync';
     twoLayer.nextPhaseAt = nowMs + _sampleSyncMs();
@@ -897,9 +975,23 @@ function _setRate(vid, rate) {
   }
 }
 
+// beat clock from the audio modulator: phases quantise to beats / bars when the tempo is confident
+function _beatBpm() { return (params.beatSync && modulation.mode === 'audio' && audioMod.clock && audioMod.clock.confident()) ? audioMod.clock.bpm : 0; }
+function _beatQuant(seconds, unitBeats) { const bpm = _beatBpm(); if (!bpm) return seconds; const u = unitBeats * 60 / bpm; return Math.max(u, Math.round(seconds / u) * u); }
+function _msToNextDownbeat(nowMs) {
+  const bpm = _beatBpm(); if (!bpm) return 0;
+  const tA = audioMod._t / 1000;                      // the clock runs on the modulator's own time base
+  return Math.max(0, (audioMod.clock.nextDownbeat(tA) - tA) * 1000);
+}
 function _sampleSyncMs() {
   const base = (params.syncDuration ?? 1.0) * 1000;
   const jit  = (params.syncJitter   ?? 0.4) * 1000;
+  const bpm = _beatBpm();
+  if (bpm) {
+    const bar = 240 / bpm * 1000;
+    const bars = Math.max(1, Math.round(base / bar) + Math.round((hash01(performance.now() * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit / bar));
+    return bars * bar + _msToNextDownbeat(performance.now());
+  }
   return base + (hash01(performance.now() * 0.0007 + (params.twoLayerSeed ?? 1)) * 2 - 1) * jit;
 }
 function _sampleHoldMs() {
@@ -912,6 +1004,7 @@ function _sampleHoldMs() {
 // Tweakpane UI
 // -----------------------------------------------------------------------------
 const pane = new Pane({ title: 'DUOTONE', container: app ? app.side : null });
+window.__boiler = { params, modulation, pane, twoLayer };   // automation / headless checks
 
 // Hoisted visibility updaters — assigned inside their folder blocks so
 // preset-switch / preset-load can re-evaluate which params are visible.
@@ -1000,6 +1093,10 @@ let updateSpeedVis = () => {};
   const bSpot = f.addBinding(params, 'spotColor', { label: 'spot' });
   // shadow = below-threshold color, applies in both colour modes
   f.addBinding(params, 'shadowColor', { label: 'shadow' });
+  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'replace (legacy)', value: 0 }, { text: 'ink over paper', value: 1 }, { text: 'duotone, two screens', value: 2 }, { text: 'riso two-ink', value: 3 }], value: params.colorModel | 0 }).on('change', (ev) => { params.colorModel = ev.value | 0; });
+  f.addBinding(params, 'inkB', { label: 'second ink' });
+  f.addBinding(params, 'inkOpacity', { label: 'ink opacity', min: 0, max: 1, step: 0.01 });
+  f.addBinding(params, 'misregPx', { label: 'misregister px', min: 0, max: 12, step: 0.5 });
   const bMode = f.addBlade({
     view: 'list',
     label: 'colour mode',
@@ -1051,6 +1148,7 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'thresholdBase',    { label: 'base',    min: 0,    max: 1,   step: 0.005 });
   f.addBinding(params, 'thresholdLFOAmp',  { label: 'lfo amp', min: 0,    max: 0.3, step: 0.005 });
   f.addBinding(params, 'thresholdLFOFreq', { label: 'lfo hz',  min: 0.01, max: 1.0, step: 0.01  });
+  f.addBlade({ view: 'list', label: 'luma', options: [{ text: "Y' (legacy)", value: 0 }, { text: 'L* perceptual', value: 1 }], value: params.lumaMode | 0 }).on('change', (ev) => { params.lumaMode = ev.value | 0; });
 }
 
 // --- Intro ---
@@ -1089,6 +1187,12 @@ let updateSpeedVis = () => {};
   const bDir     = f.addBinding(params, 'introDirectionality', { label: 'direction',  min: 0, max: 1, step: 0.01 });
   const bAngle   = f.addBinding(params, 'introAngle',          { label: 'angle (rad)', min: -3.14159, max: 3.14159, step: 0.01 });
   const bTurb    = f.addBinding(params, 'introTurbulence',     { label: 'turbulence', min: 0, max: 1, step: 0.01 });
+  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'legacy', value: 0 }, { text: 'physical (develop curve, round iris, lamp)', value: 1 }], value: params.introModel | 0 }).on('change', (ev) => { params.introModel = ev.value | 0; });
+  f.addBinding(params, 'introInduction', { label: 'induction', min: 0, max: 0.6, step: 0.01 });
+  f.addBinding(params, 'introFrom', { label: 'ramp from', min: 0, max: 1, step: 0.01 });
+  f.addBinding(params, 'scanLampGain', { label: 'lamp gain', min: 0, max: 1, step: 0.01 });
+  f.addBinding(params, 'scanLampPx', { label: 'lamp px', min: 1, max: 40, step: 1 });
+  f.addBinding(params, 'scanLinesPerFrame', { label: 'fax lines', min: 0, max: 1200, step: 1 });
 
   updateIntroVis = function () {
     const m = params.introMode | 0;
@@ -1118,6 +1222,7 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'slowAmp',        { label: 'amp',    min: 0,   max: 0.6,  step: 0.005 });
   // morphism knob — UV warp by the same field; tiny values go a long way
   f.addBinding(params, 'warpAmp',        { label: 'warp',   min: 0,   max: 0.06, step: 0.001 });
+  f.addBlade({ view: 'list', label: 'field', options: [{ text: 'value fbm (legacy)', value: 0 }, { text: 'simplex, vector warp', value: 1 }, { text: 'simplex, curl warp', value: 2 }], value: params.fieldMode | 0 }).on('change', (ev) => { params.fieldMode = ev.value | 0; });
 }
 
 // --- Boil ---
@@ -1126,6 +1231,12 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'ditherScale', { label: 'scale', min: 50,  max: 1500, step: 5    });
   f.addBinding(params, 'ditherSpeed', { label: 'speed', min: 0,   max: 1,    step: 0.01 });
   f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
+  f.addBlade({ view: 'list', label: 'grain', options: [{ text: 'white noise (legacy)', value: 0 }, { text: 'blue noise', value: 1 }, { text: 'halftone screen', value: 2 }, { text: 'Bayer 8x8', value: 3 }, { text: 'interleaved gradient', value: 4 }], value: params.ditherMode | 0 }).on('change', (ev) => { params.ditherMode = ev.value | 0; });
+  f.addBinding(params, 'boilHold',  { label: 'hold drawings (2s/3s)' });
+  f.addBinding(params, 'boilCycle', { label: 'drawings in loop', min: 1, max: 8, step: 1 });
+  f.addBinding(params, 'lpi', { label: 'screen lpi', min: 45, max: 200, step: 1 });
+  f.addBinding(params, 'printHeightIn', { label: 'print height in', min: 1, max: 20, step: 0.5 });
+  f.addBinding(params, 'screenAngle', { label: 'screen angle', min: 0, max: 90, step: 1 });
 }
 
 // --- TWO LAYER ---
@@ -1166,6 +1277,9 @@ let updateSpeedVis = () => {};
   const bBal    = f.addBinding(params, 'layerBlendBalance', { label: 'blend balance', min: 0, max: 1, step: 0.01 });
   const bPhase  = f.addBinding(params, 'phaseLockToSpeed',  { label: 'phase lock to speed' });
   const bSeed   = f.addBinding(params, 'twoLayerSeed',      { label: 'seed', min: 0, max: 9999, step: 1 });
+  f.addBlade({ view: 'list', label: 'trail model', options: [{ text: 'newest-heavy (legacy)', value: 0 }, { text: 'box exposure (step-print)', value: 1 }], value: params.trailMode | 0 }).on('change', (ev) => { params.trailMode = ev.value | 0; });
+  f.addBinding(params, 'trailShutter', { label: 'shutter', min: 0.1, max: 1, step: 0.05 });
+  f.addBinding(params, 'beatSync', { label: 'quantise to beat' });
   f.addButton({ title: 'Trigger now', id: 'bTrigger' }).on('click', () => { twoLayer.triggerNow = true; });
 
   updateTempVis = function () {
@@ -1180,6 +1294,12 @@ let updateSpeedVis = () => {};
 {
   const f = pane.addFolder({ title: 'Edge', expanded: false });
   f.addBinding(params, 'softness', { label: 'softness', min: 0, max: 0.05, step: 0.001 });
+  f.addBlade({ view: 'list', label: 'edge', options: [{ text: 'luma width (legacy)', value: 0 }, { text: 'pixel distance', value: 1 }], value: params.edgeMode | 0 }).on('change', (ev) => { params.edgeMode = ev.value | 0; });
+  f.addBinding(params, 'bleedPx', { label: 'bleed px', min: 0, max: 2, step: 0.05 });
+  f.addBinding(params, 'haloPx', { label: 'halo px', min: 0, max: 4, step: 0.1 });
+  f.addBinding(params, 'haloStrength', { label: 'halo', min: 0, max: 0.5, step: 0.01 });
+  f.addBinding(params, 'edgeRoughPx', { label: 'rough px', min: 0, max: 2, step: 0.05 });
+  f.addBinding(params, 'edgeTemporal', { label: 'temporal', min: 0, max: 0.5, step: 0.01 });
 }
 
 // --- Modulation ---
@@ -1211,6 +1331,9 @@ let updateSpeedVis = () => {};
   f.addBinding(modulation.audio, 'bassToFlash',  { label: 'bass→flash',  min: 0, max: 0.50, step: 0.01  });
   f.addBinding(modulation.audio, 'midToSpeed',   { label: 'mid→speed',   min: 0, max: 1.0,  step: 0.01  });
   f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
+  f.addBinding(modulation.audio, 'snareToLFO',   { label: 'snare→lfo',   min: 0, max: 0.30, step: 0.005 });
+  f.addBinding(modulation.audio, 'subToWarp',    { label: 'sub→warp',    min: 0, max: 0.06, step: 0.001 });
+  f.addBinding(modulation.audio, 'kickToBoil',   { label: 'kick→drawing' });
 
   // ---- camera sub-section
   f.addButton({ title: 'Start / stop webcam', id: 'bCamToggle' }).on('click', async () => {
@@ -1224,6 +1347,7 @@ let updateSpeedVis = () => {};
   });
   f.addBinding(modulation.camera, 'lfoDepth',   { label: 'mot→lfo',   min: 0, max: 0.30, step: 0.005 });
   f.addBinding(modulation.camera, 'flashDepth', { label: 'mot→flash', min: 0, max: 0.40, step: 0.005 });
+  f.addBinding(modulation.camera, 'toBoilRate',  { label: 'mot→drawing rate' });
 
   // ---- live monitors (graphs)
   const gOpts = { view: 'graph', readonly: true, min: 0, max: 1, interval: 30 };
