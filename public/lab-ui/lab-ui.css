@@ -929,3 +929,38 @@ canvas.lab-alpha{background-color:#2a2a2a;background-image:linear-gradient(45deg
 .lab-thumb .lab-thumb-rename { position: absolute; left: 2px; right: 2px; bottom: 2px; height: 14px; background: #0d0f15; color: #fff; border: 0; outline: 1px solid var(--lab-accent); font: 8.5px/1 var(--lab-mono); letter-spacing: .08em; text-transform: uppercase; padding: 0 3px; }
 .lab-dropdown.lab-ctx { position: fixed; top: auto; left: auto; border-top: 1px solid var(--lab-outline); border-radius: 4px; z-index: 200; }
 .lab-dropdown.lab-ctx button.lab-danger { color: #ff8a8a; }
+
+/* ---------------------------------------------------------------- viewer: compare, guides, pins */
+.lab-viewer-layer { position: absolute; overflow: hidden; pointer-events: none; z-index: 4; }
+.lab-viewer-layer[hidden] { display: none; }
+.lab-viewer-layer .lab-cmp { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.lab-viewer-layer .lab-cmp[hidden] { display: none; }
+.lab-cmp-label { position: absolute; top: 6px; font: 9px/1 var(--lab-mono); letter-spacing: .12em; color: #fff; background: rgba(0,0,0,.6); padding: 3px 5px; border-radius: 2px; }
+.lab-cmp-label[hidden] { display: none; }
+.lab-cmp-divider { position: absolute; top: 0; bottom: 0; width: 1px; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.6); pointer-events: auto; cursor: ew-resize; }
+.lab-cmp-divider::before { content: ""; position: absolute; left: -6px; right: -6px; top: 0; bottom: 0; }
+.lab-cmp-divider[hidden] { display: none; }
+.lab-guides { position: absolute; box-sizing: border-box; border: 1px solid rgba(255,255,255,.85); box-shadow: 0 0 0 9999px rgba(0,0,0,.45), 0 0 0 1px rgba(0,0,0,.6); }
+.lab-guides[hidden] { display: none; }
+.lab-guides-label { position: absolute; left: 4px; top: 4px; font: 9px/1 var(--lab-mono); letter-spacing: .12em; text-transform: uppercase; color: #fff; text-shadow: 0 1px 1px #000; }
+.lab-guides-ui[hidden] { display: none; }
+.lab-ui-zone { position: absolute; box-sizing: border-box; border: 1px dashed rgba(255,255,255,.5); background: repeating-linear-gradient(-45deg, rgba(255,255,255,.08) 0 4px, transparent 4px 8px); }
+.lab-pins .lab-pin { position: absolute; transform: translate(-50%, -50%); }
+.lab-pins .lab-pin i { display: block; width: 9px; height: 9px; border: 1px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #000; }
+.lab-pins .lab-pin span { position: absolute; left: 12px; top: -4px; white-space: nowrap; font: 9px/1 var(--lab-mono); color: #fff; background: rgba(0,0,0,.65); padding: 2px 4px; border-radius: 2px; }
+.lab-view.lab-probing > canvas { cursor: crosshair; }
+.lab-view.lab-panning > canvas { cursor: grab; }
+.lab-status .lab-probe-cell { font-family: var(--lab-mono); font-size: 10px; }
+.lab-status .lab-probe-cell[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- folder ops: bypass, lock, rnd */
+.lab-panel.lab-bypassed > .lab-panel-head .lab-title { text-decoration: line-through; color: var(--lab-chrome-faint); }
+.lab-panel.lab-bypassed > .lab-panel-head .lab-chev { background: radial-gradient(circle at 40% 35%, #8a8a90, #3a3a40); }
+.lab-row.lab-locked > label, .lab-row.lab-locked .lab-in { color: var(--lab-chrome-faint); }
+.lab-row.lab-locked .lab-in::after, .lab-row.lab-locked > label::after { content: " L"; font: 8px/1 var(--lab-mono); color: var(--lab-warn); }
+.lab-panel-head .lab-rnd { border: 0; background: transparent; color: var(--lab-chrome-faint); font: 8px/1 var(--lab-mono); letter-spacing: .12em; text-transform: uppercase; padding: 0 2px; cursor: default; }
+.lab-panel-head .lab-rnd:hover { color: #fff; }
+
+/* half pads go full width when the column is too narrow for two */
+.lab-panel-body { container: lab-body / inline-size; }
+@container lab-body (max-width: 240px) { .lab-row.lab-half { grid-column: 1 / -1; } }

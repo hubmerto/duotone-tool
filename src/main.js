@@ -528,7 +528,7 @@ const cameraMod  = new CameraModulator();
 // modulation peaks should be allowed to overshoot the values you'd
 // reasonably dial in manually. That's where the drama comes from.
 function computeLiveParams() {
-  const lp = { ...params };
+  const lp = { ...pane.effective(params) };   // bypassed folders contribute their identity values
   if (modulation.mode === 'audio') {
     // Specimen 06: synthetic peak signals instead of real audio analyzer.
     // Lets a still capture show what the effect looks like at audio peak.
@@ -1665,7 +1665,18 @@ pane.track('modulation', modulation);
 pane.track('modAudio', modulation.audio);
 pane.track('modCamera', modulation.camera);
 pane.on('state', (ev) => { if (ev.source === 'control') return; window.__boiler.refreshVis(); });
+// bypass identities: what each folder contributes when switched off (alt+click its dot)
+const IDENTITY = {
+  'Slow Field': { 'params.slowAmp': 0, 'params.warpAmp': 0 },
+  'Boil':       { 'params.ditherAmp': 0, 'params.boilHold': false },
+  'Edge':       { 'params.bleedPx': 0, 'params.haloStrength': 0, 'params.edgeRoughPx': 0, 'params.edgeTemporal': 0 },
+  'Intro':      { 'params.introDuration': 0 },
+  'Threshold':  { 'params.thresholdLFOAmp': 0 },
+};
+pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.title]); });
+pane.addRandomise();
 pane.addHistory();
+if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
 const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app, lookExclude: LOOK_EXCLUDE,
   source: {
     restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadImageFromFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
