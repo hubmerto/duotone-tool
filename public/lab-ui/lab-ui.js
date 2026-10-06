@@ -696,6 +696,7 @@
       keys.bind('KeyZ', 'mod', () => this.history.undo(), { label: 'Undo' });
       keys.bind('KeyZ', 'mod+shift', () => this.history.redo(), { label: 'Redo' });
       keys.bind('KeyY', 'ctrl', () => this.history.redo(), { label: 'Redo' });
+      this.element.addEventListener('focusin', (e) => { this._focusEl = e.target; });
       this.on('change', (ev) => { if (!ev || !ev.target || ev.last === false || ev.programmatic) return; const ps = (ev.target.statePaths ? ev.target.statePaths() : [ev.target.path]).filter(Boolean); if (ps.length) this._emitPaths(ps, 'control'); });
     }
     get expanded() { return true; }
@@ -741,6 +742,8 @@
     setFolds(folds) { if (!folds) return; this.folders().forEach((x) => { if (x.title in folds && x.expanded !== !!folds[x.title]) x.element.classList.toggle('collapsed', !folds[x.title]); }); }
     addFolder(o) { const f = super.addFolder(o); f.on('fold', (ev) => this.emit('fold', ev)); return f; }
     addHistory(o) { return historyFolder(this, o); }
+    focusedBinding() { const e = this._focusEl; if (!e || !e.isConnected) return null; return this.bindings().find((b) => b.element.contains(e)) || null; }
+    focusedFolder() { const e = this._focusEl; if (!e || !e.isConnected) return null; let f = null; this.folders().forEach((x) => { if (x.element.contains(e) && (!f || f.element.contains(x.element))) f = x; }); return f; }
   }
 
 
@@ -1319,6 +1322,7 @@
       doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'hidden') this.flush(); });
       keys.bind('KeyS', 'mod', () => this.save(), { label: 'Save project' });
       keys.bind('KeyO', 'mod', () => this.open(), { label: 'Open project' });
+      keys.bind('KeyC', 'mod+shift', () => this.copyLook(), { label: 'Copy look link' });
       this._mark();
     }
     get dirty() { return this._dirty; }
@@ -1362,12 +1366,13 @@
       let obj = await LabStore.get('projects', this.key);
       if (!obj && o.migrate) { try { obj = await o.migrate(); } catch (_) { obj = null; } }
       this._ready = true;
-      if (!obj) { this.emit('ready', { restored: false }); return false; }
+      if (!obj) { this.emit('ready', { restored: false }); await this.applyHash(); return false; }
       try { this.load(obj, { source: 'restore' }); } catch (e) { console.warn('project restore:', e); this.emit('ready', { restored: false }); return false; }
       this._restoring = true;
       try { await this.restoreSource(); } finally { this._restoring = false; }
       this._dirty = false; this._mark();
       this.emit('ready', { restored: true });
+      await this.applyHash();
       return true;
     }
     async restoreSource() {
@@ -1454,5 +1459,237 @@
     async reset() { clearTimeout(this._saveTimer); await LabStore.del('projects', this.key); }
   }
 
-  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, History, Project, LabStore, keys, flash, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  // ================================================================ preset grid: user layer and look URLs
+  // grid.addUser({ pane, tool, canvas, exclude: [path or 'root.' prefix], resolve: (name) => state, apply?: (state, o) => void })
+  // User tiles saved from the current state with a thumbnail; favourites; rename / duplicate / update / export / delete;
+  // drag to reorder; drop .json to import; alt-hover preview; amount; folder scope (shift+click); modified marker.
+  const lerpHex = (a, b, t) => { const pa = /^#[0-9a-f]{6}$/i.test(a) && /^#[0-9a-f]{6}$/i.test(b); if (!pa) return t < 0.5 ? a : b; const h = (s, i) => parseInt(s.slice(i, i + 2), 16); const c = (i) => Math.round(h(a, i) + (h(b, i) - h(a, i)) * t); return '#' + [1, 3, 5].map((i) => c(i).toString(16).padStart(2, '0')).join(''); };
+  // interpolate between two (partial) states: numbers and hex colours blend, everything else switches at 50 %
+  function lerpState(base, target, t) {
+    t = clamp(+t || 0, 0, 1); const out = {};
+    Object.keys(target || {}).forEach((r) => { out[r] = {}; Object.keys(target[r]).forEach((k) => {
+      const a = base && base[r] ? base[r][k] : undefined, b = target[r][k];
+      if (a === undefined || t >= 1) out[r][k] = b;
+      else if (typeof a === 'number' && typeof b === 'number') out[r][k] = a + (b - a) * t;
+      else if (typeof a === 'string' && typeof b === 'string' && a[0] === '#') out[r][k] = lerpHex(a, b, t);
+      else out[r][k] = t < 0.5 ? a : b;
+    }); });
+    return out;
+  }
+  const excluded = (path, ex) => (ex || []).some((e) => e.endsWith('.') ? path.startsWith(e) : path === e);
+  function filterState(state, ex, keep) {
+    const out = {}; Object.keys(state || {}).forEach((r) => { Object.keys(state[r]).forEach((k) => { const p = r + '.' + k; if (excluded(p, ex)) return; if (keep && !keep.has(p)) return; (out[r] = out[r] || {})[k] = cloneV(state[r][k]); }); });
+    return out;
+  }
+  function contextMenu(x, y, items) {
+    const old = doc.querySelector('.lab-ctx'); if (old) old.remove();
+    const dd = el('div', 'lab-dropdown lab-ctx');
+    items.forEach((it) => { if (it.sep) { dd.appendChild(el('hr')); return; } const b = el('button'); b.type = 'button'; b.appendChild(el('span', null, it.title)); if (it.danger) b.classList.add('lab-danger'); b.addEventListener('click', () => { close(); it.onClick(); }); dd.appendChild(b); });
+    doc.body.appendChild(dd);
+    dd.style.left = Math.min(x, global.innerWidth - 230) + 'px'; dd.style.top = Math.min(y, global.innerHeight - dd.offsetHeight - 8) + 'px';
+    const close = () => { dd.remove(); doc.removeEventListener('pointerdown', onDown, true); doc.removeEventListener('keydown', onKey, true); };
+    const onDown = (e) => { if (!dd.contains(e.target)) close(); }, onKey = (e) => { if (e.key === 'Escape') close(); };
+    setTimeout(() => { doc.addEventListener('pointerdown', onDown, true); doc.addEventListener('keydown', onKey, true); }, 0);
+    return dd;
+  }
+  const presetUser = {
+    addUser(o) {
+      o = o || {}; const g = this; const pane = o.pane; if (!pane) throw new Error('addUser needs a pane');
+      g.userOpts = o; g.tool = o.tool || (pane.project && pane.project.tool) || 'lab'; g.user = []; g.userThumbs = {}; g.modified = false; g.filter = 'all'; g._amt = { amount: 100 };
+      g.grid.classList.add('lab-has-user');
+      // filter row above the grid
+      const fr = el('div', 'lab-btns lab-grid-3 lab-presets-filter');
+      ['all', 'mine', '★'].forEach((f) => { const b = el('button', 'lab-btn' + (f === 'all' ? ' on' : ''), f); b.type = 'button'; b.addEventListener('click', () => g.setFilter(f === '★' ? 'fav' : f)); fr.appendChild(b); });
+      g.element.insertBefore(fr, g.grid); g.filterRow = fr;
+      // the "+" tile
+      const add = el('button', 'lab-btn lab-thumb lab-add'); add.type = 'button'; add.title = 'save the current look';
+      add.append(el('span', 'lab-add-plus', '+'), el('span', 'lab-thumb-cap', 'save look'));
+      add.addEventListener('click', () => g.saveUser());
+      add.addEventListener('contextmenu', (e) => { e.preventDefault(); contextMenu(e.clientX, e.clientY, [{ title: 'Import preset…', onClick: () => g.importPicker() }]); });
+      g.grid.appendChild(add); g.addTile = add;
+      // amount row under the grid
+      if (g.parent && g.parent.addBinding) { g.amountCtl = g.parent.addBinding(g._amt, 'amount', { label: 'amount', min: 0, max: 100, step: 1, unit: '%' }); }
+      // built-in tiles: context menu, alt-hover preview, shift-scope; clicks route through pick()
+      Object.keys(g.buttons).forEach((name) => g._wireTile(g.buttons[name], name, false));
+      // modified marker: any edit after a pick
+      pane.on('change', (ev) => { if (ev && !ev.programmatic && ev.last !== false) g.markModified(); });
+      pane.on('state', (ev) => { if (ev.source !== 'preset' && ev.source !== 'preview' && ev.source !== 'control') g.markModified(); });
+      doc.addEventListener('keyup', (e) => { if (e.key === 'Alt') g.endPreview(); });
+      // drop a .json preset on the grid
+      g.grid.addEventListener('dragover', (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); e.stopPropagation(); } });
+      g.grid.addEventListener('drop', (e) => { const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f && /\.json$/i.test(f.name)) { e.preventDefault(); e.stopPropagation(); g.importFile(f); } });
+      g.loadUser();
+      return g;
+    },
+    _key(id) { return this.tool + ':' + id; },
+    _wireTile(b, id, isUser) {
+      const g = this;
+      b.onclick = null; const clone = b.cloneNode(true); b.replaceWith(clone); b = clone; g.buttons[id] = b;
+      if (isUser) { g.userThumbs[id] = b.querySelector('.lab-thumb-img'); } else if (b.querySelector('.lab-thumb-img')) g.thumbs[id] = b.querySelector('.lab-thumb-img');
+      b.addEventListener('click', (e) => g.pick(id, { scope: e.shiftKey }));
+      b.addEventListener('contextmenu', (e) => { e.preventDefault(); g.menu(id, isUser, e.clientX, e.clientY); });
+      b.addEventListener('pointerenter', (e) => { if (e.altKey) g.preview(id); });
+      b.addEventListener('pointerleave', () => g.endPreview());
+      if (isUser) {
+        b.draggable = true;
+        b.addEventListener('dragstart', (e) => { g._drag = id; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', id); } catch (_) {} });
+        b.addEventListener('dragover', (e) => { if (g._drag && g._drag !== id) { e.preventDefault(); b.classList.add('lab-dragover'); } });
+        b.addEventListener('dragleave', () => b.classList.remove('lab-dragover'));
+        b.addEventListener('drop', (e) => { b.classList.remove('lab-dragover'); if (g._drag && g._drag !== id) { e.preventDefault(); e.stopPropagation(); g.reorder(g._drag, id); } g._drag = null; });
+        b.addEventListener('dragend', () => { g._drag = null; });
+      }
+      return b;
+    },
+    // state of a tile: a user record's params or the tool's resolve(name) for a built-in, minus the excluded paths
+    stateOf(id) {
+      const u = this.user.find((x) => x.id === id);
+      if (u) return filterState(u.params, this.userOpts.exclude);
+      const s = this.userOpts.resolve ? this.userOpts.resolve(id) : null;
+      return s ? filterState(s, this.userOpts.exclude) : null;
+    },
+    labelOf(id) { const u = this.user.find((x) => x.id === id); return u ? u.name : id; },
+    pick(id, o) {
+      o = o || {}; const g = this, pane = g.userOpts.pane; const target = g.stateOf(id); if (!target) { if (g.userOpts.onSelect) g.userOpts.onSelect(id); return; }
+      let keep = null;
+      if (o.scope) { const f = (pane.focusedFolder && pane.focusedFolder()) || null; if (f) { keep = new Set(f.bindings().map((b) => b.path).filter(Boolean)); } }
+      const part = keep ? filterState(target, null, keep) : target;
+      const amount = (g._amt ? g._amt.amount : 100) / 100;
+      const next = lerpState(pane.getState(), part, amount);
+      const label = 'Preset ' + g.labelOf(id) + (amount < 1 ? ' ' + Math.round(amount * 100) + '%' : '') + (keep ? ' (folder)' : '');
+      if (g.userOpts.apply) g.userOpts.apply(next, { label, id, amount, scope: !!keep }); else pane.setState(next, { label, source: 'preset' });
+      g.select(id); g.modified = false; g._paintCaps();
+      g.emit('apply', { id, amount, scope: !!keep, target: g });
+      if (g.userOpts.onSelect) g.userOpts.onSelect(id);
+    },
+    markModified() { if (!this.current || this.modified) return; this.modified = true; this._paintCaps(); },
+    _paintCaps() {
+      const g = this; Object.keys(g.buttons).forEach((id) => { const cap = g.buttons[id].querySelector('.lab-thumb-cap'); if (!cap) return; const u = g.user.find((x) => x.id === id); const base = u ? u.name : (g.userOpts && g.userOpts.format ? g.userOpts.format(id) : id); cap.textContent = base + (g.modified && g.current === id ? ' *' : ''); });
+    },
+    preview(id) {
+      const g = this, pane = g.userOpts.pane; if (g._previewSaved) return; const target = g.stateOf(id); if (!target) return;
+      g._previewSaved = pane.getState(); pane.setState(target, { noHistory: true, source: 'preview' });
+    },
+    endPreview() { const g = this, pane = g.userOpts.pane; if (!g._previewSaved) return; const s = g._previewSaved; g._previewSaved = null; pane.setState(s, { noHistory: true, source: 'preview' }); },
+    setFilter(f) {
+      this.filter = f; [...this.filterRow.children].forEach((b, i) => b.classList.toggle('on', ['all', 'mine', 'fav'][i] === f));
+      Object.keys(this.buttons).forEach((id) => { const u = this.user.find((x) => x.id === id); const show = f === 'all' || (f === 'mine' && !!u) || (f === 'fav' && !!(u && u.fav)); this.buttons[id].hidden = !show; });
+    },
+    async captureThumb() {
+      const c = this.userOpts.canvas; if (!c) return null;
+      try {
+        const w = 192, h = 108; const t = doc.createElement('canvas'); t.width = w; t.height = h; const x = t.getContext('2d');
+        const sw = c.width || c.videoWidth || 1, sh = c.height || c.videoHeight || 1, sa = sw / sh, ta = w / h; let cw = sw, ch = sh; if (sa > ta) cw = sh * ta; else ch = sw / ta;
+        x.fillStyle = '#000'; x.fillRect(0, 0, w, h); x.drawImage(c, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, w, h);
+        return await new Promise((res) => t.toBlob(res, 'image/png'));
+      } catch (_) { return null; }
+    },
+    _tile(rec) {
+      const b = el('button', 'lab-btn lab-thumb lab-user' + (rec.fav ? ' lab-fav' : '')); b.type = 'button'; b.title = rec.name;
+      const img = el('canvas', 'lab-thumb-img'); img.width = 192; img.height = 108;
+      b.append(img, el('span', 'lab-thumb-cap', rec.name));
+      return b;
+    },
+    _paintThumb(id, blob) { const cv = this.userThumbs[id]; if (!cv || !blob) return; const i = new Image(); i.onload = () => { cv.getContext('2d').drawImage(i, 0, 0, cv.width, cv.height); URL.revokeObjectURL(i.src); }; i.src = URL.createObjectURL(blob); },
+    async loadUser() {
+      const g = this; const keys_ = (await LabStore.keys('presets')) || []; const mine = keys_.filter((k) => String(k).startsWith(g.tool + ':'));
+      const recs = []; for (const k of mine) { const r = await LabStore.get('presets', k); if (r && r.id) recs.push(r); }
+      recs.sort((a, b) => (a.order || 0) - (b.order || 0));
+      g.user = recs; g._mountUser();
+      for (const r of recs) { const t = await LabStore.get('thumbs', g._key(r.id)); if (t) g._paintThumb(r.id, t); }
+      g.setFilter(g.filter); g.emit('userload', { count: recs.length });
+    },
+    _mountUser() {
+      const g = this; g.grid.querySelectorAll('.lab-user').forEach((n) => n.remove()); g.userThumbs = {};
+      g.user.forEach((r) => { let b = g._tile(r); g.grid.insertBefore(b, g.addTile); b = g._wireTile(b, r.id, true); if (g.current === r.id) b.classList.add('on'); });
+      g._paintCaps();
+    },
+    async saveUser(name, state) {
+      const g = this, pane = g.userOpts.pane;
+      const base = g.current ? g.labelOf(g.current).replace(/\s*\*$/, '') : 'Look';
+      const n = g.user.filter((u) => u.name.startsWith(base)).length + 1;
+      const rec = { id: 'u' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36), tool: g.tool, name: name || (base + ' ' + n), params: filterState(state || pane.getState(), g.userOpts.exclude), created: Date.now(), modified: Date.now(), fav: false, order: (g.user.length ? Math.max(...g.user.map((u) => u.order || 0)) : 0) + 1, derived: g.current || null };
+      await LabStore.put('presets', g._key(rec.id), rec);
+      const blob = await g.captureThumb(); if (blob) await LabStore.put('thumbs', g._key(rec.id), blob);
+      g.user.push(rec); g._mountUser(); if (blob) g._paintThumb(rec.id, blob); g.setFilter(g.filter);
+      g.select(rec.id); g.modified = false; g._paintCaps(); flash('Saved look ' + rec.name);
+      g.emit('usersave', { rec }); return rec;
+    },
+    async updateUser(id) { const g = this, r = g.user.find((x) => x.id === id); if (!r) return; r.params = filterState(g.userOpts.pane.getState(), g.userOpts.exclude); r.modified = Date.now(); await LabStore.put('presets', g._key(id), r); const blob = await g.captureThumb(); if (blob) { await LabStore.put('thumbs', g._key(id), blob); g._paintThumb(id, blob); } g.modified = false; g._paintCaps(); flash('Updated ' + r.name); },
+    async renameUser(id, name) { const r = this.user.find((x) => x.id === id); if (!r || !name) return; r.name = name; r.modified = Date.now(); await LabStore.put('presets', this._key(id), r); this.buttons[id].title = name; this._paintCaps(); },
+    async removeUser(id) { const g = this; g.user = g.user.filter((x) => x.id !== id); await LabStore.del('presets', g._key(id)); await LabStore.del('thumbs', g._key(id)); const b = g.buttons[id]; if (b) b.remove(); delete g.buttons[id]; delete g.userThumbs[id]; if (g.current === id) { g.current = null; } },
+    async favourite(id, on) { const r = this.user.find((x) => x.id === id); if (!r) return; r.fav = on == null ? !r.fav : !!on; await LabStore.put('presets', this._key(id), r); this.buttons[id].classList.toggle('lab-fav', r.fav); this.setFilter(this.filter); },
+    async duplicate(id) { const g = this; const u = g.user.find((x) => x.id === id); const st = u ? u.params : g.stateOf(id); if (!st) return; const rec = await g.saveUser((u ? u.name : id) + ' copy', st); if (!u) { const src = g.thumbs[id]; if (src && src.tagName === 'CANVAS') { const cv = g.userThumbs[rec.id]; cv.getContext('2d').drawImage(src, 0, 0, cv.width, cv.height); cv.toBlob((b) => b && LabStore.put('thumbs', g._key(rec.id), b), 'image/png'); } } },
+    async reorder(fromId, toId) { const g = this; const ids = g.user.map((u) => u.id); const i = ids.indexOf(fromId), j = ids.indexOf(toId); if (i < 0 || j < 0) return; const [m] = g.user.splice(i, 1); g.user.splice(j, 0, m); g.user.forEach((u, k) => { u.order = k + 1; }); await Promise.all(g.user.map((u) => LabStore.put('presets', g._key(u.id), u))); g._mountUser(); for (const u of g.user) { const t = await LabStore.get('thumbs', g._key(u.id)); if (t) g._paintThumb(u.id, t); } g.setFilter(g.filter); },
+    rename(id) {
+      const g = this, b = g.buttons[id], r = g.user.find((x) => x.id === id); if (!b || !r) return;
+      const cap = b.querySelector('.lab-thumb-cap'); const i = el('input', 'lab-thumb-rename'); i.value = r.name; cap.replaceWith(i); i.focus(); i.select();
+      const done = (ok) => { const v = i.value.trim(); i.replaceWith(cap); if (ok && v) g.renameUser(id, v); else g._paintCaps(); };
+      i.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') done(true); if (e.key === 'Escape') done(false); });
+      i.addEventListener('blur', () => done(true)); i.addEventListener('click', (e) => e.stopPropagation());
+    },
+    async exportUser(id) {
+      const g = this; const u = g.user.find((x) => x.id === id); const params = u ? u.params : g.stateOf(id); if (!params) return;
+      let thumb = null; const cv = g.userThumbs[id] || g.thumbs[id]; if (cv && cv.tagName === 'CANVAS') { try { thumb = cv.toDataURL('image/png'); } catch (_) {} }
+      const obj = { schema: 'lab-preset@1', tool: g.tool, name: u ? u.name : id, params, thumb };
+      const a = el('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 1)], { type: 'application/json' })); a.download = (obj.name.replace(/[^\w-]+/g, '_') || 'look') + '.' + g.tool + '.preset.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    },
+    async importFile(f) {
+      const g = this; let obj; try { obj = JSON.parse(await f.text()); } catch (_) { flash('Not a preset file'); return false; }
+      if (!obj || obj.schema !== 'lab-preset@1' || !obj.params) { flash('Not a preset file'); return false; }
+      if (obj.tool && obj.tool !== g.tool) { flash('Preset is for ' + obj.tool); return false; }
+      const rec = await g.saveUser(obj.name || f.name.replace(/\.[^.]*$/, ''), obj.params);
+      if (obj.thumb) { try { const b = await (await fetch(obj.thumb)).blob(); await LabStore.put('thumbs', g._key(rec.id), b); g._paintThumb(rec.id, b); } catch (_) {} }
+      return true;
+    },
+    importPicker() { const i = el('input'); i.type = 'file'; i.accept = '.json,application/json'; i.onchange = () => { if (i.files[0]) this.importFile(i.files[0]); }; i.click(); },
+    menu(id, isUser, x, y) {
+      const g = this; const r = g.user.find((u) => u.id === id);
+      const items = isUser ? [
+        { title: 'Rename', onClick: () => g.rename(id) },
+        { title: 'Update from current', onClick: () => g.updateUser(id) },
+        { title: 'Duplicate', onClick: () => g.duplicate(id) },
+        { title: r && r.fav ? 'Unfavourite' : 'Favourite', onClick: () => g.favourite(id) },
+        { title: 'Export JSON', onClick: () => g.exportUser(id) },
+        { sep: true },
+        { title: 'Delete', danger: true, onClick: () => g.removeUser(id) },
+      ] : [
+        { title: 'Duplicate to mine', onClick: () => g.duplicate(id) },
+        { title: 'Export JSON', onClick: () => g.exportUser(id) },
+      ];
+      contextMenu(x, y, items);
+    },
+  };
+  Object.assign(PresetsControl.prototype, presetUser);
+
+  // ---------------------------------------------------------------- look URLs: the params that differ from the defaults, deflated into #look=
+  const b64u = { enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''), dec: (s) => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < u.length; i++) u[i] = bin.charCodeAt(i); return u; } };
+  async function deflate(text) { if (typeof CompressionStream === 'undefined') return 'j.' + b64u.enc(new TextEncoder().encode(text)); const buf = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer(); return 'z.' + b64u.enc(buf); }
+  async function inflate(s) { const kind = s.slice(0, 2), body = s.slice(2); const bytes = b64u.dec(body); if (kind === 'j.') return new TextDecoder().decode(bytes); return await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text(); }
+  Object.assign(Project.prototype, {
+    diffFromDefaults(exclude) {
+      const s = this.pane.getState(), d = this.pane.getDefaults(), out = {};
+      Object.keys(s).forEach((r) => Object.keys(s[r]).forEach((k) => { const p = r + '.' + k; if (excluded(p, exclude)) return; if (JSON.stringify(s[r][k]) !== JSON.stringify(d[r] && d[r][k])) (out[r] = out[r] || {})[k] = s[r][k]; }));
+      return out;
+    },
+    async lookToHash(exclude) { const obj = { schema: 'lab-look@1', tool: this.tool, params: this.diffFromDefaults(exclude || this.o.lookExclude) }; return '#look=' + await deflate(JSON.stringify(obj)); },
+    async copyLook(exclude) {
+      const hash = await this.lookToHash(exclude); const url = location.href.replace(/#.*$/, '') + hash;
+      try { await navigator.clipboard.writeText(url); flash('Look link copied (' + url.length + ' chars)'); } catch (_) { global.prompt('Look link', url); }
+      return url;
+    },
+    // apply a #look= from the current URL (one history entry), then strip it so a reload does not re-apply it over the autosave
+    async applyHash(hash) {
+      hash = hash != null ? hash : location.hash; const m = /[#&]look=([^&]+)/.exec(hash || ''); if (!m) return false;
+      let obj; try { obj = JSON.parse(await inflate(decodeURIComponent(m[1]))); } catch (e) { flash('Bad look link'); return false; }
+      if (!obj || obj.schema !== 'lab-look@1' || (obj.tool && obj.tool !== this.tool)) { flash('Look link is for ' + (obj && obj.tool)); return false; }
+      const defaults = this.pane.getDefaults(); const full = {}; Object.keys(defaults).forEach((r) => { full[r] = Object.assign({}, defaults[r], (obj.params && obj.params[r]) || {}); });
+      this.pane.setState(filterState(full, this.o.lookExclude), { label: 'Look from link', source: 'preset', kind: 'preset' });
+      // strip the hash so a reload does not re-apply it over the autosave; after load, so the navigation itself completes first
+      const strip = () => { try { global.history.replaceState(null, '', location.pathname + location.search); } catch (_) {} };
+      if (doc.readyState === 'complete') strip(); else global.addEventListener('load', () => setTimeout(strip, 0), { once: true });
+      this.emit('look', { params: obj.params }); return true;
+    },
+  });
+
+  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, History, Project, LabStore, keys, flash, lerpState, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);
