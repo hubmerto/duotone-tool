@@ -7,7 +7,15 @@
                         addBlade({view:'list'}) / addButtons / addStatus / addProgress /
                         addPresets (text or thumbnails) / addNote / addSeparator / refresh / on('change')
      fmt(value, step)   number formatting shared by every slider
+     History / Project / LabStore / keys / flash   state layer: see "state layer" below
    }
+   State: pane.track(name, obj) declares a root; bindings on it get .path ("name.key"), .default,
+   .apply(v) / .reset() / .nudge(dir, mult) / .edit() / .focus(). pane.getState() / setState(state, {label,
+   noHistory, source}) move whole states and emit 'state' {paths, source}. pane.history coalesces drags and
+   nudges (600 ms), undo/redo (mod+Z, mod+shift+Z), transactions, snapshots. new LabUI.Project(pane, {...})
+   autosaves to IndexedDB, restores before first paint, copies file sources into OPFS, re-links, saves and
+   opens .json projects (mod+S / mod+O). Keyboard: arrows nudge (shift x10, alt x0.1), digits type, double-click
+   a label resets (alt: the folder), wheel only on a focused row.
 
    Binding options: { label, min, max, step, options, view, readonly, format, unit,
                       hidden, disabled, onChange }
@@ -64,6 +72,9 @@
     set disabled(v) { this._disabled = !!v; this.element.classList.toggle('lab-disabled', this._disabled); }
     dispose() { this.element.remove(); if (this.parent) this.parent._children = this.parent._children.filter((c) => c !== this); }
     refresh() {}
+    get pane() { let p = this.parent; while (p && p.parent) p = p.parent; return p && p.getState ? p : null; }
+    get folder() { let p = this.parent; return p && p.parent ? p : null; }
+    _record(paths, befores, afters, last) { const pn = this.pane; if (!pn || !pn.history || paths.some((p) => !p)) return; pn.history.record(paths, befores, afters, last); }
   }
 
   // ---------------------------------------------------------------- binding
@@ -97,16 +108,32 @@
       if (o.hidden) this.hidden = true;
       if (o.disabled) this.disabled = true;
       if (o.onChange) this.on('change', (ev) => o.onChange(ev.value, ev));
+      this.default = o.default !== undefined ? cloneV(o.default) : cloneV(v);
+      // double-click a label resets the value (alt: the whole folder)
+      const onDbl = (e) => { if (o.readonly) return; e.preventDefault(); e.stopPropagation(); if (e.altKey && this.folder) this.folder.resetAll(); else this.reset(); };
+      this._label.addEventListener('dblclick', onDbl);
+      if (this._in) this._in.addEventListener('dblclick', onDbl);
     }
     get label() { return this._label.textContent; }
     set label(t) { this._label.textContent = t; if (this._in) this._in.textContent = t; }
     get value() { return this.obj[this.key]; }
     set value(v) { this.obj[this.key] = v; this.refresh(); }
+    get path() { const pn = this.pane; const r = pn && pn._rootName(this.obj); return r ? r + '.' + this.key : null; }
+    get unit() { return this.opts.unit || ''; }
     _commit(v, last) {
+      const prev = this.obj[this.key];
       this.obj[this.key] = v;
       this.refresh();
+      this._record([this.path], [prev], [v], last !== false);
       this.emit('change', { value: v, last: last !== false, target: this });
     }
+    // programmatic set: no history entry; emits change unless silent
+    apply(v, o) { this.obj[this.key] = v; this.refresh(); if (!o || !o.silent) this.emit('change', { value: v, last: true, target: this, programmatic: true }); }
+    reset() { if (this.default !== undefined && this.obj[this.key] !== this.default) this._commit(cloneV(this.default), true); }
+    nudge(dir, mult) { if (this._nudge) this._nudge(dir, mult); }
+    edit(prefill) { if (this._edit) this._edit(prefill); }
+    focus() { let f = this.folder; while (f && f.parent) { if (f.expanded === false) f.expanded = true; f = f.parent; } const t = this.element.querySelector('.lab-widget[tabindex], .lab-widget input, .lab-widget select, input'); if (t) { t.focus({ preventScroll: false }); t.scrollIntoView && t.scrollIntoView({ block: 'nearest' }); } return t; }
+    serialise() { return cloneV(this.obj[this.key]); }
   }
   Binding.views = {};
 
@@ -139,13 +166,15 @@
     };
     this.refresh = paint;
     paint();
+    const mult = (e) => e.shiftKey ? 10 : e.altKey ? 0.1 : 1;
+    this._nudge = (dir, m) => this._commit(snap(read() + dir * step * (m || 1)), true);
     if (o.readonly) { w.classList.add('lab-disabled'); return; }
 
     // drag
     let drag = null;
     w.addEventListener('pointerdown', (e) => {
       if (e.button !== 0 || w.classList.contains('editing')) return;
-      drag = { x: e.clientX, v: read(), moved: false };
+      drag = { x: e.clientX, v: read(), moved: false, onLabel: !!(e.target.closest && e.target.closest('.lab-in')) };
       w.setPointerCapture(e.pointerId);
     });
     w.addEventListener('pointermove', (e) => {
@@ -155,16 +184,16 @@
       drag.moved = true;
       const width = Math.max(60, w.clientWidth);
       const span = hasRange ? (max - min) : Math.max(Math.abs(drag.v), 1) * 2;
-      const fine = e.shiftKey ? 0.1 : 1;
+      const fine = e.altKey ? 0.1 : e.shiftKey ? 3 : 1;   // alt = fine, shift = coarse
       const v = snap(drag.v + (dx / width) * span * fine);
       if (v !== read()) this._commit(v, false);
     });
     const endDrag = (e) => {
       if (!drag) return;
-      const moved = drag.moved; drag = null;
+      const moved = drag.moved, onLabel = drag.onLabel; drag = null;
       try { w.releasePointerCapture(e.pointerId); } catch (_) {}
       if (moved) this._commit(read(), true);
-      else beginEdit();
+      else if (!onLabel) beginEdit();
     };
     w.addEventListener('pointerup', endDrag);
     w.addEventListener('pointercancel', () => { drag = null; });
@@ -177,22 +206,33 @@
     }, { passive: false });
     w.addEventListener('keydown', (e) => {
       if (w.classList.contains('editing')) return;
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); this._commit(snap(read() - step * (e.shiftKey ? 10 : 1)), true); }
-      if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); this._commit(snap(read() + step * (e.shiftKey ? 10 : 1)), true); }
-      if (e.key === 'Enter') beginEdit();
+      if (e.metaKey || e.ctrlKey) return;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); this._nudge(-1, mult(e)); }
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); this._nudge(1, mult(e)); }
+      else if (e.key === 'Enter') { e.preventDefault(); beginEdit(); }
+      else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); this.reset(); }
+      else if (/^[-+*/.\d]$/.test(e.key)) { e.preventDefault(); beginEdit(e.key); }
     });
-    const beginEdit = () => {
+    const beginEdit = (prefill) => {
       w.classList.add('editing');
-      input.value = String(read());
-      input.focus(); input.select();
+      input.value = prefill != null ? prefill : String(read());
+      input.focus(); if (prefill != null) input.setSelectionRange(input.value.length, input.value.length); else input.select();
     };
+    this._edit = beginEdit;
     const endEdit = (apply) => {
       if (!w.classList.contains('editing')) return;
       w.classList.remove('editing');
       if (apply) {
         let txt = input.value.trim().replace(',', '.');
         let v = NaN;
-        try { if (/^[-+*/().\d\s%]+$/.test(txt)) v = Function('"use strict";return (' + txt.replace(/%/g, '/100') + ')')(); } catch (_) {}
+        try {
+          if (/^[-+*/().\d\s%]+$/.test(txt)) {
+            const cur = read();
+            if (/^[*/+]/.test(txt)) txt = '(' + cur + ')' + txt;                               // *2, /3, +0.1 are relative
+            if (/%$/.test(txt) && hasRange) v = min + (Function('"use strict";return (' + txt.replace(/%$/, '') + ')')() / 100) * (max - min);   // 50% of the range
+            else v = Function('"use strict";return (' + txt.replace(/%/g, '/100') + ')')();
+          }
+        } catch (_) {}
         if (isFinite(v)) this._commit(snap(+v), true);
       }
       w.focus();
@@ -218,6 +258,8 @@
     this.refresh = () => { s.value = String(this.obj[this.key]); };
     this.refresh();
     s.addEventListener('change', () => this._commit(typed(s.value), true));
+    this._nudge = (dir) => { const i = opts.findIndex((x) => String(x.value) === String(this.obj[this.key])); const j = clamp(i + dir, 0, opts.length - 1); if (j !== i) this._commit(opts[j].value, true); };
+    s.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); this._nudge(e.key === 'ArrowLeft' ? -1 : 1); } });
     this.setOptions = (next) => {
       s.textContent = '';
       opts.length = 0; normalizeOptions(next).forEach((x) => opts.push(x));
@@ -384,22 +426,41 @@
       const nx = () => clamp((+obj[xKey] - xr[0]) / (xr[1] - xr[0]), 0, 1), ny = () => clamp((+obj[yKey] - yr[0]) / (yr[1] - yr[0]), 0, 1);
       this.refresh = () => { const x = nx() * 100, y = (1 - ny()) * 100; v.style.left = x + '%'; h.style.top = y + '%'; dot.style.left = x + '%'; dot.style.top = y + '%'; rd.textContent = (+obj[xKey]).toFixed(xd) + ' · ' + (+obj[yKey]).toFixed(yd); };
       this.refresh();
+      this.default = o.reset ? o.reset.slice() : [obj[xKey], obj[yKey]];
+      const paths = () => { const pn = this.pane; const r = pn && pn._rootName(obj); return r ? [r + '.' + xKey, r + '.' + yKey] : [null, null]; };
+      const write = (x, y, last) => {
+        const bx = obj[xKey], by = obj[yKey];
+        obj[xKey] = +x.toFixed(6); obj[yKey] = +y.toFixed(6); this.refresh();
+        this.emit('change', { value: [obj[xKey], obj[yKey]], last, target: this });
+        if (o.onChange) o.onChange(obj[xKey], obj[yKey], last);
+        this._record(paths(), [bx, by], [obj[xKey], obj[yKey]], last);
+      };
       const set = (e, last) => {
         const r = pad.getBoundingClientRect();
         const fx = clamp((e.clientX - r.left) / r.width, 0, 1), fy = clamp(1 - (e.clientY - r.top) / r.height, 0, 1);
         let x = xr[0] + fx * (xr[1] - xr[0]), y = yr[0] + fy * (yr[1] - yr[0]);
         if (o.xStep) x = Math.round(x / o.xStep) * o.xStep; if (o.yStep) y = Math.round(y / o.yStep) * o.yStep;
-        obj[xKey] = +x.toFixed(6); obj[yKey] = +y.toFixed(6); this.refresh();
-        this.emit('change', { value: [obj[xKey], obj[yKey]], last, target: this });
-        if (o.onChange) o.onChange(obj[xKey], obj[yKey], last);
+        write(x, y, last);
       };
-      pad.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; pad.setPointerCapture(e.pointerId); pad.classList.add('drag'); set(e, false); e.preventDefault(); });
+      pad.tabIndex = 0;
+      pad.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; pad.focus(); pad.setPointerCapture(e.pointerId); pad.classList.add('drag'); set(e, false); e.preventDefault(); });
       pad.addEventListener('pointermove', (e) => { if (pad.classList.contains('drag')) set(e, false); });
       const up = (e) => { if (!pad.classList.contains('drag')) return; pad.classList.remove('drag'); set(e, true); };
       pad.addEventListener('pointerup', up); pad.addEventListener('pointercancel', up);
-      pad.addEventListener('dblclick', () => { if (o.reset) { obj[xKey] = o.reset[0]; obj[yKey] = o.reset[1]; this.refresh(); this.emit('change', { value: o.reset, last: true, target: this }); if (o.onChange) o.onChange(obj[xKey], obj[yKey], true); } });
+      this.reset = () => { const d = this.default; if (d && (obj[xKey] !== d[0] || obj[yKey] !== d[1])) write(d[0], d[1], true); };
+      pad.addEventListener('dblclick', (e) => { if (e.altKey && this.folder) this.folder.resetAll(); else this.reset(); });
+      this.nudge = (dx, dy, m) => { const sx = o.xStep || (xr[1] - xr[0]) / 100, sy = o.yStep || (yr[1] - yr[0]) / 100; write(clamp(+obj[xKey] + dx * sx * (m || 1), xr[0], xr[1]), clamp(+obj[yKey] + dy * sy * (m || 1), yr[0], yr[1]), true); };
+      pad.addEventListener('keydown', (e) => {
+        if (e.metaKey || e.ctrlKey) return;
+        const m = e.shiftKey ? 10 : e.altKey ? 0.1 : 1;
+        if (e.key === 'ArrowLeft') { e.preventDefault(); this.nudge(-1, 0, m); } else if (e.key === 'ArrowRight') { e.preventDefault(); this.nudge(1, 0, m); }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); this.nudge(0, -1, m); } else if (e.key === 'ArrowUp') { e.preventDefault(); this.nudge(0, 1, m); }
+        else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); this.reset(); }
+      });
       this.pad = pad;
     }
+    get path() { const pn = this.pane; const r = pn && pn._rootName(this.obj); return r ? r + '.' + this.xKey : null; }
+    statePaths() { const pn = this.pane; const r = pn && pn._rootName(this.obj); return r ? [r + '.' + this.xKey, r + '.' + this.yKey] : []; }
   }
 
   // Curve: a live function graph. addCurve(obj, {fn:(x, obj)=>y | [y...], xKey, yKey, xmin..ymax, xLabel, yLabel, label, half, samples, onChange})
@@ -454,12 +515,15 @@
         const set = (e, last) => {
           const r = pad.getBoundingClientRect();
           const fx = clamp((e.clientX - r.left) / r.width, 0, 1), fy = clamp(1 - (e.clientY - r.top) / r.height, 0, 1);
+          const keys_ = [o.xKey, o.yKey].filter(Boolean), befores = keys_.map((k) => obj[k]);
           if (o.xKey) { let x = xr[0] + fx * (xr[1] - xr[0]); if (o.xStep) x = Math.round(x / o.xStep) * o.xStep; obj[o.xKey] = +x.toFixed(6); }
           if (o.yKey) { let y = yr[0] + fy * (yr[1] - yr[0]); if (o.yStep) y = Math.round(y / o.yStep) * o.yStep; obj[o.yKey] = +y.toFixed(6); }
           draw();
           const value = [o.xKey ? obj[o.xKey] : null, o.yKey ? obj[o.yKey] : null];
           this.emit('change', { value, last, target: this });
           if (o.onChange) o.onChange(value[0], value[1], last);
+          const pn = this.pane, rn = pn && pn._rootName(obj);
+          this._record(keys_.map((k) => rn ? rn + '.' + k : null), befores, keys_.map((k) => obj[k]), last);
         };
         pad.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; pad.setPointerCapture(e.pointerId); pad.classList.add('drag'); set(e, false); e.preventDefault(); });
         pad.addEventListener('pointermove', (e) => { if (pad.classList.contains('drag')) set(e, false); });
@@ -469,6 +533,8 @@
       this.pad = pad;
       requestAnimationFrame(draw);
     }
+    get path() { const pn = this.pane; const r = pn && pn._rootName(this.obj); const k = this.opts.yKey || this.opts.xKey; return r && k ? r + '.' + k : null; }
+    statePaths() { const pn = this.pane; const r = pn && pn._rootName(this.obj); return r ? [this.opts.xKey, this.opts.yKey].filter(Boolean).map((k) => r + '.' + k) : []; }
   }
 
   class PresetsControl extends Control {
@@ -598,11 +664,21 @@
     addSeparator() { return this._add(new SeparatorControl(this)); }
     addSubhead(text) { return this._add(new SubheadControl(this, text)); }
     addElement(node) { return this._add(new RawControl(this, node)); }
-    addFolder(o) { const f = new Folder(this, o); this._children.push(f); this.body.appendChild(f.element); f.on('change', (ev) => this._bubble(ev)); return f; }
+    addFolder(o) { const f = new Folder(this, o); this._children.push(f); this.body.appendChild(f.element); f.on('change', (ev) => this._bubble(ev)); f.on('fold', (ev) => this.emit('fold', ev)); return f; }
     _bubble(ev) { this.emit('change', ev); }
     refresh() { this._children.forEach((c) => c.refresh && c.refresh()); }
     dispose() { this.element.remove(); }
     get children() { return this._children.slice(); }
+    // every Binding below this folder, depth first
+    bindings() { const out = []; const walk = (f) => f._children.forEach((c) => { if (c instanceof Binding) out.push(c); else if (c instanceof Folder) walk(c); }); walk(this); return out; }
+    folders() { const out = []; const walk = (f) => f._children.forEach((c) => { if (c instanceof Folder) { out.push(c); walk(c); } }); walk(this); return out; }
+    // reset every tracked binding in the folder to its default, as one history entry
+    resetAll() {
+      const pn = this.pane; if (!pn) return;
+      const flat = {}; this.bindings().forEach((b) => { if (b.path && b.default !== undefined) flat[b.path] = cloneV(b.default); });
+      pn.setState(nest(flat), { label: 'Reset ' + (this.title || 'folder'), source: 'reset' });
+    }
+    get pane() { let p = this; while (p && p.parent) p = p.parent; return p && p.getState ? p : null; }
   }
 
   class Pane extends Folder {
@@ -614,9 +690,57 @@
       this.body = this.element;
       const container = o.container ? (typeof o.container === 'string' ? doc.querySelector(o.container) : o.container) : null;
       if (container) container.appendChild(this.element);
+      this._roots = [];
+      this.replay = o.replay !== false;
+      this.history = new History(this, o.history || {});
+      keys.bind('KeyZ', 'mod', () => this.history.undo(), { label: 'Undo' });
+      keys.bind('KeyZ', 'mod+shift', () => this.history.redo(), { label: 'Redo' });
+      keys.bind('KeyY', 'ctrl', () => this.history.redo(), { label: 'Redo' });
+      this.on('change', (ev) => { if (!ev || !ev.target || ev.last === false || ev.programmatic) return; const ps = (ev.target.statePaths ? ev.target.statePaths() : [ev.target.path]).filter(Boolean); if (ps.length) this._emitPaths(ps, 'control'); });
     }
     get expanded() { return true; }
     set expanded(v) {}
+    get pane() { return this; }
+    // declare a state root: primitive keys of obj (at call time, plus include, minus exclude) are tracked
+    track(name, obj, o) {
+      o = o || {};
+      const ex = new Set(o.exclude || []);
+      const ks = Object.keys(obj).filter((k) => !ex.has(k) && isPrim(obj[k])).concat((o.include || []).filter((k) => !ex.has(k)));
+      const r = { name, obj, keys: [...new Set(ks)], defaults: {} };
+      r.keys.forEach((k) => { r.defaults[k] = cloneV(obj[k]); });
+      this._roots = this._roots.filter((x) => x.name !== name).concat([r]);
+      return this;
+    }
+    untrack(name) { this._roots = this._roots.filter((x) => x.name !== name); }
+    _rootName(obj) { const r = this._roots.find((x) => x.obj === obj); return r ? r.name : null; }
+    root(name) { return this._roots.find((x) => x.name === name) || null; }
+    getState() { const s = {}; this._roots.forEach((r) => { const o = {}; r.keys.forEach((k) => { o[k] = cloneV(r.obj[k]); }); s[r.name] = o; }); return s; }
+    getDefaults() { const s = {}; this._roots.forEach((r) => { s[r.name] = cloneV(r.defaults); }); return s; }
+    // apply a (partial) state: {root: {key: value}}; one history entry unless noHistory; emits 'state' with the changed paths
+    setState(state, o) {
+      o = o || {};
+      const before = {}, after = {}, paths = [];
+      this._roots.forEach((r) => {
+        const part = state && state[r.name]; if (!part) return;
+        r.keys.forEach((k) => { if (!(k in part)) return; const v = part[k]; if (r.obj[k] === v) return; paths.push(r.name + '.' + k); before[r.name + '.' + k] = cloneV(r.obj[k]); after[r.name + '.' + k] = cloneV(v); r.obj[k] = cloneV(v); });
+      });
+      if (!paths.length) return [];
+      this.refresh();
+      if (o.replay !== false && this.replay) this.bindings().forEach((b) => { const p = b.path; if (p && paths.includes(p)) b.emit('change', { value: b.value, last: true, target: b, programmatic: true, source: o.source || 'set' }); });
+      if (!o.noHistory && this.history) this.history.push({ kind: o.kind || 'state', label: o.label || (paths.length === 1 ? this.history._label(paths, before, after) : paths.length + ' changes'), before, after, paths });
+      this._emitPaths(paths, o.source || 'set');
+      return paths;
+    }
+    _emitPaths(paths, source) { this.emit('state', { paths, source, keys: paths.map((p) => p.slice(p.indexOf('.') + 1)) }); }
+    pathLabel(path) {
+      if (!this._labels) { this._labels = {}; const walk = (f, t) => f._children.forEach((c) => { if (c instanceof Binding) { const p = c.path; if (p && !this._labels[p]) this._labels[p] = (t ? t + ' · ' : '') + c.label; } else if (c instanceof Folder) walk(c, c.title); }); walk(this, ''); }
+      if (!(path in this._labels)) { if (!this._labelsRebuilt) { this._labelsRebuilt = true; this._labels = null; const r = this.pathLabel(path); this._labelsRebuilt = false; return r; } return path.slice(path.indexOf('.') + 1); }
+      return this._labels[path];
+    }
+    getFolds() { const f = {}; this.folders().forEach((x) => { if (x.title) f[x.title] = x.expanded; }); return f; }
+    setFolds(folds) { if (!folds) return; this.folders().forEach((x) => { if (x.title in folds && x.expanded !== !!folds[x.title]) x.element.classList.toggle('collapsed', !folds[x.title]); }); }
+    addFolder(o) { const f = super.addFolder(o); f.on('fold', (ev) => this.emit('fold', ev)); return f; }
+    addHistory(o) { return historyFolder(this, o); }
   }
 
 
@@ -801,7 +925,7 @@
     s.append(top, tools, tools2, rail, view, side, status);
     root.appendChild(s);
     const api = {
-      shell: s, top, brand, menu, toolbar: tbar, tools, tools2, rail, tool: toolRefs, view, side, sideHead, status,
+      shell: s, top, brand, menu, toolbar: tbar, tools, tools2, rail, tool: toolRefs, view, side, sideHead, status, keys, flash,
       setTools2(groups) { s.classList.remove('lab-no-tools2'); Object.assign(toolRefs, LabUI.toolbar(tools2, groups)); return toolRefs; },
       setRail(groups) { s.classList.remove('lab-no-rail'); Object.assign(toolRefs, LabUI.toolbar(rail, groups)); return toolRefs; },
       // document window chrome inside the viewport: title bar with lights, optional field bar, optional ruler
@@ -917,6 +1041,7 @@
         tbar.appendChild(b); return b;
       },
     };
+    lastShell = api;
     return api;
   }
 
@@ -959,5 +1084,375 @@
     if (t) t.textContent = text; else if (b.querySelector('svg')) { let span = b.querySelector('span'); if (!span) { span = el('span', 'lab-tool-text'); b.appendChild(span); } span.textContent = text; } else b.textContent = text;
   }
 
-  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  // ================================================================ state layer
+  // Pane.track(name, obj) declares a state root; every Binding / Pad / Curve on a tracked object
+  // gets a path ("root.key"), a default, and reports its commits to the pane's History.
+  // Pane.getState() / setState() move whole states; Project persists them; keys binds chords.
+  const isPrim = (v) => v == null || typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean';
+  const cloneV = (v) => (v && typeof v === 'object') ? JSON.parse(JSON.stringify(v)) : v;
+  const nest = (flat) => { const out = {}; Object.keys(flat).forEach((p) => { const i = p.indexOf('.'); const r = p.slice(0, i), k = p.slice(i + 1); (out[r] = out[r] || {})[k] = flat[p]; }); return out; };
+  const fmtAny = (v) => typeof v === 'number' ? (Number.isInteger(v) ? String(v) : (+v).toFixed(Math.abs(v) < 1 ? 3 : 2)) : String(v);
+
+  // ---------------------------------------------------------------- keys: one document listener, chords by e.code
+  const keys = {
+    _b: [],
+    // bind('KeyZ', 'mod+shift', fn, {label}) ; mods: mod (ctrl or meta), shift, alt, ctrl, meta, none
+    bind(code, mods, fn, o) { const b = { code, mods: (mods || '').split('+').filter(Boolean), fn, label: (o && o.label) || '' }; this._b.push(b); return () => { this._b = this._b.filter((x) => x !== b); }; },
+    list() { return this._b.map((b) => ({ code: b.code, mods: b.mods.join('+'), label: b.label })); },
+    _match(b, e) {
+      if (b.code !== e.code) return false;
+      const want = (m) => b.mods.includes(m);
+      const mod = e.ctrlKey || e.metaKey;
+      if (want('mod') !== mod && !(want('ctrl') || want('meta'))) return false;
+      if (want('ctrl') && !e.ctrlKey) return false;
+      if (want('meta') && !e.metaKey) return false;
+      if (want('shift') !== e.shiftKey) return false;
+      if (want('alt') !== e.altKey) return false;
+      return true;
+    },
+  };
+  const inText = (t) => !!t && (t.tagName === 'INPUT' && !/^(checkbox|radio|range|color|file|button)$/i.test(t.type || '') || t.tagName === 'TEXTAREA' || t.isContentEditable);
+  doc.addEventListener('keydown', (e) => {
+    if (inText(e.target)) return;
+    for (const b of keys._b) { if (keys._match(b, e)) { e.preventDefault(); b.fn(e); return; } }
+  });
+
+  // ---------------------------------------------------------------- flash: a short message in the status strip
+  let lastShell = null, flashTimer = null;
+  function flash(text, ms) {
+    if (!lastShell) return;
+    let f = lastShell.status.querySelector('.lab-flash');
+    if (!f) { f = el('span', 'lab-flash'); lastShell.status.prepend(f); }
+    f.textContent = text; f.hidden = false;
+    clearTimeout(flashTimer); flashTimer = setTimeout(() => { f.hidden = true; }, ms || 1800);
+  }
+
+  // ---------------------------------------------------------------- history
+  class History extends Emitter {
+    constructor(pane, o) {
+      super(); o = o || {};
+      this.pane = pane; this.cap = o.cap || 200; this.mergeMs = o.mergeMs != null ? o.mergeMs : 600;
+      this.entries = []; this.index = -1; this.snapshots = []; this._open = null; this._tx = null; this._seq = 0;
+    }
+    get length() { return this.entries.length; }
+    get canUndo() { return this.index >= 0; }
+    get canRedo() { return this.index < this.entries.length - 1; }
+    _id() { return 'h' + (++this._seq) + '_' + Date.now().toString(36); }
+    _label(paths, before, after) {
+      const lab = this.pane.pathLabel(paths[0]) || paths[0];
+      if (paths.length === 1) return lab + ' ' + fmtAny(before[paths[0]]) + ' → ' + fmtAny(after[paths[0]]);
+      return lab + ' +' + (paths.length - 1);
+    }
+    // from controls: a drag reports last=false until the pointer lifts; single commits merge inside mergeMs
+    record(paths, befores, afters, last, label) {
+      const now = Date.now();
+      const b = {}, a = {}; paths.forEach((p, i) => { b[p] = cloneV(befores[i]); a[p] = cloneV(afters[i]); });
+      if (last && !this._open && !this._tx && paths.every((p) => b[p] === a[p])) return;   // nothing changed, nothing open
+      if (this._tx) { Object.keys(a).forEach((p) => { if (!(p in this._tx.before)) this._tx.before[p] = b[p]; this._tx.after[p] = a[p]; }); return; }
+      if (!last) {
+        if (!this._open) this._open = { id: this._id(), t: now, kind: 'param', label: label || '', before: b, after: a, paths };
+        else Object.assign(this._open.after, a);
+        return;
+      }
+      if (this._open) { Object.assign(this._open.after, a); const e = this._open; this._open = null; e.label = this._label(e.paths, e.before, e.after); this.push(e); return; }
+      const prev = this.entries[this.index];
+      if (prev && prev.kind === 'param' && this.index === this.entries.length - 1 && now - prev.t < this.mergeMs && prev.paths.length === paths.length && prev.paths.every((p) => paths.includes(p))) {
+        Object.assign(prev.after, a); prev.t = now; prev.label = this._label(prev.paths, prev.before, prev.after); this.emit('change', { entry: prev, merged: true }); return;
+      }
+      this.push({ id: this._id(), t: now, kind: 'param', label: this._label(paths, b, a), before: b, after: a, paths });
+    }
+    push(e) {
+      if (!e.id) e.id = this._id(); if (!e.t) e.t = Date.now(); if (!e.paths) e.paths = Object.keys(e.after || {});
+      this.entries.splice(this.index + 1); this.entries.push(e);
+      while (this.entries.length > this.cap) this.entries.shift();
+      this.index = this.entries.length - 1;
+      this.emit('change', { entry: e });
+    }
+    // explicit transaction: everything the function changes (through setState or controls) is one entry
+    transaction(label, fn, o) {
+      if (this._tx) { return fn(); }
+      this._tx = { label, before: {}, after: {}, kind: (o && o.kind) || 'state' };
+      const s0 = this.pane.getState();
+      let out; try { out = fn(); } finally {
+        const tx = this._tx; this._tx = null;
+        const s1 = this.pane.getState();
+        const b = {}, a = {}; let n = 0;
+        Object.keys(s1).forEach((r) => Object.keys(s1[r]).forEach((k) => { if (s0[r] && s0[r][k] !== s1[r][k]) { b[r + '.' + k] = cloneV(s0[r][k]); a[r + '.' + k] = cloneV(s1[r][k]); n++; } }));
+        Object.keys(tx.after).forEach((p) => { if (!(p in a)) { a[p] = tx.after[p]; b[p] = tx.before[p]; n++; } });
+        const last = this.entries[this.index];
+        if (n && o && o.amend && last && this.index === this.entries.length - 1) {
+          Object.keys(a).forEach((p) => { if (!(p in last.before)) last.before[p] = b[p]; last.after[p] = a[p]; });
+          last.paths = Object.keys(last.after); if (label) last.label = label; last.kind = tx.kind; last.t = Date.now(); this.emit('change', { entry: last, merged: true });
+        } else if (n) this.push({ kind: tx.kind, label: label || (n + ' changes'), before: b, after: a, paths: Object.keys(a) });
+      }
+      return out;
+    }
+    beginTx(label) { if (this._tx) return; this._tx = { label, before: {}, after: {}, kind: 'state' }; this._txState = this.pane.getState(); }
+    commitTx() {
+      if (!this._tx) return; const tx = this._tx, s0 = this._txState; this._tx = null; this._txState = null;
+      const s1 = this.pane.getState(); const b = {}, a = {}; let n = 0;
+      Object.keys(s1).forEach((r) => Object.keys(s1[r]).forEach((k) => { if (s0[r] && s0[r][k] !== s1[r][k]) { b[r + '.' + k] = cloneV(s0[r][k]); a[r + '.' + k] = cloneV(s1[r][k]); n++; } }));
+      if (n) this.push({ kind: tx.kind, label: tx.label, before: b, after: a, paths: Object.keys(a) });
+    }
+    cancelTx() { this._tx = null; this._txState = null; }
+    undo() {
+      const e = this.entries[this.index]; if (!e) return false;
+      this.pane.setState(nest(e.before), { noHistory: true, source: 'undo' }); this.index--;
+      flash('Undo: ' + e.label); this.emit('change', { entry: e, undo: true }); return true;
+    }
+    redo() {
+      const e = this.entries[this.index + 1]; if (!e) return false;
+      this.pane.setState(nest(e.after), { noHistory: true, source: 'redo' }); this.index++;
+      flash('Redo: ' + e.label); this.emit('change', { entry: e, redo: true }); return true;
+    }
+    jump(id) {
+      const j = id == null ? -1 : this.entries.findIndex((e) => e.id === id); if (id != null && j < 0) return;
+      while (this.index > j) this.undo();
+      while (this.index < j) this.redo();
+    }
+    snapshot(name) { const s = { id: this._id(), t: Date.now(), name: name || ('Snapshot ' + (this.snapshots.length + 1)), state: this.pane.getState() }; this.snapshots.push(s); this.emit('change', { snapshot: s }); return s; }
+    restoreSnapshot(id) { const s = this.snapshots.find((x) => x.id === id); if (!s) return; this.pane.setState(s.state, { label: 'Snapshot ' + s.name, kind: 'snapshot', source: 'snapshot' }); }
+    removeSnapshot(id) { this.snapshots = this.snapshots.filter((x) => x.id !== id); this.emit('change', {}); }
+    serialise(n) { const e = this.entries.slice(-(n || 100)); return { entries: e, index: Math.min(this.index, e.length - 1) - Math.max(0, this.index - (e.length - 1)), snapshots: this.snapshots }; }
+    load(h) { if (!h) return; this.entries = Array.isArray(h.entries) ? h.entries : []; this.index = typeof h.index === 'number' ? Math.min(h.index, this.entries.length - 1) : this.entries.length - 1; this.snapshots = Array.isArray(h.snapshots) ? h.snapshots : []; this.emit('change', { loaded: true }); }
+    clear() { this.entries = []; this.index = -1; this._open = null; this.emit('change', {}); }
+  }
+
+  // ---------------------------------------------------------------- history folder (list of steps + snapshots)
+  function historyFolder(pane, o) {
+    o = o || {};
+    const f = pane.addFolder({ title: o.title || 'History', expanded: o.expanded === true });
+    const h = pane.history;
+    f.addButtons([{ title: 'undo', onClick: () => h.undo() }, { title: 'redo', onClick: () => h.redo() }, { title: 'snapshot', onClick: () => h.snapshot() }], { cols: 3 });
+    const list = el('div', 'lab-hist'); f.addElement(list);
+    f.addSubhead('snapshots');
+    const snaps = el('div', 'lab-hist lab-hist-snaps'); f.addElement(snaps);
+    const rel = (t) => { const s = Math.max(0, (Date.now() - t) / 1000); return s < 60 ? Math.round(s) + 's' : s < 3600 ? Math.round(s / 60) + 'm' : Math.round(s / 3600) + 'h'; };
+    const paint = () => {
+      if (!f.expanded && !o.always) return;
+      list.textContent = '';
+      const start = el('button', 'lab-hist-row' + (h.index < 0 ? ' on' : ''), ''); start.type = 'button';
+      start.append(el('span', 'lab-hist-lab', 'start'), el('span', 'lab-hist-t', ''));
+      start.addEventListener('click', () => h.jump(null)); list.appendChild(start);
+      const from = Math.max(0, h.entries.length - (o.rows || 60));
+      h.entries.slice(from).forEach((e, i) => {
+        const idx = from + i;
+        const r = el('button', 'lab-hist-row' + (idx === h.index ? ' on' : '') + (idx > h.index ? ' lab-hist-future' : '')); r.type = 'button';
+        r.append(el('span', 'lab-hist-lab', e.label || e.kind), el('span', 'lab-hist-t', rel(e.t)));
+        r.addEventListener('click', () => h.jump(e.id));
+        list.appendChild(r);
+      });
+      list.scrollTop = list.scrollHeight;
+      snaps.textContent = '';
+      h.snapshots.forEach((s) => {
+        const r = el('button', 'lab-hist-row'); r.type = 'button';
+        r.append(el('span', 'lab-hist-lab', s.name), el('span', 'lab-hist-t', rel(s.t)));
+        r.addEventListener('click', () => h.restoreSnapshot(s.id));
+        r.addEventListener('contextmenu', (e) => { e.preventDefault(); h.removeSnapshot(s.id); });
+        snaps.appendChild(r);
+      });
+      snaps.hidden = !h.snapshots.length;
+    };
+    h.on('change', paint); f.on('fold', paint); paint();
+    f.paint = paint;
+    return f;
+  }
+
+  // ---------------------------------------------------------------- LabStore: IndexedDB + OPFS, no deps
+  const LabStore = {
+    STORES: ['projects', 'handles', 'presets', 'thumbs', 'bakes'],
+    _p: null,
+    open() {
+      if (this._p) return this._p;
+      this._p = new Promise((res) => {
+        try {
+          const rq = indexedDB.open('lab-ui', 1);
+          rq.onupgradeneeded = () => { const db = rq.result; this.STORES.forEach((s) => { if (!db.objectStoreNames.contains(s)) db.createObjectStore(s); }); };
+          rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); rq.onblocked = () => res(null);
+        } catch (_) { res(null); }
+      });
+      return this._p;
+    },
+    async _tx(store, mode, fn) {
+      const db = await this.open(); if (!db) return null;
+      return new Promise((res) => { try { const t = db.transaction(store, mode); const rq = fn(t.objectStore(store)); rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); } catch (_) { res(null); } });
+    },
+    get(store, key) { return this._tx(store, 'readonly', (s) => s.get(key)); },
+    put(store, key, val) { return this._tx(store, 'readwrite', (s) => s.put(val, key)); },
+    del(store, key) { return this._tx(store, 'readwrite', (s) => s.delete(key)); },
+    keys(store) { return this._tx(store, 'readonly', (s) => s.getAllKeys()); },
+    async persist() { try { return navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; } catch (_) { return false; } },
+    async estimate() { try { return navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null; } catch (_) { return null; } },
+    opfs: {
+      async _dir(path, create) {
+        if (!navigator.storage || !navigator.storage.getDirectory) return null;
+        let d = await navigator.storage.getDirectory();
+        const parts = path.split('/').filter(Boolean); const name = parts.pop();
+        for (const p of parts) { try { d = await d.getDirectoryHandle(p, { create: !!create }); } catch (_) { return null; } }
+        return { dir: d, name };
+      },
+      async put(path, blob) {
+        try { const h = await this._dir(path, true); if (!h) return false; const fh = await h.dir.getFileHandle(h.name, { create: true }); const w = await fh.createWritable(); await w.write(blob); await w.close(); return true; } catch (_) { return false; }
+      },
+      async get(path, name, opts) {
+        try { const h = await this._dir(path, false); if (!h) return null; const fh = await h.dir.getFileHandle(h.name); const f = await fh.getFile(); return name ? new File([f], name, Object.assign({ type: f.type, lastModified: f.lastModified }, opts || {})) : f; } catch (_) { return null; }
+      },
+      async del(path) { try { const h = await this._dir(path, false); if (!h) return false; await h.dir.removeEntry(h.name); return true; } catch (_) { return false; } },
+      async has(path) { try { const h = await this._dir(path, false); if (!h) return false; await h.dir.getFileHandle(h.name); return true; } catch (_) { return false; } },
+    },
+  };
+
+  // ---------------------------------------------------------------- Project: serialise, autosave, restore, re-link, save/open
+  // new Project(pane, { tool, app, shell, source:{ restore(desc, file), label(desc) }, extra:{ get(), set(obj) }, autosaveMs })
+  class Project extends Emitter {
+    constructor(pane, o) {
+      super(); o = o || {};
+      this.pane = pane; this.o = o; this.tool = o.tool || 'lab'; this.app = o.app || this.tool;
+      this.shell = o.shell || lastShell; this.name = ''; this.created = Date.now(); this.modified = this.created;
+      this.sourceDesc = null; this._dirty = false; this._handle = null; this._saveTimer = null; this.autosaveMs = o.autosaveMs != null ? o.autosaveMs : 1000;
+      this.key = this.tool + ':current'; this.sourceCap = o.sourceCap || 1e9; this._ready = false; this._files = new Map();
+      pane.project = this;
+      pane.on('change', (ev) => { if (ev && ev.last === false) return; this.touch(); });
+      pane.history.on('change', () => this.touch());
+      pane.on('fold', () => this.touch());
+      global.addEventListener('pagehide', () => this.flush());
+      doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'hidden') this.flush(); });
+      keys.bind('KeyS', 'mod', () => this.save(), { label: 'Save project' });
+      keys.bind('KeyO', 'mod', () => this.open(), { label: 'Open project' });
+      this._mark();
+    }
+    get dirty() { return this._dirty; }
+    set dirty(v) { this._dirty = !!v; this._mark(); }
+    _mark() {
+      const s = this.shell; if (!s) return;
+      let d = s.brand.querySelector('.lab-dirty'); if (!d) { d = el('span', 'lab-dirty', '•'); d.title = 'unsaved changes'; s.brand.appendChild(d); }
+      d.hidden = !this._dirty;
+      if (s.docRef && s.docRef.setTitle && this._titleBase) s.docRef.setTitle(this._titleBase + (this._dirty ? ' •' : ''));
+    }
+    setTitle(t) { this._titleBase = t; this._mark(); }
+    touch() { if (!this._ready || this._loading) return; this.modified = Date.now(); if (!this._dirty && !this._restoring) { this._dirty = true; this._mark(); } this.emit('dirty', { dirty: true }); clearTimeout(this._saveTimer); this._saveTimer = setTimeout(() => this.autosave(), this.autosaveMs); }
+    serialise(o) {
+      o = o || {};
+      const out = { schema: 'lab-project@1', tool: this.tool, app: this.app, name: this.name, created: this.created, modified: this.modified,
+        source: this.sourceDesc ? cloneV(this.sourceDesc) : null, params: this.pane.getState(), folds: this.pane.getFolds() };
+      if (this.o.extra && this.o.extra.get) out.extra = cloneV(this.o.extra.get());
+      if (!o.noHistory) out.history = this.pane.history.serialise(o.historyN || 100);
+      return out;
+    }
+    load(obj, o) {
+      o = o || {};
+      if (!obj || obj.schema !== 'lab-project@1') throw new Error('not a lab project');
+      if (obj.tool && obj.tool !== this.tool) throw new Error('project is for ' + obj.tool);
+      this.name = obj.name || ''; this.created = obj.created || Date.now(); this.modified = obj.modified || Date.now();
+      this._loading = true;
+      try {
+        if (obj.params) this.pane.setState(obj.params, { noHistory: true, source: o.source || 'project' });
+        if (obj.folds) this.pane.setFolds(obj.folds);
+        if (obj.extra && this.o.extra && this.o.extra.set) this.o.extra.set(obj.extra);
+        if (obj.history && !o.noHistory) this.pane.history.load(obj.history); else if (!o.keepHistory) this.pane.history.clear();
+        this.sourceDesc = obj.source || null;
+      } finally { this._loading = false; }
+      this.emit('load', { project: obj });
+    }
+    async autosave() { if (!this._ready) return false; clearTimeout(this._saveTimer); const ok = await LabStore.put('projects', this.key, this.serialise()); this.emit('autosave', { ok: ok !== null }); return ok !== null; }
+    flush() { if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; this.autosave(); } }
+    // restore the autosaved project, then the source; resolves true when a project was found
+    async restore(o) {
+      o = o || {};
+      let obj = await LabStore.get('projects', this.key);
+      if (!obj && o.migrate) { try { obj = await o.migrate(); } catch (_) { obj = null; } }
+      this._ready = true;
+      if (!obj) { this.emit('ready', { restored: false }); return false; }
+      try { this.load(obj, { source: 'restore' }); } catch (e) { console.warn('project restore:', e); this.emit('ready', { restored: false }); return false; }
+      this._restoring = true;
+      try { await this.restoreSource(); } finally { this._restoring = false; }
+      this._dirty = false; this._mark();
+      this.emit('ready', { restored: true });
+      return true;
+    }
+    async restoreSource() {
+      const d = this.sourceDesc; if (!d || !this.o.source || !this.o.source.restore) return false;
+      if (d.kind === 'file') {
+        let f = this._files.get(d.fp) || null;
+        if (!f && d.opfs) f = await LabStore.opfs.get(d.opfs, d.name, { type: d.type, lastModified: d.lastModified });
+        if (f) { this._files.set(d.fp, f); await this.o.source.restore(d, f); this.hideRelink(); return true; }
+        this.showRelink(d); return false;
+      }
+      await this.o.source.restore(d, null); this.hideRelink(); return true;
+    }
+    // tools call this when a source is loaded; file sources are copied into OPFS in the background
+    setSource(desc, file) {
+      if (this._restoring) return this.sourceDesc;
+      desc = Object.assign({}, desc || {});
+      if (file) {
+        desc.kind = 'file'; desc.name = file.name; desc.size = file.size; desc.lastModified = file.lastModified; desc.type = file.type;
+        desc.fp = Project.fingerprint(file); this._files.set(desc.fp, file);
+        const path = 'sources/' + desc.fp;
+        if (file.size <= this.sourceCap) {
+          LabStore.opfs.has(path).then(async (has) => {
+            if (!has) { const est = await LabStore.estimate(); if (est && est.quota && est.usage + file.size > est.quota * 0.9) return; if (!(await LabStore.opfs.put(path, file))) return; LabStore.persist(); }
+            if (this.sourceDesc && this.sourceDesc.fp === desc.fp) { this.sourceDesc.opfs = path; this.touch(); }
+          });
+        }
+      }
+      this.sourceDesc = desc; this.hideRelink(); this.touch();
+      return desc;
+    }
+    updateSource(patch) { if (this.sourceDesc) { Object.assign(this.sourceDesc, patch); this.touch(); } }
+    static fingerprint(f) { return [f.name, f.size, f.lastModified].join('|').replace(/[^\w.|-]+/g, '_'); }
+    showRelink(d) {
+      const s = this.shell; if (!s) return;
+      let r = s.view.querySelector('.lab-relink');
+      if (!r) { r = el('div', 'lab-relink'); r.append(el('span', 'lab-relink-text'), el('button', 'lab-btn lab-accent', 'Re-link'), el('button', 'lab-btn', 'Dismiss')); s.view.appendChild(r);
+        r.children[1].addEventListener('click', () => this.relink());
+        r.children[2].addEventListener('click', () => this.hideRelink()); }
+      const lab = this.o.source && this.o.source.label ? this.o.source.label(d) : (d.name || d.kind);
+      r.firstChild.textContent = 'Re-link: ' + lab; r.hidden = false;
+    }
+    hideRelink() { const s = this.shell; if (!s) return; const r = s.view.querySelector('.lab-relink'); if (r) r.hidden = true; }
+    async relink() {
+      const d = this.sourceDesc; if (!d) return;
+      let f = null;
+      if (global.showOpenFilePicker) { try { const [h] = await global.showOpenFilePicker({ multiple: false }); f = await h.getFile(); } catch (_) { return; } }
+      else { f = await new Promise((res) => { const i = el('input'); i.type = 'file'; i.onchange = () => res(i.files[0] || null); i.click(); }); }
+      if (!f) return;
+      if (Project.fingerprint(f) !== d.fp) flash('Re-linked a different file: ' + f.name, 2500);
+      const desc = Object.assign({}, d); this.setSource(desc, f);
+      await this.o.source.restore(this.sourceDesc, f);
+    }
+    fileName() { return (this.name || (this.sourceDesc && this.sourceDesc.name ? this.sourceDesc.name.replace(/\.[^.]+$/, '') : this.tool)) + '.' + this.tool + '.json'; }
+    async save() {
+      const json = JSON.stringify(this.serialise(), null, 1);
+      if (global.showSaveFilePicker) {
+        try {
+          if (!this._handle) this._handle = await global.showSaveFilePicker({ suggestedName: this.fileName(), types: [{ description: 'Lab project', accept: { 'application/json': ['.json'] } }] });
+          const w = await this._handle.createWritable(); await w.write(json); await w.close();
+          this.name = this._handle.name.replace(/\.[^.]+\.json$|\.json$/, '');
+        } catch (e) { if (e && e.name === 'AbortError') return false; this._handle = null; this._download(json); }
+      } else this._download(json);
+      this._dirty = false; this._mark(); flash('Saved ' + this.fileName()); this.emit('save', {}); this.autosave();
+      return true;
+    }
+    _download(json) { const a = el('a'); a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' })); a.download = this.fileName(); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
+    async open() {
+      let f = null;
+      if (global.showOpenFilePicker) { try { const [h] = await global.showOpenFilePicker({ types: [{ description: 'Lab project', accept: { 'application/json': ['.json'] } }] }); this._handle = h; f = await h.getFile(); } catch (_) { return false; } }
+      else { f = await new Promise((res) => { const i = el('input'); i.type = 'file'; i.accept = '.json,application/json'; i.onchange = () => res(i.files[0] || null); i.click(); }); }
+      if (!f) return false;
+      return this.loadFile(f);
+    }
+    // returns false (quietly) when the file is not a project for this tool, so drop handlers can fall through to media
+    async loadFile(f) {
+      if (!/\.json$/i.test(f.name)) return false;
+      let obj; try { obj = JSON.parse(await f.text()); } catch (_) { return false; }
+      if (!obj || obj.schema !== 'lab-project@1' || (obj.tool && obj.tool !== this.tool)) return false;
+      this.pane.history.transaction('Open ' + f.name, () => this.load(obj, { keepHistory: true, noHistory: true, source: 'open' }), { kind: 'project' });
+      this.name = this.name || f.name.replace(/\.[^.]+\.json$|\.json$/, '');
+      this._dirty = false; this._mark(); await this.restoreSource(); flash('Opened ' + f.name); this.autosave();
+      return true;
+    }
+    async reset() { clearTimeout(this._saveTimer); await LabStore.del('projects', this.key); }
+  }
+
+  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, History, Project, LabStore, keys, flash, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);

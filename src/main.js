@@ -143,6 +143,7 @@ const app = SPECIMEN ? null : window.LabUI.shell({
   title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
   menus: [
     { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }] },
+    { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
     { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
     { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
   ],
@@ -500,19 +501,15 @@ async function loadImageFromFile(file) {
 // v6 saved state doesn't override the new defaults.
 const LS_KEY = 'duotone:lastState:v7';
 
-function saveStateToLocalStorage() {
-  try { localStorage.setItem(LS_KEY, JSON.stringify({ params, sourceState })); }
-  catch {}
-}
-
-function loadStateFromLocalStorage() {
+// one-time migration of the old localStorage state into the project store
+function migrateLocalStorage() {
   try {
     const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return;
+    if (!raw) return null;
     const saved = JSON.parse(raw);
-    if (saved?.params) Object.assign(params, saved.params);
-    if (saved?.sourceState) Object.assign(sourceState, saved.sourceState);
-  } catch {}
+    localStorage.removeItem(LS_KEY);
+    return { schema: 'lab-project@1', tool: 'boiler', params: { params: saved?.params || {}, source: saved?.sourceState || {} } };
+  } catch { return null; }
 }
 
 // -----------------------------------------------------------------------------
@@ -571,11 +568,12 @@ function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
 let liveDtMs = 16.7;            // frame delta for the ms-based followers
 let lastKickEffectTime = -1;    // effect-time of the last kick onset (-1 = none)
 
-async function setModulationMode(next) {
-  // teardown current
-  if (modulation.mode === 'audio')  audioMod.pause();
-  if (modulation.mode === 'camera') cameraMod.stop();
-  modulation.mode = next;
+async function setModulationMode(next, prev) {
+  // teardown current (prev is passed when the binding already wrote the new mode)
+  const cur = prev !== undefined ? prev : modulation.mode;
+  if (cur === 'audio')  audioMod.pause();
+  if (cur === 'camera') cameraMod.stop();
+  modulation.mode = next; pane.refresh();
   if (next === 'audio')  audioMod.resume();
   if (next === 'camera') {
     try { await cameraMod.start(); }
@@ -1030,7 +1028,7 @@ let updateSpeedVis = () => {};
 {
   const f = pane.addFolder({ title: 'Source', expanded: true, cols: 2 });
   f.addButton({ title: 'Pick file… (video / image)', id: 'bPick' }).on('click', () => mediaPicker.click());
-  f.addButton({ title: 'Use sample', id: 'bSample' }).on('click', () => { loadVideoFromUrl('/samples/sample.mp4'); if (app && app.docRef) app.docRef.setTitle('Boiler Eggs – sample.mp4'); });
+  f.addButton({ title: 'Use sample', id: 'bSample' }).on('click', () => { if (project) project.setSource({ kind: 'sample', name: 'sample.mp4' }); loadVideoFromUrl('/samples/sample.mp4'); if (app && app.docRef) app.docRef.setTitle('Boiler Eggs – sample.mp4'); });
   // Restart video + song together: video back to frame 0, song to its cue
   // point ('song start'), intro replayed — a live preview of exactly what an
   // export will capture.
@@ -1107,24 +1105,18 @@ let updateSpeedVis = () => {};
   const bSpot = f.addBinding(params, 'spotColor', { label: 'spot' });
   // shadow = below-threshold color, applies in both colour modes
   f.addBinding(params, 'shadowColor', { label: 'shadow' });
-  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'replace (legacy)', value: 0 }, { text: 'ink over paper', value: 1 }, { text: 'duotone, two screens', value: 2 }, { text: 'riso two-ink', value: 3 }], value: params.colorModel | 0 }).on('change', (ev) => { params.colorModel = ev.value | 0; updateColorVis0(); });
+  f.addBinding(params, 'colorModel', { label: 'model', options: [{ text: 'replace (legacy)', value: 0 }, { text: 'ink over paper', value: 1 }, { text: 'duotone, two screens', value: 2 }, { text: 'riso two-ink', value: 3 }] }).on('change', () => { updateColorVis0(); });
   f.addBinding(params, 'inkB', { label: 'second ink' });
   const duoCurve = f.addCurve(params, { label: 'duotone curves', xLabel: 'lightness', yLabel: 'coverage', readout: () => 'spot · black',
     fn: (L) => { const sm = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); }; return [1 - Math.pow(L, 0.8), Math.pow(sm((0.55 - L) / 0.55), 1.2)]; } });
   updateColorVis0 = () => { duoCurve.hidden = (params.colorModel | 0) !== 2; }; updateColorVis0();
   const bIO = f.addBinding(params, 'inkOpacity', { label: 'ink opacity', min: 0, max: 1, step: 0.01 });
   const bMr = f.addBinding(params, 'misregPx', { label: 'misregister px', min: 0, max: 12, step: 0.5 });
-  const bMode = f.addBlade({
-    view: 'list',
-    label: 'colour mode',
-    options: [
+  const bMode = f.addBinding(params, 'colorMode', { label: 'colour mode', options: [
       { text: 'spot colour (1-bit)',      value: 0 },
       { text: 'original video colours',   value: 1 },
-    ],
-    value: params.colorMode | 0,
-  });
+    ] });
   bMode.on('change', (ev) => {
-    params.colorMode = ev.value | 0;
     updateColorVis();
   });
   updateColorVis = function () {
@@ -1132,29 +1124,19 @@ let updateSpeedVis = () => {};
     bSpot.hidden = (params.colorMode | 0) === 1;  // spot swatch is inert in original mode
   };
   updateColorVis();
-  f.addBlade({
-    view: 'list',
-    label: 'preset',
-    options: [
+  f.addBinding(sourceState, 'preset', { label: 'preset', options: [
       { text: 'default (orange ref)', value: 'default' },
       { text: 'orange',               value: 'orange'  },
       { text: 'green',                value: 'green'   },
       { text: 'blue',                 value: 'blue'    },
       { text: 'custom',               value: 'custom'  },
-    ],
-    value: sourceState.preset,
-  }).on('change', (ev) => {
-    sourceState.preset = ev.value;
+    ] }).on('change', (ev) => {
+    if (ev.programmatic) return;
     if (ev.value !== 'custom' && PRESETS[ev.value]) {
-      applyPreset(params, PRESETS[ev.value]);
-      pane.refresh();
-      updateIntroVis();
-      updateSpeedVis();
-      updateTempVis();
+      pane.history.transaction('Preset ' + ev.value, () => { applyPreset(params, PRESETS[ev.value]); }, { amend: true });
+      pane.refresh(); updateIntroVis(); updateSpeedVis(); updateTempVis(); updateColorVis();
       // restart intro on preset change so spatial wavefronts re-play
-      effectStart = performance.now();
-      frameCount = 0;
-      saveStateToLocalStorage();
+      effectStart = performance.now(); frameCount = 0;
     }
   });
 }
@@ -1171,24 +1153,19 @@ let updateSpeedVis = () => {};
     fn: (L, P) => { const T = P.thresholdBase, w = Math.max(P.softness, 0.002); const sm = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); };
       return [sm((L - (T - w)) / (2 * w)), sm((L - (T + P.thresholdLFOAmp - w)) / (2 * w))]; } });
   f.body.insertBefore(cutCurve.element, f.body.firstChild);
-  f.addBlade({ view: 'list', label: 'luma', options: [{ text: "Y' (legacy)", value: 0 }, { text: 'L* perceptual', value: 1 }], value: params.lumaMode | 0 }).on('change', (ev) => { params.lumaMode = ev.value | 0; });
+  f.addBinding(params, 'lumaMode', { label: 'luma', options: [{ text: "Y' (legacy)", value: 0 }, { text: 'L* perceptual', value: 1 }] }).on('change', () => {  });
 }
 
 // --- Intro ---
 {
   const f = pane.addFolder({ title: 'Intro', expanded: false, cols: 2 });
 
-  f.addBlade({
-    view: 'list',
-    label: 'mode',
-    options: [
+  f.addBinding(params, 'introMode', { label: 'mode', options: [
       { text: 'develop  (global ramp)',  value: 0 },
       { text: 'radiance (outward)',      value: 1 },
       { text: 'aperture (inward iris)',  value: 2 },
       { text: 'scanline (linear sweep)', value: 3 },
-    ],
-    value: params.introMode | 0,
-  }).on('change', (ev) => { params.introMode = ev.value | 0; updateIntroVis(); });
+    ] }).on('change', () => { updateIntroVis(); });
 
   const bDur = f.addBinding(params, 'introDuration', { label: 'duration', min: 0, max: 6, step: 0.05 });
   f.addBlade({
@@ -1210,7 +1187,7 @@ let updateSpeedVis = () => {};
   const bDir     = f.addBinding(params, 'introDirectionality', { label: 'direction',  min: 0, max: 1, step: 0.01 });
   const bAngle   = f.addBinding(params, 'introAngle',          { label: 'angle (rad)', min: -3.14159, max: 3.14159, step: 0.01 });
   const bTurb    = f.addBinding(params, 'introTurbulence',     { label: 'turbulence', min: 0, max: 1, step: 0.01 });
-  f.addBlade({ view: 'list', label: 'model', options: [{ text: 'legacy', value: 0 }, { text: 'physical (develop curve, round iris, lamp)', value: 1 }], value: params.introModel | 0 }).on('change', (ev) => { params.introModel = ev.value | 0; });
+  f.addBinding(params, 'introModel', { label: 'model', options: [{ text: 'legacy', value: 0 }, { text: 'physical (develop curve, round iris, lamp)', value: 1 }] }).on('change', () => {  });
   f.addBinding(params, 'introInduction', { label: 'induction', min: 0, max: 0.6, step: 0.01 });
   f.addBinding(params, 'introFrom', { label: 'ramp from', min: 0, max: 1, step: 0.01 });
   f.addBinding(params, 'scanLampGain', { label: 'lamp gain', min: 0, max: 1, step: 0.01 });
@@ -1250,7 +1227,7 @@ let updateSpeedVis = () => {};
   // morphism knob — UV warp by the same field; tiny values go a long way
   const bFW = f.addBinding(params, 'warpAmp',        { label: 'warp',   min: 0,   max: 0.06, step: 0.001 });
   padPair(f, params, bFS, bFV, 'slowNoiseScale', 'slowNoiseSpeed', [0.5, 12, 0.1], [0, 1, 0.005], 'field', 'scale', 'speed', true);
-  f.addBlade({ view: 'list', label: 'field', options: [{ text: 'value fbm (legacy)', value: 0 }, { text: 'simplex, vector warp', value: 1 }, { text: 'simplex, curl warp', value: 2 }], value: params.fieldMode | 0 }).on('change', (ev) => { params.fieldMode = ev.value | 0; });
+  f.addBinding(params, 'fieldMode', { label: 'field', options: [{ text: 'value fbm (legacy)', value: 0 }, { text: 'simplex, vector warp', value: 1 }, { text: 'simplex, curl warp', value: 2 }] }).on('change', () => {  });
 }
 
 // --- Boil ---
@@ -1260,7 +1237,7 @@ let updateSpeedVis = () => {};
   const bBV = f.addBinding(params, 'ditherSpeed', { label: 'speed', min: 0,   max: 1,    step: 0.01 });
   f.addSubhead('boil');
   const bBA = f.addBinding(params, 'ditherAmp',   { label: 'amp',   min: 0,   max: 0.3,  step: 0.005 });
-  f.addBlade({ view: 'list', label: 'grain', options: [{ text: 'white noise (legacy)', value: 0 }, { text: 'blue noise', value: 1 }, { text: 'halftone screen', value: 2 }, { text: 'Bayer 8x8', value: 3 }, { text: 'interleaved gradient', value: 4 }], value: params.ditherMode | 0 }).on('change', (ev) => { params.ditherMode = ev.value | 0; });
+  f.addBinding(params, 'ditherMode', { label: 'grain', options: [{ text: 'white noise (legacy)', value: 0 }, { text: 'blue noise', value: 1 }, { text: 'halftone screen', value: 2 }, { text: 'Bayer 8x8', value: 3 }, { text: 'interleaved gradient', value: 4 }] }).on('change', () => {  });
   f.addBinding(params, 'boilHold',  { label: 'hold drawings (2s/3s)' });
   const bBC = f.addBinding(params, 'boilCycle', { label: 'drawings in loop', min: 1, max: 8, step: 1 });
   f.addSubhead('halftone');
@@ -1310,7 +1287,7 @@ let updateSpeedVis = () => {};
   const bBal    = f.addBinding(params, 'layerBlendBalance', { label: 'blend balance', min: 0, max: 1, step: 0.01 });
   const bPhase  = f.addBinding(params, 'phaseLockToSpeed',  { label: 'phase lock to speed' });
   const bSeed   = f.addBinding(params, 'twoLayerSeed',      { label: 'seed', min: 0, max: 9999, step: 1 });
-  f.addBlade({ view: 'list', label: 'trail model', options: [{ text: 'newest-heavy (legacy)', value: 0 }, { text: 'box exposure (step-print)', value: 1 }], value: params.trailMode | 0 }).on('change', (ev) => { params.trailMode = ev.value | 0; });
+  f.addBinding(params, 'trailMode', { label: 'trail model', options: [{ text: 'newest-heavy (legacy)', value: 0 }, { text: 'box exposure (step-print)', value: 1 }] }).on('change', () => {  });
   const bShut = f.addBinding(params, 'trailShutter', { label: 'shutter', min: 0.1, max: 1, step: 0.05 });
   f.addBinding(params, 'beatSync', { label: 'quantise to beat' });
   const tlPads = [
@@ -1333,7 +1310,7 @@ let updateSpeedVis = () => {};
   const f = pane.addFolder({ title: 'Edge', expanded: false, cols: 2 });
   f.addSubhead('cut');
   const bSo = f.addBinding(params, 'softness', { label: 'softness', min: 0, max: 0.05, step: 0.001 });
-  f.addBlade({ view: 'list', label: 'edge', options: [{ text: 'luma width (legacy)', value: 0 }, { text: 'pixel distance', value: 1 }], value: params.edgeMode | 0 }).on('change', (ev) => { params.edgeMode = ev.value | 0; });
+  f.addBinding(params, 'edgeMode', { label: 'edge', options: [{ text: 'luma width (legacy)', value: 0 }, { text: 'pixel distance', value: 1 }] }).on('change', () => {  });
   const bBl = f.addBinding(params, 'bleedPx', { label: 'bleed px', min: 0, max: 2, step: 0.05 });
   const bHp = f.addBinding(params, 'haloPx', { label: 'halo px', min: 0, max: 4, step: 0.1 });
   const bHs = f.addBinding(params, 'haloStrength', { label: 'halo', min: 0, max: 0.5, step: 0.01 });
@@ -1347,16 +1324,11 @@ let updateSpeedVis = () => {};
 {
   const f = pane.addFolder({ title: 'Modulation', expanded: false, cols: 2 });
 
-  f.addBlade({
-    view: 'list',
-    label: 'mode',
-    options: [
+  { let lastMode = modulation.mode; f.addBinding(modulation, 'mode', { label: 'mode', options: [
       { text: 'none (manual)', value: 'none'   },
       { text: 'audio file',    value: 'audio'  },
       { text: 'webcam motion', value: 'camera' },
-    ],
-    value: modulation.mode,
-  }).on('change', (ev) => { setModulationMode(ev.value); });
+    ] }).on('change', (ev) => { const prev = lastMode; lastMode = ev.value; setModulationMode(ev.value, prev); }); }
 
   // ---- audio sub-section
   f.addButton({ title: 'Pick audio file…', id: 'bAudioPick' }).on('click', () => audioPicker.click());
@@ -1421,9 +1393,9 @@ let updateSpeedVis = () => {};
 
   // alpha key: png sequence / save png carry transparency; mp4 and webm flatten over black
   const applyAlpha = () => { canvas.classList.toggle('lab-alpha', (params.alphaMode | 0) > 0); };
-  f.addBlade({ view: 'list', label: 'alpha', options: [
+  f.addBinding(params, 'alphaMode', { label: 'alpha', options: [
       { text: 'opaque', value: 0 }, { text: 'key paper (keep ink)', value: 1 }, { text: 'key ink (keep paper)', value: 2 },
-    ], value: params.alphaMode | 0 }).on('change', (ev) => { params.alphaMode = ev.value | 0; applyAlpha(); });
+    ] }).on('change', () => { applyAlpha(); });
   applyAlpha();
   f.addButton({ title: 'Save PNG', id: 'bPng' }).on('click', () => {
     canvas.toBlob((b) => { if (!b) return; const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = `boiler-eggs-${Date.now()}.png`; a.click(); }, 'image/png');
@@ -1562,15 +1534,9 @@ let updateSpeedVis = () => {};
   });
 
   f.addButton({ title: 'Reset to default', id: 'bResetDefault' }).on('click', () => {
-    applyPreset(params, PRESETS[DEFAULT_PRESET]);
-    sourceState.preset = DEFAULT_PRESET;
-    pane.refresh();
-    updateIntroVis();
-    updateTempVis();
-    updateSpeedVis();
-    effectStart = performance.now();
-    frameCount = 0;
-    saveStateToLocalStorage();
+    pane.history.transaction('Reset to default', () => { applyPreset(params, PRESETS[DEFAULT_PRESET]); sourceState.preset = DEFAULT_PRESET; });
+    pane.refresh(); updateIntroVis(); updateTempVis(); updateSpeedVis(); updateColorVis();
+    effectStart = performance.now(); frameCount = 0;
   });
 
   f.addButton({ title: 'Save preset (json)' }).on('click', () => {
@@ -1586,8 +1552,12 @@ mediaPicker.addEventListener('change', () => {
   if (app && app.docRef && mediaPicker.files && mediaPicker.files[0]) app.docRef.setTitle('Boiler Eggs – ' + mediaPicker.files[0].name);
   const f = mediaPicker.files?.[0];
   if (!f) return;
-  if (f.type.startsWith('video/'))      loadVideoFromFile(f);
-  else if (f.type.startsWith('image/')) loadImageFromFile(f);
+  (project ? project.loadFile(f) : Promise.resolve(false)).then((isProject) => {
+    if (isProject) return;
+    if (project) project.setSource({}, f);
+    if (f.type.startsWith('video/'))      loadVideoFromFile(f);
+    else if (f.type.startsWith('image/')) loadImageFromFile(f);
+  });
 });
 audioPicker.addEventListener('change', async () => {
   const f = audioPicker.files?.[0];
@@ -1608,14 +1578,12 @@ presetPicker.addEventListener('change', async () => {
   if (!f) return;
   try {
     const obj = await readPresetFile(f);
-    applyPreset(params, obj);
-    sourceState.preset = obj.name || 'custom';
+    pane.history.transaction('Preset file ' + f.name, () => { applyPreset(params, obj); sourceState.preset = obj.name || 'custom'; });
     pane.refresh();
     updateIntroVis();
       updateSpeedVis();
     updateTempVis();
     updateColorVis();
-    saveStateToLocalStorage();
   } catch (e) {
     console.error('Preset load failed:', e);
   }
@@ -1641,9 +1609,12 @@ window.addEventListener('drop', (e) => {
   dropOverlay.classList.remove('active');
   const file = e.dataTransfer?.files?.[0];
   if (!file) return;
+  (project ? project.loadFile(file) : Promise.resolve(false)).then((isProject) => { if (isProject) return;
   if (file.type.startsWith('video/')) {
+    if (project) project.setSource({}, file);
     loadVideoFromFile(file);
   } else if (file.type.startsWith('image/')) {
+    if (project) project.setSource({}, file);
     loadImageFromFile(file);
   } else if (file.type.startsWith('audio/')) {
     audioMod.loadFile(file).then(() => {
@@ -1660,9 +1631,9 @@ window.addEventListener('drop', (e) => {
       updateSpeedVis();
       updateTempVis();
       updateColorVis();
-      saveStateToLocalStorage();
     });
   }
+  });
 });
 
 // fade out hint after 3s
@@ -1677,13 +1648,23 @@ window.addEventListener('pointerdown', () => {
   hint.classList.add('hidden');
 }, { once: true });
 
-// persist UI state on any change
-pane.on('change', saveStateToLocalStorage);
+// state layer: roots, history folder, project (autosave to IndexedDB, restore, re-link, save / open)
+pane.track('params', params);
+pane.track('source', sourceState, { exclude: ['playing'] });
+pane.track('modulation', modulation);
+pane.track('modAudio', modulation.audio);
+pane.track('modCamera', modulation.camera);
+pane.on('state', (ev) => { if (ev.source === 'control') return; window.__boiler.refreshVis(); });
+pane.addHistory();
+const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app,
+  source: {
+    restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadImageFromFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
+    label: (d) => (d.name || d.kind) + (d.w ? ` (${d.w}×${d.h}${d.duration ? ' · ' + d.duration.toFixed(1) + 's' : ''})` : ''),
+  } }) : null;
 
 // -----------------------------------------------------------------------------
 // boot
 // -----------------------------------------------------------------------------
-loadStateFromLocalStorage();
 pane.refresh();
 updateIntroVis();
       updateSpeedVis();
@@ -1696,7 +1677,7 @@ updateColorVis();
 if (typeof window !== 'undefined') {
   window.boiler = {
     params, sourceState, modulation, exportSettings, monitor,
-    pane, mediaPicker, audioPicker, presetPicker,
+    pane, mediaPicker, audioPicker, presetPicker, project,
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {
@@ -1728,6 +1709,8 @@ if (typeof window !== 'undefined') {
 window.addEventListener('resize', resize);
 resize();
 video.addEventListener('loadedmetadata', resize);
+video.addEventListener('loadedmetadata', () => { if (project) project.updateSource({ w: video.videoWidth, h: video.videoHeight, duration: isFinite(video.duration) ? video.duration : undefined }); });
+if (project) project.restore({ migrate: migrateLocalStorage }).then(() => { window.__boiler.refreshVis(); });
 
 // rVFC chain — registers a callback that fires once per real video frame.
 // Chain re-registers itself inside the callback. The chain stays alive across
