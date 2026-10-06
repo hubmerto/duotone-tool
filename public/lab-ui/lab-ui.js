@@ -402,6 +402,75 @@
     }
   }
 
+  // Curve: a live function graph. addCurve(obj, {fn:(x, obj)=>y | [y...], xKey, yKey, xmin..ymax, xLabel, yLabel, label, half, samples, onChange})
+  // fn maps x in 0..1 to y in 0..1 (or an array of ys for several traces). With xKey / yKey the surface drags like a pad.
+  class CurveControl extends Control {
+    constructor(parent, obj, o) {
+      o = o || {};
+      const row = el('div', o.half ? 'lab-row lab-half' : 'lab-row lab-full');
+      super(parent, row);
+      this.obj = obj; this.opts = o;
+      const pad = el('div', 'lab-pad lab-curve'); row.appendChild(pad);
+      const cv = document.createElement('canvas'); cv.className = 'lab-curve-cv'; pad.appendChild(cv);
+      const ax = el('span', 'lab-pad-ax lab-pad-x', o.xLabel || ''), ay = el('span', 'lab-pad-ax lab-pad-y', o.yLabel || ''), rd = el('span', 'lab-pad-rd');
+      pad.append(ay, ax, rd);
+      if (o.label) pad.appendChild(el('span', 'lab-pad-title', o.label));
+      const xr = [o.xmin != null ? o.xmin : 0, o.xmax != null ? o.xmax : 1], yr = [o.ymin != null ? o.ymin : 0, o.ymax != null ? o.ymax : 1];
+      const xd = o.xDigits != null ? o.xDigits : 2, yd = o.yDigits != null ? o.yDigits : 2;
+      const N = o.samples || 64;
+      const draggable = !!(o.xKey || o.yKey);
+      if (!draggable) pad.classList.add('lab-curve-ro');
+      const draw = () => {
+        const w = pad.clientWidth, h = pad.clientHeight; if (!w || !h) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+        const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+        g.strokeStyle = 'rgba(255,255,255,.07)'; g.lineWidth = 1;
+        for (let i = 1; i < 4; i++) { const x = Math.round(w * i / 4) + .5, y = Math.round(h * i / 4) + .5; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+        const cols = ['rgba(120,170,255,.95)', 'rgba(255,150,70,.9)', 'rgba(120,230,160,.9)'];
+        const traces = [];
+        for (let i = 0; i <= N; i++) { let v = o.fn(i / N, obj); if (!Array.isArray(v)) v = [v]; v.forEach((y, k) => { (traces[k] = traces[k] || []).push(y); }); }
+        traces.forEach((tr, k) => {
+          g.strokeStyle = cols[k % cols.length]; g.lineWidth = 1.5; g.beginPath();
+          tr.forEach((y, i) => { const px = i / N * (w - 2) + 1, py = (1 - clamp(+y || 0, 0, 1)) * (h - 2) + 1; if (i) g.lineTo(px, py); else g.moveTo(px, py); });
+          g.stroke();
+          if (k === 0) { g.lineTo(w - 1, h - 1); g.lineTo(1, h - 1); g.closePath(); g.fillStyle = 'rgba(61,125,220,.12)'; g.fill(); }
+        });
+        if (draggable) {
+          const nx = o.xKey ? clamp((+obj[o.xKey] - xr[0]) / (xr[1] - xr[0]), 0, 1) : null;
+          const ny = o.yKey ? clamp((+obj[o.yKey] - yr[0]) / (yr[1] - yr[0]), 0, 1) : null;
+          g.strokeStyle = 'rgba(61,125,220,.55)';
+          if (nx != null) { const x = Math.round(nx * w) + .5; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke(); }
+          if (ny != null) { const y = Math.round((1 - ny) * h) + .5; g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+          const parts = []; if (o.xKey) parts.push((+obj[o.xKey]).toFixed(xd)); if (o.yKey) parts.push((+obj[o.yKey]).toFixed(yd));
+          rd.textContent = parts.join(' · ');
+        } else if (o.readout) rd.textContent = o.readout(obj);
+      };
+      this.refresh = draw;
+      if (typeof ResizeObserver !== 'undefined') new ResizeObserver(draw).observe(pad);
+      let root = parent; while (root && root.parent) root = root.parent;
+      if (root && root.on) root.on('change', () => draw());
+      if (draggable) {
+        const set = (e, last) => {
+          const r = pad.getBoundingClientRect();
+          const fx = clamp((e.clientX - r.left) / r.width, 0, 1), fy = clamp(1 - (e.clientY - r.top) / r.height, 0, 1);
+          if (o.xKey) { let x = xr[0] + fx * (xr[1] - xr[0]); if (o.xStep) x = Math.round(x / o.xStep) * o.xStep; obj[o.xKey] = +x.toFixed(6); }
+          if (o.yKey) { let y = yr[0] + fy * (yr[1] - yr[0]); if (o.yStep) y = Math.round(y / o.yStep) * o.yStep; obj[o.yKey] = +y.toFixed(6); }
+          draw();
+          const value = [o.xKey ? obj[o.xKey] : null, o.yKey ? obj[o.yKey] : null];
+          this.emit('change', { value, last, target: this });
+          if (o.onChange) o.onChange(value[0], value[1], last);
+        };
+        pad.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; pad.setPointerCapture(e.pointerId); pad.classList.add('drag'); set(e, false); e.preventDefault(); });
+        pad.addEventListener('pointermove', (e) => { if (pad.classList.contains('drag')) set(e, false); });
+        const up = (e) => { if (!pad.classList.contains('drag')) return; pad.classList.remove('drag'); set(e, true); };
+        pad.addEventListener('pointerup', up); pad.addEventListener('pointercancel', up);
+      }
+      this.pad = pad;
+      requestAnimationFrame(draw);
+    }
+  }
+
   class PresetsControl extends Control {
     constructor(parent, names, o) {
       o = o || {};
@@ -522,6 +591,7 @@
     }
     addPresets(names, o) { return this._add(new PresetsControl(this, names, o)); }
     addPad(obj, xKey, yKey, o) { return this._add(new PadControl(this, obj, xKey, yKey, o)); }
+    addCurve(obj, o) { const c = this._add(new CurveControl(this, obj, o)); c.on('change', (ev) => this._bubble(ev)); return c; }
     addStatus(text, o) { return this._add(new StatusControl(this, text, o)); }
     addProgress(o) { return this._add(new ProgressControl(this, o)); }
     addNote(html) { return this._add(new NoteControl(this, html)); }
@@ -889,5 +959,5 @@
     if (t) t.textContent = text; else if (b.querySelector('svg')) { let span = b.querySelector('span'); if (!span) { span = el('span', 'lab-tool-text'); b.appendChild(span); } span.textContent = text; } else b.textContent = text;
   }
 
-  global.LabUI = { Pane, Folder, Binding, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);
