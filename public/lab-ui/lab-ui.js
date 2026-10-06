@@ -1343,12 +1343,16 @@
       if (s.docRef && s.docRef.setTitle && this._titleBase) s.docRef.setTitle(this._titleBase + (this._dirty ? ' •' : ''));
     }
     setTitle(t) { this._titleBase = t; this._mark(); }
+    // register('clock', {get, set}): a named block saved in the project's `extra` next to the tool's own
+    register(name, r) { if (!this._extras) this._extras = new Map(); this._extras.set(name, r); return () => this._extras.delete(name); }
     touch() { if (!this._ready || this._loading) return; this.modified = Date.now(); if (!this._dirty && !this._restoring) { this._dirty = true; this._mark(); } this.emit('dirty', { dirty: true }); clearTimeout(this._saveTimer); this._saveTimer = setTimeout(() => this.autosave(), this.autosaveMs); }
     serialise(o) {
       o = o || {};
       const out = { schema: 'lab-project@1', tool: this.tool, app: this.app, name: this.name, created: this.created, modified: this.modified,
         source: this.sourceDesc ? cloneV(this.sourceDesc) : null, params: this.pane.getState(), folds: this.pane.getFolds() };
-      if (this.o.extra && this.o.extra.get) out.extra = cloneV(this.o.extra.get());
+      const ex = (this.o.extra && this.o.extra.get) ? (cloneV(this.o.extra.get()) || {}) : {};
+      if (this._extras) for (const [k, r] of this._extras) { try { ex[k] = cloneV(r.get()); } catch (e) { console.warn('project extra ' + k + ':', e); } }
+      if (Object.keys(ex).length) out.extra = ex;
       if (this.shell && this.shell.viewer && this.shell.viewer.canvas) out.view = this.shell.viewer.getState();
       out.locks = [...this.pane.locks]; out.random = { seed: this.pane.seed | 0, rolls: this.pane.rolls | 0, deviation: this.pane.deviation != null ? this.pane.deviation : 0.25 };
       if (!o.noHistory) out.history = this.pane.history.serialise(o.historyN || 100);
@@ -1364,6 +1368,7 @@
         if (obj.params) this.pane.setState(obj.params, { noHistory: true, source: o.source || 'project' });
         if (obj.folds) this.pane.setFolds(obj.folds);
         if (obj.extra && this.o.extra && this.o.extra.set) this.o.extra.set(obj.extra);
+        if (obj.extra && this._extras) for (const [k, r] of this._extras) { if (obj.extra[k] != null) { try { r.set(obj.extra[k]); } catch (e) { console.warn('project extra ' + k + ':', e); } } }
         if (obj.view && this.shell && this.shell.viewer && this.shell.viewer.canvas) this.shell.viewer.setState(obj.view);
         if (Array.isArray(obj.locks)) this.pane.setLocks(obj.locks);
         if (obj.random) { this.pane.seed = obj.random.seed | 0; this.pane.rolls = obj.random.rolls | 0; if (obj.random.deviation != null) { this.pane.deviation = obj.random.deviation; if (this.pane._rand) { this.pane._rand.deviation = obj.random.deviation; this.pane.refresh(); } } }
@@ -1418,6 +1423,8 @@
       return desc;
     }
     updateSource(patch) { if (this.sourceDesc) { Object.assign(this.sourceDesc, patch); this.touch(); } }
+    // the File behind the current source (file sources only; null for samples, webcams and test cards)
+    sourceFile() { const d = this.sourceDesc; return (d && d.kind === 'file') ? (this._files.get(d.fp) || null) : null; }
     static fingerprint(f) { return [f.name, f.size, f.lastModified].join('|').replace(/[^\w.|-]+/g, '_'); }
     showRelink(d) {
       const s = this.shell; if (!s) return;

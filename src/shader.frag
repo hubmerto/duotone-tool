@@ -42,6 +42,7 @@ uniform sampler2D       u_blueNoise;         // 64x64 R8 void-and-cluster tile
 
 // ----- frame state --------------------------------------------------------------
 uniform vec2  u_resolution;
+uniform vec4  u_fit;                  // uv scale.xy + offset.zw of the picture inside the canvas
 uniform float u_time;
 uniform int   u_frame;
 
@@ -450,7 +451,8 @@ vec2 misregOffset(float drawing, float inkId) {   // rigid per-ink shift per dra
 // main
 // ============================================================================
 void main() {
-    vec2 uv = v_uv;
+    vec2 uv = v_uv * u_fit.xy + u_fit.zw;                       // placement fit: cover crops, contain letterboxes
+    bool outside = any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)));
     vec2 fragPx = gl_FragCoord.xy;
 
     vec2 warp;
@@ -534,5 +536,6 @@ void main() {
     float a = 1.0;
     if (u_alphaMode == 1) { a = cov;       rgb = clamp((rgb - u_shadowColor * (1.0 - a)) / max(a, 1e-3), 0.0, 1.0); }
     else if (u_alphaMode == 2) { a = 1.0 - cov; rgb = clamp((rgb - ink * (1.0 - a)) / max(a, 1e-3), 0.0, 1.0); }
+    if (outside) { rgb = u_shadowColor; a = (u_alphaMode == 1) ? 0.0 : 1.0; }   // letterbox is paper
     fragColor = vec4(rgb, a);
 }
