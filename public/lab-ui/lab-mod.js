@@ -20,7 +20,11 @@
   }
   const sliderOf = (pane, path) => { const b = pane.byPath(path); return (b && b.view === 'slider' && typeof b.opts.min === 'number' && typeof b.opts.max === 'number') ? b : null; };
   const rangeOf = (b) => (b.opts.max - b.opts.min) || 1;
-  const INTERPS = ['hold', 'linear', 'ease'];
+  const INTERPS = ['hold', 'linear', 'ease', 'bezier'];
+  const BEZIER_DEFAULT = [0.42, 0, 0.58, 1];
+  const BEZIER_PRESETS = { 'ease in': [0.42, 0, 1, 1], 'ease out': [0, 0, 0.58, 1], 'ease in out': [0.42, 0, 0.58, 1], 'snap': [0.9, 0, 0.1, 1], 'overshoot': [0.34, 1.56, 0.64, 1] };
+  // y for x on a CSS-style cubic bezier (0,0)-(x1,y1)-(x2,y2)-(1,1), bisection on x
+  function bezierY(k, h) { const [x1, y1, x2, y2] = h || BEZIER_DEFAULT; const bx = (t) => 3 * (1 - t) * (1 - t) * t * x1 + 3 * (1 - t) * t * t * x2 + t * t * t; const by = (t) => 3 * (1 - t) * (1 - t) * t * y1 + 3 * (1 - t) * t * t * y2 + t * t * t; let lo = 0, hi = 1, t = k; for (let i = 0; i < 24; i++) { t = (lo + hi) / 2; if (bx(t) < k) lo = t; else hi = t; } return by(t); }
 
   // ================================================================ Timeline: keys per path + the strip
   class Timeline extends Emitter {
@@ -43,6 +47,7 @@
         keys.bind('F6', '', () => this.setInterp('hold'), { label: 'Keys: hold' });
         keys.bind('F7', '', () => this.setInterp('linear'), { label: 'Keys: linear' });
         keys.bind('F8', '', () => this.setInterp('ease'), { label: 'Keys: ease' });
+        keys.bind('F9', '', () => this.editHandles(), { label: 'Keys: bezier handles' });
         keys.bind('KeyA', 'shift', () => this.setArmed(!this.armed), { label: 'Arm keyframe recording' });
       }
     }
@@ -57,7 +62,7 @@
       const a = ks[i - 1], b = ks[i]; if (typeof a.v !== 'number' || typeof b.v !== 'number') return a.v;
       const interp = b.i || 'linear';
       if (interp === 'hold') return a.v;
-      let k = (t - a.t) / Math.max(1e-9, b.t - a.t); if (interp === 'ease') k = k * k * (3 - 2 * k);
+      let k = (t - a.t) / Math.max(1e-9, b.t - a.t); if (interp === 'ease') k = k * k * (3 - 2 * k); else if (interp === 'bezier') k = bezierY(k, b.h);
       return a.v + (b.v - a.v) * k;
     }
     // overrides for one root at time t: {key: value}
@@ -84,9 +89,9 @@
       this._changed(); return true;
     }
     // undo / redo and project load land here
-    setKeysFor(path, arr) { this.keys[path] = (arr || []).map((k) => ({ t: +k.t, v: k.v, i: k.i || 'linear' })).sort((a, b) => a.t - b.t); this._changed(); }
+    setKeysFor(path, arr) { this.keys[path] = (arr || []).map((k) => { const o = { t: +k.t, v: k.v, i: k.i || 'linear' }; if (k.h) o.h = k.h.slice(0, 4).map(Number); return o; }).sort((a, b) => a.t - b.t); this._changed(); }
     clear(path) { if (path) delete this.keys[path]; else this.keys = {}; this.sel.clear(); this._changed(); }
-    getState() { const out = {}; this.paths.forEach((p) => { out[p] = this.keys[p].map((k) => ({ t: k.t, v: k.v, i: k.i })); }); return { keys: out, armed: this.armed, collapsed: this.collapsed }; }
+    getState() { const out = {}; this.paths.forEach((p) => { out[p] = this.keys[p].map((k) => { const o = { t: k.t, v: k.v, i: k.i }; if (k.h) o.h = k.h.slice(); return o; }); }); return { keys: out, armed: this.armed, collapsed: this.collapsed }; }
     setState(s) { if (!s) return; this.keys = {}; Object.keys(s.keys || {}).forEach((p) => this.setKeysFor(p, s.keys[p])); this.armed = !!s.armed; this.collapsed = !!s.collapsed; this._changed(); }
     _changed() { this.render(); this._markRows(); this.emit('change'); if (this.o.project) this.o.project.touch(); }
     // ---- actions
@@ -108,8 +113,35 @@
       if (best == null) { flash(dir > 0 ? 'no next key' : 'no previous key'); return; }
       this.clock.pause(); this.clock.seek(t + best * dir);
     }
-    setInterp(i) { if (!this.sel.size) { flash('select keys first'); return; } this.sel.forEach((id) => { const [p, ts] = id.split('@'); const k = (this.keys[p] || []).find((x) => String(x.t) === ts); if (k) k.i = i; }); flash('keys: ' + i); this._changed(); }
+    _selKeys() { const out = []; this.sel.forEach((id) => { const [p, ts] = id.split('@'); const k = (this.keys[p] || []).find((x) => String(x.t) === ts); if (k) out.push({ p, k }); }); return out; }
+    setInterp(i) { if (!this.sel.size) { flash('select keys first'); return; } this._selKeys().forEach(({ k }) => { k.i = i; if (i === 'bezier' && !k.h) k.h = BEZIER_DEFAULT.slice(); }); flash('keys: ' + i); this._changed(); }
+    // bezier handles of the selected keys: [x1, y1, x2, y2] in segment space (the key is the end of its segment)
+    setHandles(h) { const sel = this._selKeys(); if (!sel.length) { flash('select keys first'); return; } sel.forEach(({ k }) => { k.i = 'bezier'; k.h = h.slice(0, 4).map(Number); }); this._changed(); }
+    editHandles() {
+      const sel = this._selKeys(); if (!sel.length) { flash('select a key first'); return; }
+      const k = sel[0].k; const h = (k.h || BEZIER_DEFAULT).slice(); k.i = 'bezier'; k.h = h;
+      let box = this.el.querySelector('.lab-strip-bez'); if (box) box.remove();
+      box = el('div', 'lab-strip-bez'); const inputs = ['x1', 'y1', 'x2', 'y2'].map((n, i) => { const inp = el('input'); inp.type = 'number'; inp.step = '0.01'; inp.value = String(+h[i].toFixed(3)); inp.title = n; inp.addEventListener('change', () => { h[i] = clamp(+inp.value || 0, i % 2 ? -2 : 0, i % 2 ? 3 : 1); this.setHandles(h); }); inp.addEventListener('keydown', (e) => e.stopPropagation()); return inp; });
+      const presets = el('div', 'lab-widget lab-select'); const ps = el('select'); const op0 = el('option', null, 'preset…'); op0.value = ''; ps.appendChild(op0); Object.keys(BEZIER_PRESETS).forEach((n) => { const op = el('option', null, n); op.value = n; ps.appendChild(op); }); presets.appendChild(ps);
+      ps.addEventListener('change', () => { const v = BEZIER_PRESETS[ps.value]; if (!v) return; v.forEach((x, i) => { h[i] = x; inputs[i].value = String(x); }); this.setHandles(h); ps.value = ''; });
+      const close = el('button', 'lab-qx', '×'); close.type = 'button'; close.addEventListener('click', () => box.remove());
+      box.append(el('span', 'lab-tlabel', 'handles'), ...inputs, presets, close); this.el.appendChild(box); this._changed();
+    }
     deleteSelected() { if (!this.sel.size) return; const by = {}; this.sel.forEach((id) => { const [p, ts] = id.split('@'); (by[p] = by[p] || []).push(+ts); }); Object.keys(by).forEach((p) => { const before = cloneV(this.keys[p]); this.keys[p] = this.keys[p].filter((k) => !by[p].includes(k.t)); this._record(p, before, this.keys[p], 'Remove keys'); }); this.sel.clear(); this._changed(); }
+    // record paths as keys while the clock plays (a camera move): getter() returns {key: value} for the root, keys land every 1/rate s, then thin
+    recordPaths(paths, o) {
+      o = o || {}; if (this._recPaths) { this.stopRecord(); return false; }
+      if (!this.clock) return false; const rate = o.rate || 4; let last = -1e9;
+      const off = this.clock.on('time', () => { const t = this.clock.t; if (!this.clock.playing || t - last < 1 / rate - 1e-6) return; last = t; const vals = o.getter ? o.getter() : null; paths.forEach((p) => { const root = p.slice(0, p.indexOf('.')), key = p.slice(root.length + 1); let v = vals ? vals[key] : undefined; if (v == null) { const b = this.pane.byPath(p); v = b ? b.value : undefined; } if (typeof v === 'number') this.setKey(p, t, +v.toFixed(5), 'linear', { history: false }); }); });
+      this._recPaths = { paths, off, eps: o.eps != null ? o.eps : 0.002 }; this.clock.play(); flash('recording keys · press again to stop'); this.emit('record', { on: true, paths }); return true;
+    }
+    stopRecord() {
+      const r = this._recPaths; if (!r) return; this._recPaths = null; r.off(); this.clock.pause();
+      // thin: drop keys that linear interpolation of their neighbours already gives
+      r.paths.forEach((p) => { const ks = this.keys[p]; if (!ks || ks.length < 3) return; const keep = [ks[0]]; for (let i = 1; i < ks.length - 1; i++) { const a = keep[keep.length - 1], b = ks[i + 1], k = ks[i]; const lin = a.v + (b.v - a.v) * ((k.t - a.t) / Math.max(1e-9, b.t - a.t)); if (Math.abs(lin - k.v) > r.eps) keep.push(k); } keep.push(ks[ks.length - 1]); this.keys[p] = keep; });
+      flash('take: ' + r.paths.reduce((n, p) => n + (this.keys[p] || []).length, 0) + ' keys'); this._changed(); this.emit('record', { on: false, paths: r.paths });
+    }
+    get recording() { return !!this._recPaths; }
     setArmed(v) { this.armed = !!v; if (this._armBtn) this._armBtn.classList.toggle('on', this.armed); flash(this.armed ? 'arm: edits write keys' : 'arm off'); this.emit('arm', { armed: this.armed }); }
     // ---- row markers: filled diamond on a key, hollow while interpolating, none when unkeyed
     _markRows() {
@@ -169,7 +201,7 @@
       });
       lanes.addEventListener('contextmenu', (e) => {
         const d = e.target.closest('.lab-key'); if (!d) return; e.preventDefault(); const id = d.dataset.id; if (!this.sel.has(id)) { this.sel.clear(); this.sel.add(id); this.render(); }
-        LabUI.contextMenu(e.clientX, e.clientY, INTERPS.map((i) => ({ title: i, onClick: () => this.setInterp(i) })).concat([{ sep: true }, { title: 'Delete', danger: true, onClick: () => this.deleteSelected() }]));
+        LabUI.contextMenu(e.clientX, e.clientY, INTERPS.map((i) => ({ title: i, onClick: () => this.setInterp(i) })).concat([{ title: 'Bezier handles…', onClick: () => this.editHandles() }, { sep: true }, { title: 'Delete', danger: true, onClick: () => this.deleteSelected() }]));
       });
       doc.addEventListener('keydown', (e) => { if (!this.sel.size || (e.key !== 'Delete' && e.key !== 'Backspace')) return; const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return; e.preventDefault(); this.deleteSelected(); });
       this.render();
@@ -514,5 +546,40 @@
     }
   }
 
-  LabUI.Timeline = Timeline; LabUI.ModMatrix = ModMatrix; LabUI.Bake = Bake; LabUI.MidiLearn = MidiLearn; LabUI.Palette = Palette;
+  // ================================================================ Pins: alt+P mirrors a control into a Pinned folder at the top of the panel
+  class Pins extends Emitter {
+    constructor(pane, o) {
+      super(); o = o || {}; this.pane = pane; this.o = o; this.paths = []; this.mirrors = new Map(); this.folder = null;
+      pane.pins = this;
+      if (o.project && o.project.register) o.project.register('pins', { get: () => ({ paths: this.paths.slice() }), set: (s) => { this.clear(); ((s && s.paths) || []).forEach((p) => this.pin(p, { quiet: true })); } });
+      // keep mirror and original in step
+      pane.on('change', (ev) => { if (!ev || !ev.target || !ev.target.path) return; const p = ev.target.path; const m = this.mirrors.get(p); if (!m) return; const orig = pane.byPath(p); if (ev.target === m && orig) orig.refresh(); else if (ev.target === orig) m.refresh(); });
+      pane.on('state', () => this.mirrors.forEach((m) => m.refresh()));
+      if (o.keys !== false) keys.bind('KeyP', 'alt', () => this.toggleFocused(), { label: 'Pin / unpin the focused control' });
+    }
+    _folder() {
+      if (this.folder) return this.folder;
+      const f = this.pane.addFolder({ title: 'Pinned', expanded: true }); f.element.classList.add('lab-pinned');
+      const body = this.pane.body || this.pane.element; body.insertBefore(f.element, body.firstChild);
+      this.folder = f; return f;
+    }
+    toggleFocused() { const b = this.pane.focusedBinding(); if (!b || !b.path) { flash('focus a control, then alt+P'); return; } if (this.paths.includes(b.path)) this.unpin(b.path); else this.pin(b.path); }
+    pin(path, o) {
+      if (this.paths.includes(path)) return this.mirrors.get(path); const orig = this.pane.byPath(path); if (!orig) return null;
+      const f = this._folder(); const opts = Object.assign({}, orig.opts, { label: this.pane.pathLabel(path) || orig.label, hidden: false, inline: true });
+      delete opts.onChange; const m = f.addBinding(orig.obj, orig.key, opts); m.element.classList.add('lab-pin-row'); m._pinOf = path;
+      const x = el('button', 'lab-qx lab-pin-x', '×'); x.type = 'button'; x.title = 'unpin (alt+P)'; x.addEventListener('click', () => this.unpin(path)); m.element.appendChild(x);
+      this.paths.push(path); this.mirrors.set(path, m); this.pane._byPath = null;
+      if (!(o && o.quiet)) { flash('pinned ' + opts.label); if (this.o.project) this.o.project.touch(); } this.emit('change'); return m;
+    }
+    unpin(path, o) {
+      const m = this.mirrors.get(path); if (!m) return; m.element.remove(); const f = this.folder; if (f) f._children = f._children.filter((c) => c !== m);
+      this.mirrors.delete(path); this.paths = this.paths.filter((p) => p !== path); this.pane._byPath = null;
+      if (!this.paths.length && f) { f.element.remove(); this.pane._children = this.pane._children.filter((c) => c !== f); this.folder = null; }
+      if (!(o && o.quiet)) { flash('unpinned'); if (this.o.project) this.o.project.touch(); } this.emit('change');
+    }
+    clear() { this.paths.slice().forEach((p) => this.unpin(p, { quiet: true })); }
+  }
+
+  LabUI.Timeline = Timeline; LabUI.ModMatrix = ModMatrix; LabUI.Pins = Pins; LabUI.Bake = Bake; LabUI.MidiLearn = MidiLearn; LabUI.Palette = Palette;
 })(typeof window !== 'undefined' ? window : globalThis);

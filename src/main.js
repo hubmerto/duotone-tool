@@ -156,9 +156,9 @@ const hint        = document.getElementById('hint');
 const app = SPECIMEN ? null : window.LabUI.shell({
   title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
   menus: [
-    { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }] },
+    { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }, { sep: true }, { title: 'Reset looks and project…', icon: 'undo', onClick: () => window.boiler && window.boiler.resetLooks() }] },
     { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
-    { title: 'Control', items: [{ title: 'Command palette', kbd: '⌘K', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open() }, { title: 'Filter panel', kbd: '/', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open('filter') }, { sep: true }, { title: 'Key focused control', kbd: 'K', onClick: () => window.boiler && window.boiler.timeline.keyFocused() }, { title: 'Arm keyframes', kbd: '⇧A', onClick: () => window.boiler && window.boiler.timeline.setArmed(!window.boiler.timeline.armed) }, { sep: true }, { title: 'MIDI learn', kbd: '⇧M', onClick: () => window.boiler && window.boiler.midi.toggle() }] },
+    { title: 'Control', items: [{ title: 'Command palette', kbd: '⌘K', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open() }, { title: 'Filter panel', kbd: '/', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open('filter') }, { sep: true }, { title: 'Key focused control', kbd: 'K', onClick: () => window.boiler && window.boiler.timeline.keyFocused() }, { title: 'Arm keyframes', kbd: '⇧A', onClick: () => window.boiler && window.boiler.timeline.setArmed(!window.boiler.timeline.armed) }, { sep: true }, { title: 'MIDI learn', kbd: '⇧M', onClick: () => window.boiler && window.boiler.midi.toggle() }, { title: 'Pin focused control', kbd: '⌥P', onClick: () => window.boiler && window.boiler.pins.toggleFocused() }] },
     { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
     { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
   ],
@@ -1828,6 +1828,17 @@ mod.o.bake = bakeAudio; mod.o.bakeKey = () => { const d = project && project.sou
 if (project) { mod.o.project = project; project.register('mod', { get: () => mod.getState(), set: (st) => mod.setState(st) }); }
 const timeline = new window.LabUI.Timeline(pane, { clock, host: app ? app.view : null, project, tool: 'boiler' });
 const midi = new window.LabUI.MidiLearn(pane, { tool: 'boiler' });
+const pins = new window.LabUI.Pins(pane, { project });
+// wipe the saved looks, their thumbnails and the autosaved project, then start clean (MIDI maps stay)
+async function resetLooks(o) {
+  if (!(o && o.force) && !window.confirm('Delete your saved looks and the autosaved project, then reload?')) return false;
+  const LS = window.LabUI.LabStore;
+  const ks = await LS.keys('presets');
+  for (const k of ks) { if (String(k).startsWith('boiler:')) { await LS.del('presets', k); await LS.del('thumbs', k); } }
+  if (project) { project._ready = false; clearTimeout(project._saveTimer); await project.reset(); }
+  if (!(o && o.noReload)) window.location.reload();
+  return true;
+}
 const palette = app ? new window.LabUI.Palette(pane, { host: app.side, presets: window.__boilerLooks }) : null;
 
 // -----------------------------------------------------------------------------
@@ -1846,7 +1857,7 @@ if (typeof window !== 'undefined') {
   window.boiler = {
     params, sourceState, modulation, exportSettings, monitor,
     pane, mediaPicker, audioPicker, presetPicker, project,
-    clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, sig,
+    clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, pins, sig, resetLooks,
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {
