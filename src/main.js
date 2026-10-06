@@ -1746,8 +1746,15 @@ pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.
 pane.addRandomise();
 pane.addHistory();
 if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const CHANGELOG = [
+  { version: '1.1.0', date: '2026-10-07', notes: [
+    'Frames are the truth: the clock always sits on a whole frame, so seeking to a frame and playing into it evaluate keys and modulation identically.',
+    'Graph editor in the keys strip (alt+G): the lane as a curve with draggable keys and bezier handles, plus a speed view.',
+    'F9 easy ease, shift+F9 ease in, alt+F9 ease out; roving keys (alt+R) float in time so the value moves at constant speed.',
+    'Markers (M, [ and ] to jump): keys and in/out snap to them; right-click a marker on the range bar for in/out, rename, delete.',
+    'LFO and noise generators in the modulation matrix: rate, shape, phase, seed. Deterministic, nothing to bake.',
+  ] },
   { version: '1.0.0', date: '2026-10-06', notes: [
     'Named projects on disk (.labproj): New, Open, Open recent, Save, Save as. The window title shows the project and unsaved edits.',
     'Preferences: default frame rate, render folder, panel side, interface scale, autosave, confirm before discarding.',

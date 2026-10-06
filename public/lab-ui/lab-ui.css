@@ -1112,3 +1112,25 @@ canvas.lab-alpha{background-color:#2a2a2a;background-image:linear-gradient(45deg
 .lab-about-txt { font-size: 11px; color: #c4c4cc; }
 .lab-about-sys { margin-top: 6px; font: 10px/1.4 var(--lab-mono); color: #7c7e8a; word-break: break-word; }
 .lab-status .lab-version { min-width: 56px; font-family: var(--lab-mono); color: #9a9aa6; }
+
+/* ---- PR B: markers, roving keys, graph editor */
+.lab-range-marks { position: absolute; inset: 0; pointer-events: none; }
+.lab-range-mark { position: absolute; top: -4px; width: 0; height: 0; margin-left: -4px; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 6px solid #f0c04a; pointer-events: auto; cursor: context-menu; }
+.lab-lane-mark { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(240,192,74,.55); pointer-events: none; }
+.lab-key.rove { border-style: dashed; opacity: .85; }
+.lab-strip-head .lab-strip-graph.on, .lab-strip-head .lab-strip-speed.on { background: linear-gradient(#3d7ddc, #2b62c4); color: #fff; }
+.lab-gedit { position: relative; height: 96px; display: flex; border-top: 1px solid rgba(255,255,255,.08); background: linear-gradient(rgba(0,0,0,.45), rgba(0,0,0,.25)); }
+.lab-gedit-label { width: 96px; flex: none; padding: 4px 6px; box-sizing: border-box; font: 10px/1.3 var(--lab-mono); color: #c4c4cc; display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+.lab-gedit-label b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lab-gedit-label span { color: #8c8e9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lab-gedit svg { flex: 1 1 auto; height: 100%; min-width: 0; display: block; cursor: crosshair; touch-action: none; }
+.lab-gedit .lab-g-range { fill: rgba(61,125,220,.14); }
+.lab-gedit .lab-g-mark { stroke: rgba(240,192,74,.55); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.lab-gedit .lab-g-zero { stroke: rgba(255,255,255,.18); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.lab-gedit .lab-g-curve { fill: none; stroke: #9fd0ff; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.lab-gedit .lab-g-head { stroke: var(--lab-record); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
+.lab-gedit .lab-g-key { fill: #d4dbf0; stroke: #0a0b0f; stroke-width: 1; vector-effect: non-scaling-stroke; cursor: grab; }
+.lab-gedit .lab-g-key.sel { fill: var(--lab-accent); stroke: #fff; }
+.lab-gedit .lab-g-key.rove { stroke-dasharray: 2 2; }
+.lab-gedit .lab-g-hline { stroke: rgba(240,192,74,.8); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.lab-gedit .lab-g-handle { fill: #f0c04a; stroke: #0a0b0f; stroke-width: 1; vector-effect: non-scaling-stroke; cursor: move; }
