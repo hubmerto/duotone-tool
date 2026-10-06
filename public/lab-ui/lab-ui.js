@@ -113,6 +113,9 @@
       const onDbl = (e) => { if (o.readonly) return; e.preventDefault(); e.stopPropagation(); if (e.altKey && this.folder) this.folder.resetAll(); else this.reset(); };
       this._label.addEventListener('dblclick', onDbl);
       if (this._in) this._in.addEventListener('dblclick', onDbl);
+      const onLock = (e) => { if (!e.altKey || o.readonly) return; e.preventDefault(); e.stopPropagation(); this.locked = !this.locked; };
+      this._label.addEventListener('click', onLock);
+      if (this._in) this._in.addEventListener('click', onLock);
     }
     get label() { return this._label.textContent; }
     set label(t) { this._label.textContent = t; if (this._in) this._in.textContent = t; }
@@ -697,6 +700,7 @@
       keys.bind('KeyZ', 'mod+shift', () => this.history.redo(), { label: 'Redo' });
       keys.bind('KeyY', 'ctrl', () => this.history.redo(), { label: 'Redo' });
       this.element.addEventListener('focusin', (e) => { this._focusEl = e.target; });
+      this.on('state', (ev) => { if (ev.paths.some((p) => p.startsWith('bypass.'))) this._syncBypassUI(); });
       this.on('change', (ev) => { if (!ev || !ev.target || ev.last === false || ev.programmatic) return; const ps = (ev.target.statePaths ? ev.target.statePaths() : [ev.target.path]).filter(Boolean); if (ps.length) this._emitPaths(ps, 'control'); });
     }
     get expanded() { return true; }
@@ -990,10 +994,12 @@
           foot.append(lab, sel, grp, el('span', 'lab-spacer'));
           if (opts.footRight) { const r = el('span', 'lab-foot-right', opts.footRight); foot.appendChild(r); foot._right = r; }
           let cur = 'fit';
+          api._zoomSelect = se;
           const apply = (z) => {
             cur = z; se.value = String(z);
             const f = z === 'fit' ? 1 : z / 100;
-            view.style.setProperty('--lab-zoom', String(f)); view.classList.toggle('lab-zoomed', f !== 1);
+            if (api.viewer && api.viewer.canvas) api.viewer.setZoom(z === 'fit' ? 'fit' : f);
+            else { view.style.setProperty('--lab-zoom', String(f)); view.classList.toggle('lab-zoomed', f !== 1); }
             if (opts.onZoom) opts.onZoom(f, z);
           };
           se.addEventListener('change', () => apply(se.value === 'fit' ? 'fit' : +se.value));
@@ -1044,6 +1050,7 @@
         tbar.appendChild(b); return b;
       },
     };
+    api.viewer = new Viewer(api);
     lastShell = api;
     return api;
   }
@@ -1318,6 +1325,8 @@
       pane.on('change', (ev) => { if (ev && ev.last === false) return; this.touch(); });
       pane.history.on('change', () => this.touch());
       pane.on('fold', () => this.touch());
+      pane.on('locks', () => this.touch());
+      if (this.shell && this.shell.viewer) this.shell.viewer.on('view', () => this.touch());
       global.addEventListener('pagehide', () => this.flush());
       doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'hidden') this.flush(); });
       keys.bind('KeyS', 'mod', () => this.save(), { label: 'Save project' });
@@ -1340,6 +1349,8 @@
       const out = { schema: 'lab-project@1', tool: this.tool, app: this.app, name: this.name, created: this.created, modified: this.modified,
         source: this.sourceDesc ? cloneV(this.sourceDesc) : null, params: this.pane.getState(), folds: this.pane.getFolds() };
       if (this.o.extra && this.o.extra.get) out.extra = cloneV(this.o.extra.get());
+      if (this.shell && this.shell.viewer && this.shell.viewer.canvas) out.view = this.shell.viewer.getState();
+      out.locks = [...this.pane.locks]; out.random = { seed: this.pane.seed | 0, rolls: this.pane.rolls | 0, deviation: this.pane.deviation != null ? this.pane.deviation : 0.25 };
       if (!o.noHistory) out.history = this.pane.history.serialise(o.historyN || 100);
       return out;
     }
@@ -1353,6 +1364,9 @@
         if (obj.params) this.pane.setState(obj.params, { noHistory: true, source: o.source || 'project' });
         if (obj.folds) this.pane.setFolds(obj.folds);
         if (obj.extra && this.o.extra && this.o.extra.set) this.o.extra.set(obj.extra);
+        if (obj.view && this.shell && this.shell.viewer && this.shell.viewer.canvas) this.shell.viewer.setState(obj.view);
+        if (Array.isArray(obj.locks)) this.pane.setLocks(obj.locks);
+        if (obj.random) { this.pane.seed = obj.random.seed | 0; this.pane.rolls = obj.random.rolls | 0; if (obj.random.deviation != null) { this.pane.deviation = obj.random.deviation; if (this.pane._rand) { this.pane._rand.deviation = obj.random.deviation; this.pane.refresh(); } } }
         if (obj.history && !o.noHistory) this.pane.history.load(obj.history); else if (!o.keepHistory) this.pane.history.clear();
         this.sourceDesc = obj.source || null;
       } finally { this._loading = false; }
@@ -1691,5 +1705,229 @@
     },
   });
 
-  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, History, Project, LabStore, keys, flash, lerpState, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  // ================================================================ viewer: zoom, pan, probe, guides, compare
+  // shell.viewer.attach(canvas, { pane, source: () => ({el, w, h}) | null, fit: () => 'cover'|'contain', spacePan, hPan })
+  // keys: 0 fit, 1 100 %, 2 200 %, mod+wheel zooms about the cursor, middle-drag (or Space / H held) pans,
+  //       P probe (shift+click pins up to four), G guides (shift+G platform UI), \ held shows the source,
+  //       shift+\ stores the current output as B, Y wipes A against B (alt+Y swaps sides).
+  const GUIDES = [null, { name: '9:16', ar: 9 / 16 }, { name: '4:5', ar: 4 / 5 }, { name: '1:1', ar: 1 }, { name: 'title safe 90%', inset: 0.05 }, { name: 'action safe 93%', inset: 0.035 }];
+  class Viewer extends Emitter {
+    constructor(api) {
+      super(); this.api = api; this.view = api.view; this.canvas = null; this.o = {};
+      this.zoom = 'fit'; this.pan = { x: 0, y: 0 }; this.probe = { on: false, pins: [] }; this.guides = { mode: 0, ui: false }; this.compare = { mode: 'off', split: 0.5, swap: false, b: null };
+      const L = this.layer = el('div', 'lab-viewer-layer'); L.hidden = true;
+      this.cmp = el('canvas', 'lab-cmp'); this.cmpLabA = el('span', 'lab-cmp-label lab-cmp-a', 'A CURRENT'); this.cmpLabB = el('span', 'lab-cmp-label lab-cmp-b', 'SOURCE');
+      this.divider = el('div', 'lab-cmp-divider'); this.guideBox = el('div', 'lab-guides'); this.guideLab = el('span', 'lab-guides-label'); this.uiBox = el('div', 'lab-guides-ui'); this.pinBox = el('div', 'lab-pins');
+      this.guideBox.appendChild(this.guideLab); L.append(this.cmp, this.cmpLabA, this.cmpLabB, this.divider, this.guideBox, this.uiBox, this.pinBox);
+      this.view.appendChild(L);
+      this._raf = 0; this._drag = null; this._held = {};
+      this.divider.addEventListener('pointerdown', (e) => { e.preventDefault(); this.divider.setPointerCapture(e.pointerId); this._dragDiv = true; });
+      this.divider.addEventListener('pointermove', (e) => { if (!this._dragDiv) return; const r = this._rect(); this.compare.split = clamp((e.clientX - r.left) / r.width, 0.02, 0.98); this._layout(); });
+      const endDiv = () => { this._dragDiv = false; this.emit('view'); }; this.divider.addEventListener('pointerup', endDiv); this.divider.addEventListener('pointercancel', endDiv);
+    }
+    attach(canvas, o) {
+      this.canvas = canvas; this.o = o || {}; const v = this.view;
+      canvas.classList.add('lab-zoom-target');
+      // zoom about the cursor with mod+wheel; pan with the middle button, or a held Space / H
+      v.addEventListener('wheel', (e) => { if (!(e.ctrlKey || e.metaKey)) return; e.preventDefault(); const f = Math.pow(1.1, -e.deltaY / 100); this.setZoom((this.zoom === 'fit' ? this._fitFactor() : this.zoom) * f, e.clientX, e.clientY); }, { passive: false });
+      v.addEventListener('pointerdown', (e) => {
+        const held = (this.o.spacePan && this._held.Space) || (this.o.hPan && this._held.KeyH);
+        if (e.button === 1 || (e.button === 0 && held)) { e.preventDefault(); e.stopPropagation(); this._drag = { x: e.clientX, y: e.clientY, px: this.pan.x, py: this.pan.y }; v.setPointerCapture(e.pointerId); return; }
+        if (e.button === 0 && this.probe.on && e.shiftKey) { e.preventDefault(); e.stopPropagation(); this.addPin(e.clientX, e.clientY); }
+      }, true);
+      v.addEventListener('pointermove', (e) => {
+        if (this._drag) { this.pan.x = this._drag.px + (e.clientX - this._drag.x); this.pan.y = this._drag.py + (e.clientY - this._drag.y); this._applyTransform(); return; }
+        if (this.probe.on) this._probeAt(e.clientX, e.clientY);
+      });
+      const endDrag = (e) => { if (this._drag) { this._drag = null; try { v.releasePointerCapture(e.pointerId); } catch (_) {} this.emit('view'); } };
+      v.addEventListener('pointerup', endDrag); v.addEventListener('pointercancel', endDrag);
+      doc.addEventListener('keydown', (e) => {
+        if (inText(e.target) || e.metaKey || e.ctrlKey) return;
+        this._held[e.code] = true;
+        if (e.code === 'Backslash' && !e.repeat) { e.preventDefault(); if (e.shiftKey) this.captureB(); else if (this.compare.mode === 'off') this.setCompare('source'); }
+        if ((e.code === 'Space' && this.o.spacePan) || (e.code === 'KeyH' && this.o.hPan)) { if (e.target === v || v.contains(e.target) || e.target === doc.body) v.classList.add('lab-panning'); }
+      });
+      doc.addEventListener('keyup', (e) => {
+        this._held[e.code] = false;
+        if (e.code === 'Backslash' && this.compare.mode === 'source') this.setCompare('off');
+        if (e.code === 'Space' || e.code === 'KeyH') v.classList.remove('lab-panning');
+      });
+      keys.bind('Digit0', '', () => this.setZoom('fit'), { label: 'Zoom to fit' });
+      keys.bind('Digit1', '', () => this.setZoom(1), { label: 'Zoom 100%' });
+      keys.bind('Digit2', '', () => this.setZoom(2), { label: 'Zoom 200%' });
+      keys.bind('KeyP', '', () => this.setProbe(!this.probe.on), { label: 'Pixel probe' });
+      keys.bind('KeyG', '', () => this.setGuides((this.guides.mode + 1) % GUIDES.length), { label: 'Cycle guides' });
+      keys.bind('KeyG', 'shift', () => { this.guides.ui = !this.guides.ui; this._layout(); this.emit('view'); }, { label: 'Platform UI overlay' });
+      keys.bind('KeyY', '', () => this.setCompare(this.compare.mode === 'wipe' ? 'off' : 'wipe'), { label: 'Split wipe' });
+      keys.bind('KeyY', 'alt', () => { this.compare.swap = !this.compare.swap; this._layout(); this.emit('view'); }, { label: 'Swap wipe sides' });
+      if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => this._layout()).observe(canvas);
+      this._layout();
+      return this;
+    }
+    _rect() { return this.canvas.getBoundingClientRect(); }
+    _viewRect() { return this.view.getBoundingClientRect(); }
+    _dpr() { return global.devicePixelRatio || 1; }
+    _fitFactor() { return 1; }
+    // scale factor so that 1 output pixel = 1 device pixel at zoom 1
+    _factor(z) { if (z === 'fit') return 1; const c = this.canvas; const cssW = c.clientWidth || 1; return z * (c.width / this._dpr()) / cssW; }
+    setZoom(z, cx, cy) {
+      const c = this.canvas; if (!c) return;
+      if (z !== 'fit') z = clamp(+z || 1, 0.05, 16);
+      const s0 = this._factor(this.zoom), s1 = this._factor(z);
+      if (z === 'fit') { this.pan.x = 0; this.pan.y = 0; }
+      else if (cx != null) { const r = this._rect(); const ccx = r.left + r.width / 2, ccy = r.top + r.height / 2; const px = (cx - ccx) / s0, py = (cy - ccy) / s0; this.pan.x += (s0 - s1) * px; this.pan.y += (s0 - s1) * py; }
+      this.zoom = z; this._applyTransform(); this._layout();
+      const sel = this.api._zoomSelect; if (sel) { const v = z === 'fit' ? 'fit' : String(Math.round(z * 100)); if ([...sel.options].some((o) => o.value === v)) sel.value = v; }
+      this.emit('zoom', { zoom: z }); this.emit('view');
+    }
+    _applyTransform() { const c = this.canvas; if (!c) return; const s = this._factor(this.zoom); c.style.transform = (this.zoom === 'fit' && !this.pan.x && !this.pan.y) ? '' : `translate(${this.pan.x}px, ${this.pan.y}px) scale(${s})`; c.style.transformOrigin = '50% 50%'; this.view.classList.toggle('lab-zoomed', this.zoom !== 'fit'); }
+    fit() { this.setZoom('fit'); }
+    // canvas backing-pixel coordinates under a client point
+    toCanvas(cx, cy) { const r = this._rect(), c = this.canvas; return { x: Math.floor((cx - r.left) / r.width * c.width), y: Math.floor((cy - r.top) / r.height * c.height) }; }
+    readPixel(x, y) {
+      const c = this.canvas; if (!c || x < 0 || y < 0 || x >= c.width || y >= c.height) return null;
+      if (this.o.readPixel) return this.o.readPixel(x, y);
+      try { const t = this._rc || (this._rc = doc.createElement('canvas')); t.width = t.height = 1; const g = t.getContext('2d', { willReadFrequently: true }); g.clearRect(0, 0, 1, 1); g.drawImage(c, x, y, 1, 1, 0, 0, 1, 1); const d = g.getImageData(0, 0, 1, 1).data; return [d[0], d[1], d[2], d[3]]; } catch (_) { return null; }
+    }
+    static describe(x, y, px) { if (!px) return `x ${x} y ${y}  —`; const hex = '#' + [px[0], px[1], px[2]].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase(); const L = (0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]) / 255; return `x ${x} y ${y}  rgb ${px[0]} ${px[1]} ${px[2]}  ${hex}  L ${L.toFixed(2)}`; }
+    setProbe(on) { this.probe.on = !!on; this.view.classList.toggle('lab-probing', this.probe.on); if (!this.probe.on) this._status(''); else this._status('probe: move over the canvas · shift+click pins'); this._layout(); this.emit('view'); }
+    _probeAt(cx, cy) { const p = this.toCanvas(cx, cy); const px = this.readPixel(p.x, p.y); this.probe.last = { x: p.x, y: p.y, px }; this._status(Viewer.describe(p.x, p.y, px)); }
+    _status(text) { const s = this.api.status; let cell = s.querySelector('.lab-probe-cell'); if (!cell) { cell = el('span', 'lab-cell lab-probe-cell'); s.appendChild(cell); } cell.textContent = text; cell.hidden = !text; }
+    addPin(cx, cy) { const p = this.toCanvas(cx, cy); if (this.probe.pins.length >= 4) this.probe.pins.shift(); this.probe.pins.push({ x: p.x, y: p.y }); this._layout(); this.emit('view'); }
+    clearPins() { this.probe.pins = []; this._layout(); this.emit('view'); }
+    setGuides(mode) { this.guides.mode = clamp(mode | 0, 0, GUIDES.length - 1); this._layout(); flash(GUIDES[this.guides.mode] ? 'Guides: ' + GUIDES[this.guides.mode].name : 'Guides off'); this.emit('view'); }
+    // B: a still of the current output plus a named history snapshot of the state
+    captureB() {
+      const c = this.canvas; if (!c) return;
+      const b = doc.createElement('canvas'); b.width = c.width; b.height = c.height; try { b.getContext('2d').drawImage(c, 0, 0); } catch (_) { return; }
+      this._bImage = b; const snap = this.o.pane ? this.o.pane.history.snapshot('B') : null;
+      this.compare.b = { t: Date.now(), snapshot: snap ? snap.id : null, name: snap ? snap.name : 'B' };
+      flash('B stored: ' + (this.o.label ? this.o.label() : 'current state')); this._layout(); this.emit('view');
+    }
+    setCompare(mode) { this.compare.mode = mode; this._layout(); if (mode !== 'off') this._tick(); this.emit('compare', { mode }); this.emit('view'); }
+    _drawSource(g, w, h) {
+      const s = this.o.source ? this.o.source() : null; if (!s || !s.el) { g.fillStyle = '#000'; g.fillRect(0, 0, w, h); return false; }
+      const sw = s.w || s.el.videoWidth || s.el.naturalWidth || s.el.width || 1, sh = s.h || s.el.videoHeight || s.el.naturalHeight || s.el.height || 1;
+      const fit = this.o.fit ? this.o.fit() : 'contain'; const sa = sw / sh, ca = w / h; let dw = w, dh = h;
+      if (fit === 'cover' ? sa < ca : sa > ca) { dw = w; dh = w / sa; } else { dh = h; dw = h * sa; }
+      g.fillStyle = '#000'; g.fillRect(0, 0, w, h); try { g.drawImage(s.el, (w - dw) / 2, (h - dh) / 2, dw, dh); } catch (_) { return false; }
+      return true;
+    }
+    _tick() {
+      cancelAnimationFrame(this._raf); if (this.compare.mode === 'off') return;
+      const c = this.canvas, m = this.cmp; if (m.width !== c.width || m.height !== c.height) { m.width = c.width; m.height = c.height; }
+      const g = m.getContext('2d'); g.clearRect(0, 0, m.width, m.height);
+      const rightIsB = !this.compare.swap; const split = Math.round(this.compare.split * m.width);
+      if (this.compare.mode === 'source') { this._drawSource(g, m.width, m.height); }
+      else {
+        g.save(); if (rightIsB) g.rect(split, 0, m.width - split, m.height); else g.rect(0, 0, split, m.height); g.clip();
+        if (this._bImage) g.drawImage(this._bImage, 0, 0, m.width, m.height); else this._drawSource(g, m.width, m.height);
+        g.restore();
+      }
+      if (this.compare.mode === 'source' || !this._bImage) this._raf = requestAnimationFrame(() => this._tick());   // live source: keep drawing
+    }
+    _layout() {
+      const c = this.canvas, L = this.layer; if (!c) return;
+      const on = this.compare.mode !== 'off' || this.guides.mode > 0 || this.guides.ui || this.probe.pins.length > 0;
+      L.hidden = !on; if (!on) { this.guideBox.hidden = true; this.cmp.hidden = true; this.divider.hidden = true; return; }
+      const r = this._rect(), vr = this._viewRect();
+      L.style.left = (r.left - vr.left) + 'px'; L.style.top = (r.top - vr.top) + 'px'; L.style.width = r.width + 'px'; L.style.height = r.height + 'px';
+      // compare
+      const cm = this.compare.mode; this.cmp.hidden = cm === 'off'; this.divider.hidden = cm !== 'wipe'; this.cmpLabA.hidden = cm !== 'wipe'; this.cmpLabB.hidden = cm === 'off';
+      if (cm === 'wipe') { const x = this.compare.split * r.width; this.divider.style.left = x + 'px'; const nm = this.compare.b && this.compare.b.name; const bName = this._bImage ? 'B ' + (nm && nm !== 'B' ? nm.toUpperCase() : 'SNAPSHOT') : 'SOURCE'; if (this.compare.swap) { this.cmpLabB.textContent = bName; this.cmpLabB.style.left = '6px'; this.cmpLabB.style.right = 'auto'; this.cmpLabA.style.right = '6px'; this.cmpLabA.style.left = 'auto'; } else { this.cmpLabB.textContent = bName; this.cmpLabB.style.right = '6px'; this.cmpLabB.style.left = 'auto'; this.cmpLabA.style.left = '6px'; this.cmpLabA.style.right = 'auto'; } }
+      else if (cm === 'source') { this.cmpLabB.textContent = 'SOURCE'; this.cmpLabB.style.left = '6px'; this.cmpLabB.style.right = 'auto'; }
+      // guides
+      const gd = GUIDES[this.guides.mode]; this.guideBox.hidden = !gd;
+      if (gd) { let w = r.width, h = r.height, x = 0, y = 0; if (gd.ar) { if (r.width / r.height > gd.ar) { w = r.height * gd.ar; x = (r.width - w) / 2; } else { h = r.width / gd.ar; y = (r.height - h) / 2; } } else { x = r.width * gd.inset; y = r.height * gd.inset; w = r.width - 2 * x; h = r.height - 2 * y; }
+        Object.assign(this.guideBox.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' }); this.guideLab.textContent = gd.name; this.guideBox.dataset.ar = gd.ar ? gd.name : ''; }
+      // platform ui for 9:16: caption zone (bottom 24 %) and action column (right 14 %)
+      this.uiBox.hidden = !(this.guides.ui && gd && gd.ar === 9 / 16);
+      if (!this.uiBox.hidden) { const gb = this.guideBox.style; this.uiBox.innerHTML = ''; const cap = el('div', 'lab-ui-zone lab-ui-cap'), col = el('div', 'lab-ui-zone lab-ui-col'); const w = parseFloat(gb.width), h = parseFloat(gb.height), x = parseFloat(gb.left), y = parseFloat(gb.top); Object.assign(cap.style, { left: x + 'px', top: (y + h * 0.76) + 'px', width: w + 'px', height: h * 0.24 + 'px' }); Object.assign(col.style, { left: (x + w * 0.86) + 'px', top: (y + h * 0.45) + 'px', width: w * 0.14 + 'px', height: h * 0.31 + 'px' }); this.uiBox.append(cap, col); }
+      // pins
+      this.pinBox.innerHTML = ''; this.probe.pins.forEach((p, i) => { const px = this.readPixel(p.x, p.y); const d = el('div', 'lab-pin'); d.style.left = (p.x / c.width * r.width) + 'px'; d.style.top = (p.y / c.height * r.height) + 'px'; d.append(el('i'), el('span', null, (i + 1) + ' ' + (px ? `${px[0]} ${px[1]} ${px[2]}` : '—'))); this.pinBox.appendChild(d); });
+      if (this.probe.pins.length && !this._pinTimer) this._pinTimer = setInterval(() => { if (!this.probe.pins.length) { clearInterval(this._pinTimer); this._pinTimer = null; return; } this._layout(); }, 250);
+    }
+    getState() { return { zoom: this.zoom, pan: { x: this.pan.x, y: this.pan.y }, guides: { mode: this.guides.mode, ui: this.guides.ui }, pins: this.probe.pins.slice(), split: this.compare.split, swap: this.compare.swap }; }
+    setState(s) { if (!s) return; if (s.zoom != null) this.zoom = s.zoom; if (s.pan) this.pan = { x: +s.pan.x || 0, y: +s.pan.y || 0 }; if (s.guides) this.guides = { mode: s.guides.mode | 0, ui: !!s.guides.ui }; if (Array.isArray(s.pins)) this.probe.pins = s.pins.slice(0, 4); if (s.split != null) this.compare.split = clamp(+s.split, 0.02, 0.98); this.compare.swap = !!s.swap; this._applyTransform(); this._layout(); }
+  }
+
+  // ================================================================ folder ops: bypass / solo (identity values), lock, seeded randomise
+  function mulberry32(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  Object.assign(Folder.prototype, {
+    // declare what this folder contributes when bypassed: { 'root.key': identityValue }
+    setIdentity(map) {
+      const pn = this.pane; if (!pn) throw new Error('setIdentity needs a pane'); this.identity = map || {};
+      if (!pn._bypass) { pn._bypass = {}; }
+      if (!(this.title in pn._bypass)) pn._bypass[this.title] = false;
+      pn.track('bypass', pn._bypass);
+      if (!this._bypassWired) { this._bypassWired = true; this.head.addEventListener('click', (e) => { if (!e.altKey) return; e.preventDefault(); e.stopPropagation(); if (e.shiftKey) pn.solo(this); else this.bypass = !this.bypass; }, true); this.head.title = 'alt+click: bypass · alt+shift+click: solo'; }
+      pn._syncBypassUI(); return this;
+    },
+
+    // randomise the unlocked tracked bindings of this folder around their current values (deviation 1 = uniform over the range)
+    randomise(o) {
+      const pn = this.pane; if (!pn) return; o = o || {}; const dev = o.deviation != null ? o.deviation : pn.deviation; const rng = o.rng || pn.nextRng();
+      const flat = {}; const seen = new Set();
+      this.bindings().forEach((b) => { const p = b.path; if (!p || seen.has(p) || b.locked || b.opts.readonly) return; seen.add(p); const v = b.randomValue(rng, dev); if (v !== undefined && v !== b.value) flat[p] = v; });
+      if (!Object.keys(flat).length) return;
+      pn.setState(nest(flat), { label: 'Randomise ' + (this.title || 'folder') + ' ' + Math.round(dev * 100) + '%', source: 'random', kind: 'random' });
+    },
+  });
+  Object.defineProperty(Folder.prototype, 'bypass', {
+    get() { const pn = this.pane; return !!(pn && pn._bypass && pn._bypass[this.title]); },
+    set(v) { const pn = this.pane; if (!pn || !this.identity) return; pn.setState({ bypass: { [this.title]: !!v } }, { label: (v ? 'Bypass ' : 'Enable ') + this.title, source: 'bypass', kind: 'bypass' }); },
+  });
+  Object.defineProperty(Binding.prototype, 'locked', {
+    get() { return !!this._locked; },
+    set(v) { this._locked = !!v; this.element.classList.toggle('lab-locked', this._locked); const pn = this.pane; if (pn && this.path) { if (this._locked) pn.locks.add(this.path); else pn.locks.delete(this.path); pn.emit('locks', { path: this.path, locked: this._locked }); } },
+  });
+  Object.defineProperty(Pane.prototype, 'locks', { get() { if (!this._locks) this._locks = new Set(); return this._locks; } });
+  Object.assign(Binding.prototype, {
+    randomValue(rng, dev) {
+      const o = this.opts, cur = this.value; dev = clamp(dev == null ? 1 : dev, 0, 1);
+      if (this.view === 'slider') { const min = o.min, max = o.max; if (typeof min !== 'number' || typeof max !== 'number') return undefined; let v = dev >= 1 ? min + rng() * (max - min) : cur + (rng() * 2 - 1) * dev * (max - min); v = clamp(v, min, max); const st = o.step || 0; if (st > 0) v = Math.round(v / st) * st; return +v.toFixed(Math.min(10, decimals(st || 0.01) + 2)); }
+      if (this.view === 'list') { const opts = normalizeOptions(o.options); if (!opts.length) return undefined; if (dev < 1 && rng() > dev) return cur; return opts[Math.floor(rng() * opts.length)].value; }
+      if (this.view === 'checkbox') { if (dev < 1 && rng() > dev) return cur; return rng() < 0.5; }
+      if (this.view === 'color') { const rnd = '#' + Math.floor(rng() * 0xffffff).toString(16).padStart(6, '0'); return dev >= 1 ? rnd : lerpHex(String(cur), rnd, dev); }
+      return undefined;
+    },
+  });
+  Object.assign(Pane.prototype, {
+    _syncBypassUI() { const m = this._bypass || {}; this.folders().forEach((f) => { if (f.identity) f.element.classList.toggle('lab-bypassed', !!m[f.title]); }); this._eff = null; },
+    // overrides per root for the bypassed folders, cached until the next state event
+    _overrides() {
+      if (this._eff) return this._eff; const out = {}; const m = this._bypass || {};
+      this.folders().forEach((f) => { if (f.identity && m[f.title]) Object.keys(f.identity).forEach((p) => { const i = p.indexOf('.'); (out[p.slice(0, i)] = out[p.slice(0, i)] || {})[p.slice(i + 1)] = f.identity[p]; }); });
+      this._eff = out; return out;
+    },
+    bypassActive() { const m = this._bypass || {}; return Object.keys(m).some((k) => m[k]); },
+    // the object the renderer should read: the root itself when nothing is bypassed, else a copy with the identity values applied
+    effective(obj) { if (!this.bypassActive()) return obj; const r = this._rootName(obj); const ov = r && this._overrides()[r]; return ov ? Object.assign({}, obj, ov) : obj; },
+    getEffectiveState() { const s = this.getState(); const ov = this._overrides(); Object.keys(ov).forEach((r) => { if (s[r]) Object.assign(s[r], ov[r]); }); return s; },
+    solo(folder) {
+      const m = this._bypass || {}; const ids = this.folders().filter((f) => f.identity);
+      if (this._soloPrev && this._soloFolder === folder) { const prev = this._soloPrev; this._soloPrev = null; this._soloFolder = null; this.setState({ bypass: prev }, { label: 'Unsolo ' + folder.title, source: 'bypass', kind: 'bypass' }); return; }
+      if (!this._soloPrev) this._soloPrev = Object.assign({}, m); this._soloFolder = folder;
+      const next = {}; ids.forEach((f) => { next[f.title] = f !== folder; });
+      this.setState({ bypass: next }, { label: 'Solo ' + folder.title, source: 'bypass', kind: 'bypass' });
+    },
+    setLocks(paths) { const set = new Set(paths || []); this.bindings().forEach((b) => { const p = b.path; if (p) b.locked = set.has(p); }); },
+    nextRng() { this.rolls = (this.rolls | 0) + 1; return mulberry32(((this.seed | 0) ^ (this.rolls * 2654435761)) >>> 0); },
+    randomiseAll(o) { const flat = {}; const seen = new Set(); const dev = (o && o.deviation != null) ? o.deviation : this.deviation; const rng = this.nextRng(); this.bindings().forEach((b) => { const p = b.path; if (!p || seen.has(p) || b.locked || b.opts.readonly || !b.folder || !b.folder.title) return; seen.add(p); const v = b.randomValue(rng, dev); if (v !== undefined && v !== b.value) flat[p] = v; }); if (Object.keys(flat).length) this.setState(nest(flat), { label: 'Randomise all ' + Math.round(dev * 100) + '%', source: 'random', kind: 'random' }); },
+    // a Randomise folder (deviation, roll buttons) plus an RND action on every folder with tracked bindings
+    addRandomise(o) {
+      o = o || {}; if (this.deviation == null) this.deviation = o.deviation != null ? o.deviation : 0.25; if (this.seed == null) this.seed = (Math.random() * 0xffffffff) >>> 0;
+      const f = this.addFolder({ title: o.title || 'Randomise', expanded: o.expanded === true });
+      const R = this._rand = { deviation: this.deviation };
+      f.addBinding(R, 'deviation', { label: 'deviation', min: 0, max: 1, step: 0.01, format: (v) => Math.round(v * 100) + '%' }).on('change', (ev) => { this.deviation = ev.value; });
+      f.addButtons([{ title: 'roll folder', onClick: () => { const t = this.focusedFolder(); if (t) t.randomise(); else flash('Focus a control in a folder first'); } }, { title: 'roll all', onClick: () => this.randomiseAll() }], { cols: 2 });
+      f.addNote('alt+click a label to lock it · shift+R rolls the focused folder · alt+click a folder dot to bypass it, alt+shift to solo');
+      this.folders().forEach((x) => { if (x === f || !x.title || x.bindings().some((b) => !b.path) && !x.bindings().some((b) => b.path)) return; if (!x.bindings().some((b) => b.path)) return; if (x._rnd) return; const b = el('button', 'lab-rnd', 'rnd'); b.type = 'button'; b.title = 'randomise this folder (shift+R)'; b.addEventListener('click', (e) => { e.stopPropagation(); x.randomise(); }); x.headRight.appendChild(b); x._rnd = b; });
+      keys.bind('KeyR', 'shift', () => { const t = this.focusedFolder(); if (t) t.randomise(); else this.randomiseAll(); }, { label: 'Randomise focused folder' });
+      keys.bind('KeyB', '', () => { const t = this.focusedFolder(); if (t && t.identity) t.bypass = !t.bypass; }, { label: 'Bypass focused folder' });
+      return f;
+    },
+  });
+
+  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, Viewer, History, Project, LabStore, keys, flash, lerpState, mulberry32, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);
