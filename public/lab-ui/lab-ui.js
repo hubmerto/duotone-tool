@@ -1343,6 +1343,7 @@
       let d = s.brand.querySelector('.lab-dirty'); if (!d) { d = el('span', 'lab-dirty', '•'); d.title = 'unsaved changes'; s.brand.appendChild(d); }
       d.hidden = !this._dirty;
       if (s.docRef && s.docRef.setTitle && this._titleBase) s.docRef.setTitle(this._titleBase + (this._dirty ? ' •' : ''));
+      if (this.o.windowTitle !== false) doc.title = (this._dirty ? '• ' : '') + (this.name || 'Untitled') + ' — ' + this.app;
     }
     setTitle(t) { this._titleBase = t; this._mark(); }
     // register('clock', {get, set}): a named block saved in the project's `extra` next to the tool's own
@@ -1351,7 +1352,7 @@
     serialise(o) {
       o = o || {};
       const out = { schema: 'lab-project@1', tool: this.tool, app: this.app, name: this.name, created: this.created, modified: this.modified,
-        source: this.sourceDesc ? cloneV(this.sourceDesc) : null, params: this.pane.getState(), folds: this.pane.getFolds() };
+        source: this.sourceDesc ? cloneV(this.sourceDesc) : null, params: this.pane.getState(), folds: this.pane.getFolds(), version: { app: this.o.version || '', kit: VERSION } };
       const ex = (this.o.extra && this.o.extra.get) ? (cloneV(this.o.extra.get()) || {}) : {};
       if (this._extras) for (const [k, r] of this._extras) { try { ex[k] = cloneV(r.get()); } catch (e) { console.warn('project extra ' + k + ':', e); } }
       if (Object.keys(ex).length) out.extra = ex;
@@ -1448,38 +1449,73 @@
       const desc = Object.assign({}, d); this.setSource(desc, f);
       await this.o.source.restore(this.sourceDesc, f);
     }
-    fileName() { return (this.name || (this.sourceDesc && this.sourceDesc.name ? this.sourceDesc.name.replace(/\.[^.]+$/, '') : this.tool)) + '.' + this.tool + '.json'; }
-    async save() {
+    fileName() { return (this.name || (this.sourceDesc && this.sourceDesc.name ? this.sourceDesc.name.replace(/\.[^.]+$/, '') : this.tool)) + '.labproj'; }
+    static stripExt(n) { return String(n || '').replace(/\.labproj$|\.[^.]+\.json$|\.json$/i, ''); }
+    static get FILE_TYPES() { return [{ description: 'Lab project', accept: { 'application/json': ['.labproj', '.json'] } }]; }
+    async save(o) {
+      o = o || {};
       const json = JSON.stringify(this.serialise(), null, 1);
       if (global.showSaveFilePicker) {
         try {
-          if (!this._handle) this._handle = await global.showSaveFilePicker({ suggestedName: this.fileName(), types: [{ description: 'Lab project', accept: { 'application/json': ['.json'] } }] });
+          if (!this._handle || o.as) this._handle = await global.showSaveFilePicker({ suggestedName: this.fileName(), types: Project.FILE_TYPES });
           const w = await this._handle.createWritable(); await w.write(json); await w.close();
-          this.name = this._handle.name.replace(/\.[^.]+\.json$|\.json$/, '');
+          this.name = Project.stripExt(this._handle.name);
+          this._remember(this._handle);
         } catch (e) { if (e && e.name === 'AbortError') return false; this._handle = null; this._download(json); }
       } else this._download(json);
       this._dirty = false; this._mark(); flash('Saved ' + this.fileName()); this.emit('save', {}); this.autosave();
       return true;
     }
+    saveAs() { return this.save({ as: true }); }
+    // a fresh document: defaults, no source, no name; asks first when there are unsaved edits
+    async newProject(o) {
+      o = o || {};
+      if (this._dirty && !o.force && global.confirm && !global.confirm('Discard unsaved changes and start a new project?')) return false;
+      this._handle = null; this.name = ''; this.sourceDesc = null;
+      this._loading = true;
+      try { this.pane.setState(this.pane.getDefaults(), { noHistory: true, source: 'new' }); this.pane.history.clear(); if (this.o.extra && this.o.extra.set) { try { this.o.extra.set({}); } catch (_) {} } if (this._extras) for (const [k, r] of this._extras) { try { r.set(null); } catch (_) {} } }
+      finally { this._loading = false; }
+      if (this.o.onNew) { try { await this.o.onNew(); } catch (e) { console.warn(e); } }
+      this._dirty = false; this._mark(); this.emit('new', {}); flash('New project'); this.autosave();
+      return true;
+    }
+    // recent files: handles kept in the store (reopen needs a permission prompt); names only where handles cannot be stored
+    async _remember(handle) {
+      const name = Project.stripExt(handle && handle.name); if (!name) return;
+      const key = this.tool + ':recent:' + name; const rec = { name, t: Date.now(), tool: this.tool };
+      let ok = await LabStore.put('handles', key, Object.assign({ handle }, rec)); if (ok === null) ok = await LabStore.put('handles', key, rec);
+      const ks = await LabStore.keys('handles'); const mine = []; for (const k of ks) { if (String(k).startsWith(this.tool + ':recent:')) { const r = await LabStore.get('handles', k); if (r) mine.push({ k, r }); } }
+      mine.sort((a, b) => (b.r.t || 0) - (a.r.t || 0)); for (const m of mine.slice(8)) await LabStore.del('handles', m.k);
+      this.emit('recents', {});
+    }
+    async recents() { const ks = await LabStore.keys('handles'); const out = []; for (const k of ks) { if (String(k).startsWith(this.tool + ':recent:')) { const r = await LabStore.get('handles', k); if (r && r.name) out.push(r); } } return out.sort((a, b) => (b.t || 0) - (a.t || 0)); }
+    async openRecent(rec) {
+      if (!rec || !rec.handle) { flash('that file has no stored handle, use Open…'); return false; }
+      try { if (rec.handle.queryPermission && (await rec.handle.queryPermission({ mode: 'readwrite' })) !== 'granted') { if ((await rec.handle.requestPermission({ mode: 'readwrite' })) !== 'granted') return false; } const f = await rec.handle.getFile(); const ok = await this.loadFile(f); if (ok) { this._handle = rec.handle; this.name = Project.stripExt(rec.handle.name); this._mark(); this._remember(rec.handle); } return ok; }
+      catch (e) { flash('could not open ' + rec.name); console.warn(e); return false; }
+    }
+    async clearRecents() { const ks = await LabStore.keys('handles'); for (const k of ks) if (String(k).startsWith(this.tool + ':recent:')) await LabStore.del('handles', k); this.emit('recents', {}); }
     _download(json) { const a = el('a'); a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' })); a.download = this.fileName(); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
     async open() {
       let f = null;
-      if (global.showOpenFilePicker) { try { const [h] = await global.showOpenFilePicker({ types: [{ description: 'Lab project', accept: { 'application/json': ['.json'] } }] }); this._handle = h; f = await h.getFile(); } catch (_) { return false; } }
-      else { f = await new Promise((res) => { const i = el('input'); i.type = 'file'; i.accept = '.json,application/json'; i.onchange = () => res(i.files[0] || null); i.click(); }); }
+      if (this._dirty && global.confirm && !global.confirm('Discard unsaved changes and open another project?')) return false;
+      if (global.showOpenFilePicker) { try { const [h] = await global.showOpenFilePicker({ types: Project.FILE_TYPES }); this._handle = h; f = await h.getFile(); this._remember(h); } catch (_) { return false; } }
+      else { f = await new Promise((res) => { const i = el('input'); i.type = 'file'; i.accept = '.labproj,.json,application/json'; i.onchange = () => res(i.files[0] || null); i.click(); }); }
       if (!f) return false;
       return this.loadFile(f);
     }
     // returns false (quietly) when the file is not a project for this tool, so drop handlers can fall through to media
     async loadFile(f) {
-      if (!/\.json$/i.test(f.name)) return false;
+      if (!/\.(labproj|json)$/i.test(f.name)) return false;
       let obj; try { obj = JSON.parse(await f.text()); } catch (_) { return false; }
       if (!obj || obj.schema !== 'lab-project@1' || (obj.tool && obj.tool !== this.tool)) return false;
       this.pane.history.transaction('Open ' + f.name, () => this.load(obj, { keepHistory: true, noHistory: true, source: 'open' }), { kind: 'project' });
-      this.name = this.name || f.name.replace(/\.[^.]+\.json$|\.json$/, '');
+      this.name = Project.stripExt(f.name) || this.name;
       this._dirty = false; this._mark(); await this.restoreSource(); flash('Opened ' + f.name); this.autosave();
       return true;
     }
-    async reset() { clearTimeout(this._saveTimer); await LabStore.del('projects', this.key); }
+    // wipe the autosave; the project stays dormant until the next restore/load so a pagehide flush cannot resurrect it ({ live: true } keeps it armed)
+    async reset(o) { clearTimeout(this._saveTimer); this._saveTimer = null; if (!(o && o.live)) this._ready = false; await LabStore.del('projects', this.key); }
   }
 
   // ================================================================ preset grid: user layer and look URLs
@@ -1947,5 +1983,6 @@
     },
   });
 
-  global.LabUI = { Pane, Folder, Binding, PadControl, CurveControl, Viewer, History, Project, LabStore, keys, flash, normalizeOptions, contextMenu, lerpState, mulberry32, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
+  const VERSION = '1.0.0';
+  global.LabUI = { VERSION, Pane, Folder, Binding, PadControl, CurveControl, Viewer, History, Project, LabStore, keys, flash, normalizeOptions, contextMenu, lerpState, mulberry32, shell, dropTarget, fmt, el, enhance, icon, menubar, toolbar, bindTip, setLabel, ICONS };
 })(window);

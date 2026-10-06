@@ -155,13 +155,13 @@ const hint        = document.getElementById('hint');
 // where the canvas is positioned by the composite CSS instead.
 const app = SPECIMEN ? null : window.LabUI.shell({
   title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
-  menus: [
+  menus: (window.MENUS = [
     { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }, { sep: true }, { title: 'Reset looks and project…', icon: 'undo', onClick: () => window.boiler && window.boiler.resetLooks() }] },
-    { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }, { title: 'Save project…', icon: 'save', kbd: '⌘S', onClick: () => window.boiler && window.boiler.project && window.boiler.project.save() }, { title: 'Open project…', icon: 'folder', kbd: '⌘O', onClick: () => window.boiler && window.boiler.project && window.boiler.project.open() }] },
+    { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }] },
     { title: 'Control', items: [{ title: 'Command palette', kbd: '⌘K', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open() }, { title: 'Filter panel', kbd: '/', onClick: () => window.boiler && window.boiler.palette && window.boiler.palette.open('filter') }, { sep: true }, { title: 'Key focused control', kbd: 'K', onClick: () => window.boiler && window.boiler.timeline.keyFocused() }, { title: 'Arm keyframes', kbd: '⇧A', onClick: () => window.boiler && window.boiler.timeline.setArmed(!window.boiler.timeline.armed) }, { sep: true }, { title: 'MIDI learn', kbd: '⇧M', onClick: () => window.boiler && window.boiler.midi.toggle() }, { title: 'Pin focused control', kbd: '⌥P', onClick: () => window.boiler && window.boiler.pins.toggleFocused() }] },
     { title: 'Playback', items: [{ title: 'Play / pause', icon: 'play', kbd: 'space', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { title: 'Replay intro', icon: 'reset', click: '#bReplay' }, { title: 'Trigger two-layer now', icon: 'bolt', click: '#bTrigger' }] },
     { title: 'Export', items: [{ title: 'Record', icon: 'record', click: '#bRecord' }, { sep: true }, { title: 'Reset to default', icon: 'undo', click: '#bResetDefault' }] },
-  ],
+  ]),
   tools: [
     [{ icon: 'folder', tip: 'Pick file (video / image)', click: '#bPick' }, { icon: 'sample', tip: 'Use sample', click: '#bSample' }, { icon: 'restart', tip: 'Start over (video + song)', click: '#bStartOver' }],
     [{ icon: 'play', text: 'pause', tip: 'Play / pause', kbd: 'space', key: 'play', onClick: () => window.__labTogglePlay && window.__labTogglePlay() }, { icon: 'reset', tip: 'Replay intro', click: '#bReplay' }, { icon: 'bolt', tip: 'Trigger two-layer now', click: '#bTrigger' }],
@@ -1746,7 +1746,19 @@ pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.
 pane.addRandomise();
 pane.addHistory();
 if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
-const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app, lookExclude: LOOK_EXCLUDE,
+const APP_VERSION = '1.0.0';
+const CHANGELOG = [
+  { version: '1.0.0', date: '2026-10-06', notes: [
+    'Named projects on disk (.labproj): New, Open, Open recent, Save, Save as. The window title shows the project and unsaved edits.',
+    'Preferences: default frame rate, render folder, panel side, interface scale, autosave, confirm before discarding.',
+    'Keyframes with hold, linear, ease and bezier handles; arm mode; a strip above the transport.',
+    'Modulation matrix replaces the fixed routing table; audio bands, onsets and camera motion route to any slider; baked for offline renders.',
+    'Clock with in/out and loop, placements with cover / contain, a render queue, byte-identical offline renders with the Two Layer machine simulated per frame.',
+    'MIDI learn with soft takeover, command palette (⌘K), panel filter (/), pinned rows (⌥P), reset looks.',
+    'Looks with live thumbnails, look links, A/B compare, probe, guides, lock and randomise, folder bypass.',
+  ] },
+];
+const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app, lookExclude: LOOK_EXCLUDE, version: APP_VERSION, onNew: () => { clock.clearRange(); clock.setFps(window.LabUI.prefs ? window.LabUI.prefs.get('fps') : 30); restartEffect(); },
   source: {
     restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadImageFromFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
     label: (d) => (d.name || d.kind) + (d.w ? ` (${d.w}×${d.h}${d.duration ? ' · ' + d.duration.toFixed(1) + 's' : ''})` : ''),
@@ -1799,7 +1811,7 @@ const renderer_ = {
 if (app && app.docRef && app.docRef.foot) clock.transport(app.docRef.foot);
 if (project) project.register('clock', { get: () => clock.getState(), set: (s) => clock.setState(s) });
 const renderUI = app ? window.LabUI.Render.folder(pane, { tool: 'boiler', renderer: renderer_, clock, project, srcAspect }) : null;
-clock.on('range', () => { if (project) project.touch(); });
+clock.on('range', (ev) => { if (project && !(ev && ev.silent)) project.touch(); });
 // keys, modulation bake, MIDI, palette (lab-mod.js)
 pane.clock = clock;
 const pct = (path, abs) => { const b = pane.byPath(path); return b && typeof b.opts.max === 'number' ? Math.round(abs / ((b.opts.max - b.opts.min) || 1) * 100) : 0; };
@@ -1835,11 +1847,13 @@ async function resetLooks(o) {
   const LS = window.LabUI.LabStore;
   const ks = await LS.keys('presets');
   for (const k of ks) { if (String(k).startsWith('boiler:')) { await LS.del('presets', k); await LS.del('thumbs', k); } }
-  if (project) { project._ready = false; clearTimeout(project._saveTimer); await project.reset(); }
+  if (project) await project.reset();
   if (!(o && o.noReload)) window.location.reload();
   return true;
 }
 const palette = app ? new window.LabUI.Palette(pane, { host: app.side, presets: window.__boilerLooks }) : null;
+const appApi = app ? window.LabUI.app({ shell: app, pane, project, tool: 'boiler', name: 'Boiler Eggs', version: APP_VERSION, menus: window.MENUS, changelog: CHANGELOG,
+  shortcuts: [['H + drag', 'pan'], ['⌘ + wheel', 'zoom view'], ['\\ hold', 'show the source'], ['⇧\\', 'capture B for compare'], ['Y', 'wipe A/B'], ['P', 'pixel probe'], ['G', 'guides'], ['B', 'bypass folder'], ['⇧R', 'randomise']] }) : null;
 
 // -----------------------------------------------------------------------------
 // boot
@@ -1857,7 +1871,7 @@ if (typeof window !== 'undefined') {
   window.boiler = {
     params, sourceState, modulation, exportSettings, monitor,
     pane, mediaPicker, audioPicker, presetPicker, project,
-    clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, pins, sig, resetLooks,
+    clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, pins, sig, resetLooks, appApi,
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {
@@ -1888,7 +1902,7 @@ window.addEventListener('resize', resize);
 resize();
 video.addEventListener('loadedmetadata', resize);
 video.addEventListener('loadedmetadata', () => { if (project) project.updateSource({ w: video.videoWidth, h: video.videoHeight, duration: isFinite(video.duration) ? video.duration : undefined }); });
-if (project) project.restore({ migrate: migrateLocalStorage }).then(() => { window.__boiler.refreshVis(); });
+if (project) project.restore({ migrate: migrateLocalStorage }).then((restored) => { if (!restored) clock.setFps(window.LabUI.prefs.get('fps'), { silent: true }); window.__boiler.refreshVis(); });
 
 // rVFC chain — registers a callback that fires once per real video frame.
 // Chain re-registers itself inside the callback. The chain stays alive across
