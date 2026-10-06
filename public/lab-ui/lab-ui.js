@@ -371,7 +371,7 @@
   class PadControl extends Control {
     constructor(parent, obj, xKey, yKey, o) {
       o = o || {};
-      const row = el('div', 'lab-row lab-full');
+      const row = el('div', o.half ? 'lab-row lab-half' : 'lab-row lab-full');   // half: one column of a cols:2 body
       super(parent, row);
       this.obj = obj; this.xKey = xKey; this.yKey = yKey; this.opts = o;
       const pad = el('div', 'lab-pad'); row.appendChild(pad);

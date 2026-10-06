@@ -885,3 +885,11 @@ html.lab-root, html.lab-root body { height: 100%; }
 
 /* no hint line under the canvas; shortcuts belong in the menus */
 .lab-hint { display: none; }
+.lab-row.lab-half { grid-column: auto; min-width: 0; display: block; }
+.lab-row.lab-half[hidden] { display: none; }
+.lab-row.lab-half .lab-pad { height: 96px; width: 100%; }
+.lab-row.lab-half .lab-pad-title { display: none; }
+.lab-row.lab-half .lab-pad-x { top: 4px; bottom: auto; }
+.lab-row.lab-half .lab-pad-ax { font-size: 8px; max-width: 46%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lab-row.lab-half .lab-pad-y { text-align: left; } .lab-row.lab-half .lab-pad-x { text-align: right; }
+.lab-row.lab-full .lab-pad { width: 100%; }
