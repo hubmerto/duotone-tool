@@ -150,11 +150,10 @@ const video       = document.getElementById('source-video');
 const videoB      = document.getElementById('source-video-b');
 const imageEl     = document.getElementById('source-image');
 const dropOverlay = document.getElementById('dropzone-overlay');
-const hint        = document.getElementById('hint');
 // lab-ui shell: top bar, properties column, viewport. Skipped in specimen mode,
 // where the canvas is positioned by the composite CSS instead.
 const app = SPECIMEN ? null : window.LabUI.shell({
-  title: 'BOILER EGGS', subtitle: 'boiling-threshold duotone', side: 'right', view: canvas,
+  title: 'BOILER EGGS', side: 'right', view: canvas,
   menus: (window.MENUS = [
     { title: 'File', items: [{ title: 'Pick file… (video / image)', icon: 'folder', click: '#bPick' }, { title: 'Use sample', icon: 'sample', click: '#bSample' }, { title: 'Start over (video + song)', icon: 'restart', click: '#bStartOver' }, { sep: true }, { title: 'Pick audio file…', icon: 'audio', click: '#bAudioPick' }, { title: 'Start / stop webcam', icon: 'webcam', click: '#bCamToggle' }, { sep: true }, { title: 'Reset looks and project…', icon: 'undo', onClick: () => window.boiler && window.boiler.resetLooks() }] },
     { title: 'Edit', items: [{ title: 'Undo', icon: 'undo', kbd: '⌘Z', onClick: () => window.boiler && window.boiler.pane.history.undo() }, { title: 'Redo', kbd: '⇧⌘Z', onClick: () => window.boiler && window.boiler.pane.history.redo() }, { sep: true }, { title: 'Copy look link', icon: 'link', kbd: '⇧⌘C', onClick: () => window.boiler && window.boiler.project && window.boiler.project.copyLook() }] },
@@ -171,9 +170,8 @@ const app = SPECIMEN ? null : window.LabUI.shell({
   ],
 });
 if (app) {
-  app.hint('drop a video, image or audio file anywhere · <kbd>space</kbd> play / pause');
   app.docRef = app.doc({ title: 'Boiler Eggs – sample', right: '', unit: 50, zoom: true });
-  app.setStatus([{ text: 'GLSL ES 300 · single pass', id: 'lab-status-left' }, { spacer: true }, { text: '', id: 'sbRes', cell: true }, { text: 'Boiler Eggs', cell: true }]);
+  app.setStatus([{ text: '', id: 'lab-status-left' }, { spacer: true }, { text: '', id: 'sbRes', cell: true }]);
 }
 
 // Which source the texture is currently bound to. Video uploads each frame;
@@ -1715,17 +1713,6 @@ window.addEventListener('drop', (e) => {
   });
 });
 
-// fade out hint after 3s
-setTimeout(() => {
-  hint.classList.remove('visible');
-  hint.classList.add('hidden');
-}, 3000);
-
-// dismiss hint on first interaction
-window.addEventListener('pointerdown', () => {
-  hint.classList.remove('visible');
-  hint.classList.add('hidden');
-}, { once: true });
 
 // state layer: roots, history folder, project (autosave to IndexedDB, restore, re-link, save / open)
 pane.track('params', params);

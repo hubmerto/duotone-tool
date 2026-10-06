@@ -192,13 +192,16 @@
       const arm = btn('lab-strip-arm', 'arm', 'Arm: edits at the playhead write keys (shift+A)'); this._armBtn = arm; arm.addEventListener('click', () => this.setArmed(!this.armed));
       const k = btn('', 'K', 'Key the focused control (K)'); k.addEventListener('click', () => this.keyFocused());
       const prev = btn('', '‹', 'Previous key (alt+,)'), next = btn('', '›', 'Next key (alt+.)'); prev.addEventListener('click', () => this.jump(-1)); next.addEventListener('click', () => this.jump(1));
-      const sel = el('div', 'lab-widget lab-select lab-strip-interp'); const se = el('select'); INTERPS.forEach((i) => { const op = el('option', null, i); op.value = i; se.appendChild(op); }); sel.appendChild(se); se.addEventListener('change', () => this.setInterp(se.value)); sel.title = 'interpolation of the selected keys (F6 hold · F7 linear · F8 ease)';
+      const sel = el('div', 'lab-widget lab-select lab-strip-interp'); const se = el('select'); const op0 = el('option', null, 'interp'); op0.value = ''; op0.disabled = true; se.appendChild(op0); INTERPS.forEach((i) => { const op = el('option', null, i); op.value = i; se.appendChild(op); }); sel.appendChild(se); se.addEventListener('change', () => { if (se.value) this.setInterp(se.value); }); sel.title = 'interpolation of the selected keys (F6 hold · F7 linear · F8 ease · F9 easy ease)'; this._interpSel = se;
       const del = btn('', '×', 'Delete selected keys (Delete)'); del.addEventListener('click', () => this.deleteSelected());
       const count = el('span', 'lab-strip-count'); this._count = count;
       const fold = btn('lab-strip-fold', '▾', 'Collapse the strip'); fold.addEventListener('click', () => { this.collapsed = !this.collapsed; this.render(); });
       const graph = btn('lab-strip-graph', 'graph', 'Graph editor: the selected lane as a curve (alt+G)'); this._graphBtn = graph; graph.addEventListener('click', () => this.toggleGraph());
       const speed = btn('lab-strip-speed', 'speed', 'Graph shows speed (value per second) instead of value'); this._speedBtn = speed; speed.addEventListener('click', () => { this.graphMode = this.graphMode === 'speed' ? 'value' : 'speed'; this.render(); });
-      head.append(title, arm, k, el('div', 'lab-tgroup'), prev, next, sel, del, graph, speed, count, el('span', 'lab-spacer'), fold);
+      const sep = () => el('i', 'lab-tsep');
+      const gNav = el('div', 'lab-tgroup'); gNav.append(k, prev, next);
+      const gGraph = el('div', 'lab-tgroup'); gGraph.append(graph, speed);
+      head.append(title, arm, sep(), gNav, sep(), sel, del, sep(), gGraph, el('span', 'lab-spacer'), count, fold);
       const lanes = el('div', 'lab-strip-lanes'); this._lanes = lanes;
       const headLine = el('div', 'lab-strip-headline'); this._headLine = headLine;
       lanes.appendChild(headLine);
@@ -249,7 +252,7 @@
       const paths = this.paths; const s = this.el;
       s.classList.toggle('lab-strip-empty', !paths.length); s.classList.toggle('collapsed', this.collapsed);
       this._armBtn.classList.toggle('on', this.armed);
-      if (this._count) this._count.textContent = paths.length ? paths.reduce((n, p) => n + this.keys[p].length, 0) + ' keys' : 'no keys · K on a focused control';
+      if (this._count) this._count.textContent = paths.length ? paths.reduce((n, p) => n + this.keys[p].length, 0) + ' keys' : '';
       const lanes = this._lanes; [...lanes.querySelectorAll('.lab-lane')].forEach((n) => n.remove());
       const dur = Math.max(1e-6, this.clock ? this.clock.duration : 10);
       const beat = this.clock && this.clock.beat; const grid = (beat && beat.bpm) ? beat : null;
@@ -263,7 +266,8 @@
         this.keys[p].forEach((k) => { const d = el('b', 'lab-key lab-key-' + (k.i || 'linear') + (k.r ? ' rove' : '')); d.style.left = (k.t / dur * 100) + '%'; d.dataset.id = p + '@' + k.t; d.dataset.t = String(k.t); d.title = (this.clock ? this.clock.timecode(k.t) : k.t.toFixed(2)) + ' · ' + (typeof k.v === 'number' ? +k.v.toFixed(4) : k.v) + ' · ' + (k.i || 'linear') + (k.r ? ' · roving' : ''); if (this.sel.has(d.dataset.id)) d.classList.add('sel'); track.appendChild(d); });
         lane.appendChild(track); lanes.appendChild(lane);
       });
-      if (this._graphBtn) this._graphBtn.classList.toggle('on', this.graph); if (this._speedBtn) { this._speedBtn.classList.toggle('on', this.graphMode === 'speed'); this._speedBtn.hidden = !this.graph; }
+      if (this._graphBtn) this._graphBtn.classList.toggle('on', this.graph); if (this._speedBtn) { this._speedBtn.classList.toggle('on', this.graphMode === 'speed'); this._speedBtn.style.display = this.graph ? '' : 'none'; }
+      if (this._interpSel) { const sk = this._selKeys(); const same = sk.length && sk.every(({ k }) => (k.i || 'linear') === (sk[0].k.i || 'linear')) ? (sk[0].k.i || 'linear') : ''; this._interpSel.value = same; }
       let old = lanes.querySelector('.lab-gedit'); let gh = 0;
       if (this.graph && paths.length) { if (!this.graphPath || !this.keys[this.graphPath] || !this.keys[this.graphPath].length) this.graphPath = this._graphTarget(); if (old && old.dataset.path !== this.graphPath) { old.remove(); old = null; } const g = this._renderGraph(this.graphPath, dur, old); if (g) { if (!g.isConnected) lanes.appendChild(g); gh = GRAPH_H; } else if (old) old.remove(); }
       else if (old) old.remove();
@@ -477,7 +481,7 @@
       const dstOptions = () => pane.bindings().filter((b) => b.path && b.view === 'slider' && typeof b.opts.min === 'number' && typeof b.opts.max === 'number' && !b.opts.readonly && !/^(mod|keys|render)\./.test(b.path)).map((b) => [b.path, pane.pathLabel(b.path)]);
       const rebuild = () => {
         list.textContent = '';
-        if (!this.routes.length) list.appendChild(el('div', 'lab-route-empty', 'no routes · + route, or right-click a slider → modulate by…'));
+        if (!this.routes.length) list.appendChild(el('div', 'lab-route-empty', 'no routes'));
         this.routes.forEach((r) => {
           const row = el('div', 'lab-route');
           const line = el('div', 'lab-route-line');
@@ -502,7 +506,7 @@
       btns.buttons.bake.addEventListener('click', () => this.ensureBaked({ force: true }));
       this._recBtn = btns.buttons.rec; btns.buttons.rec.classList.add('lab-rec');
       btns.buttons.rec.addEventListener('click', () => { const live = [...this.sources.values()].filter((s) => s.recordable); if (!live.length) { flash('no recordable source (camera / mic)'); return; } this.record(this._rec ? this._rec.id : live[0].id); });
-      this._bakeStat = f.addStatus(this.o.bake ? 'not baked · offline renders read baked tracks' : '');
+      this._bakeStat = f.addStatus('');
       // right-click a slider → modulate by…
       pane.element.addEventListener('contextmenu', (e) => {
         const row = e.target.closest('.lab-row'); if (!row) return; const b = pane.bindings().find((x) => x.element === row); if (!b || b.view !== 'slider' || !b.path || !this.sources.size) return;

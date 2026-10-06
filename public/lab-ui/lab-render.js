@@ -75,9 +75,9 @@
         if (this.rangeSet && t >= this.out) {
           if (this.loop) t = this.in + ((t - this.in) % Math.max(1e-6, this.out - this.in));
           else { t = this.out; this.playing = false; this.emit('play'); }
-        } else if (!this.rangeSet && this.media && t >= this.duration) {   // media without its own transport (a looping video): the clock wraps with it, so every played frame is one a seek can reach
+        } else if (!this.rangeSet && t >= this.duration) {   // no range: wrap at the duration (loop) or stop there, so every played frame is one a seek can reach
           if (this.loop) t = t % Math.max(1e-6, this.duration); else { t = this.duration; this.playing = false; this.emit('play'); }
-        } else if (!this.rangeSet && !this.loop && t >= this.length) { t = this.length; this.playing = false; this.emit('play'); }   // free-running + loop: no wrap, no seam
+        }
         this._acc = t; this.t = this.quantise(t);
       }
       this.emit('time');
@@ -135,10 +135,12 @@
       const bLoop = btn('lab-tp-loop', '<path d="M17 4l3 3-3 3M7 20l-3-3 3-3M20 7H9a4 4 0 0 0-4 4v1M4 17h11a4 4 0 0 0 4-4v-1"/>', 'Loop the range', 'L');
       const bMark = el('div', 'lab-tgroup'); const bI = el('button', 'lab-tool lab-tp-txt', 'I'), bO = el('button', 'lab-tool lab-tp-txt', 'O'); bI.type = bO.type = 'button'; LabUI.bindTip(bI, 'Set in at playhead', 'I'); LabUI.bindTip(bO, 'Set out at playhead', 'O'); bMark.append(bI, bO);
       const fpsW = el('div', 'lab-widget lab-select lab-tp-fps'); const fpsS = el('select'); [24, 25, 30, 50, 60].forEach((f) => { const op = el('option', null, f + ' fps'); op.value = String(f); fpsS.appendChild(op); }); fpsW.appendChild(fpsS); fpsW.title = 'frame rate of the clock and of renders';
-      root.append(grp, tc, dur, bar, bMark, bLoop, fpsW);
+      const sep = () => el('i', 'lab-tsep');
+      const right = el('div', 'lab-tp-right'); right.append(bMark, bLoop, fpsW);
+      root.append(grp, tc, dur, sep(), bar, sep(), right);
       host = host || doc.body;
       const spacer = host.querySelector && host.querySelector(':scope > .lab-spacer');
-      if (spacer) host.insertBefore(root, spacer); else host.appendChild(root);
+      if (spacer) { host.insertBefore(sep(), spacer); host.insertBefore(root, spacer); } else host.appendChild(root);
       const playSvg = () => { bPlay.innerHTML = '<svg viewBox="0 0 24 24">' + (self.playing ? '<path d="M8 5v14M16 5v14"/>' : '<path d="M7 4l12 8-12 8z"/>') + '</svg>'; bPlay.classList.toggle('on', self.playing); };
       const drawRange = () => {
         const d = Math.max(1e-6, self.duration); const a = self.rangeSet ? self.in / d : 0, b = self.rangeSet ? self.out / d : 1;
