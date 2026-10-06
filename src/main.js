@@ -1081,8 +1081,8 @@ let updateSpeedVis = () => {};
   const bStMax  = f.addBinding(params, 'stepIntervalMax', { label: 'step max (s)', min: 0.5,  max: 8.0, step: 0.1 });
   const bSm     = f.addBinding(params, 'speedSmoothing',  { label: 'smoothing',    min: 0,    max: 0.99, step: 0.01 });
 
-  const pSF = padPair(f, params, bSlow, bFast, 'slowSpeed', 'fastSpeed', [0.1, 1.0, 0.05], [0.5, 2.0, 0.05], 'slow / fast', 'slow', 'fast');
-  const pSt = padPair(f, params, bStMin, bStMax, 'stepIntervalMin', 'stepIntervalMax', [0.5, 5.0, 0.1], [0.5, 8.0, 0.1], 'step hold', 'min s', 'max s');
+  const pSF = padPair(f, params, bSlow, bFast, 'slowSpeed', 'fastSpeed', [0.1, 1.0, 0.05], [0.5, 2.0, 0.05], 'slow / fast', 'slow', 'fast', true);
+  const pSt = padPair(f, params, bStMin, bStMax, 'stepIntervalMin', 'stepIntervalMax', [0.5, 5.0, 0.1], [0.5, 8.0, 0.1], 'step hold', 'min s', 'max s', true);
   updateSpeedVis = function () {
     const locked = !!params.lockNormalSpeed;
     const m = params.speedMode | 0;
@@ -1247,7 +1247,7 @@ let updateSpeedVis = () => {};
   const bFA = f.addBinding(params, 'slowAmp',        { label: 'amp',    min: 0,   max: 0.6,  step: 0.005 });
   // morphism knob — UV warp by the same field; tiny values go a long way
   const bFW = f.addBinding(params, 'warpAmp',        { label: 'warp',   min: 0,   max: 0.06, step: 0.001 });
-  padPair(f, params, bFS, bFV, 'slowNoiseScale', 'slowNoiseSpeed', [0.5, 12, 0.1], [0, 1, 0.005], 'field', 'scale', 'speed');
+  padPair(f, params, bFS, bFV, 'slowNoiseScale', 'slowNoiseSpeed', [0.5, 12, 0.1], [0, 1, 0.005], 'field', 'scale', 'speed', true);
   f.addBlade({ view: 'list', label: 'field', options: [{ text: 'value fbm (legacy)', value: 0 }, { text: 'simplex, vector warp', value: 1 }, { text: 'simplex, curl warp', value: 2 }], value: params.fieldMode | 0 }).on('change', (ev) => { params.fieldMode = ev.value | 0; });
 }
 
@@ -1314,7 +1314,7 @@ let updateSpeedVis = () => {};
   const tlPads = [
     padPair(f, params, bSync, bHold, 'syncDuration', 'holdDuration', [0.5, 6.0, 0.05], [0.2, 2.0, 0.05], 'sync / hold', 'sync s', 'hold s'),
     padPair(f, params, bCatch, bResy, 'catchUpDuration', 'resyncDuration', [0.2, 1.5, 0.05], [0, 1.0, 0.05], 'catch-up', 'catch s', 'resync s'),
-    padPair(f, params, bSyncJ, bHoldJ, 'syncJitter', 'holdJitter', [0, 1.0, 0.05], [0, 0.5, 0.02], 'jitter', 'sync', 'hold'),
+    padPair(f, params, bSyncJ, bHoldJ, 'syncJitter', 'holdJitter', [0, 1.0, 0.05], [0, 0.5, 0.02], 'jitter', 'sync', 'hold', true),
   ];
   f.addButton({ title: 'Trigger now', id: 'bTrigger' }).on('click', () => { twoLayer.triggerNow = true; });
 
@@ -1338,7 +1338,7 @@ let updateSpeedVis = () => {};
   f.addSubhead('paper');
   const bRo = f.addBinding(params, 'edgeRoughPx', { label: 'rough px', min: 0, max: 2, step: 0.05 });
   const bTe = f.addBinding(params, 'edgeTemporal', { label: 'temporal', min: 0, max: 0.5, step: 0.01 });
-  padPair(f, params, bHp, bHs, 'haloPx', 'haloStrength', [0, 4, 0.1], [0, 0.5, 0.01], 'halo', 'px', 'strength');
+  padPair(f, params, bHp, bHs, 'haloPx', 'haloStrength', [0, 4, 0.1], [0, 0.5, 0.01], 'halo', 'px', 'strength', true);
 }
 
 // --- Modulation ---
@@ -1373,7 +1373,7 @@ let updateSpeedVis = () => {};
   const bR1 = f.addBinding(modulation.audio, 'rmsToBoil',    { label: 'rms→boil',    min: 0, max: 0.40, step: 0.005 });
   const bS1 = f.addBinding(modulation.audio, 'snareToLFO',   { label: 'snare→lfo',   min: 0, max: 0.30, step: 0.005 });
   const bS2 = f.addBinding(modulation.audio, 'subToWarp',    { label: 'sub→warp',    min: 0, max: 0.06, step: 0.001 });
-  padPair(f, modulation.audio, bB1, bB2, 'bassToSlow', 'bassToFlash', [0, 1.0, 0.01], [0, 0.5, 0.01], 'bass', 'swell', 'flash');
+  padPair(f, modulation.audio, bB1, bB2, 'bassToSlow', 'bassToFlash', [0, 1.0, 0.01], [0, 0.5, 0.01], 'bass', 'swell', 'flash', true);
   f.addBinding(modulation.audio, 'kickToBoil',   { label: 'kick→drawing' });
 
   // ---- camera sub-section
