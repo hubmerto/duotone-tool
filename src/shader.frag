@@ -52,6 +52,7 @@ uniform int   u_colorMode;            // 0=spot color, 1=original video colors
 uniform int   u_colorModel;           // 0 legacy replace, 1 ink over paper, 2 duotone (two screens), 3 riso two-ink
 uniform vec3  u_inkB;                 // second ink (duotone / riso)
 uniform float u_inkOpacity;           // 1 = opaque ink (legacy look), 0 = pure multiply
+uniform int   u_alphaMode;            // 0 opaque, 1 key paper (keep ink), 2 key ink (keep paper)
 uniform float u_misregPx;             // riso: rigid per-ink shift per drawing, px
 uniform float u_lpi, u_printHeightIn, u_screenAngle;
 
@@ -493,10 +494,12 @@ void main() {
 
     vec3 ink = (u_colorMode == 1) ? comp : u_spotColor;
     vec3 rgb;
+    float cov = mask;                                  // ink coverage, drives the alpha key
     if (u_colorModel == 0) {
         rgb = mix(ink, u_shadowColor, 1.0 - mask);
     } else if (u_colorModel == 1) {
         rgb = inkOverPaper(mask, density, ink);
+        cov = mask * mix(density, 1.0, u_inkOpacity);
     } else if (u_colorModel == 2) {
         // true duotone: two continuous curves, each screened on its own angle (spot 75°, black 45°)
         float cell = halftoneCellPx();
@@ -510,6 +513,7 @@ void main() {
         float mK = clamp(0.5 + (cK - sK) / gK, 0.0, 1.0);
         vec3 c = lin(u_shadowColor) * mix(vec3(1.0), lin(ink), mS) * mix(vec3(1.0), lin(u_inkB), mK);
         rgb = enc(c);
+        cov = 1.0 - (1.0 - mS) * (1.0 - mK);
     } else {
         // riso: two semi-translucent inks, each pass misregistered per drawing, multiplied over the paper
         float dr = drawingIndex(u_time);
@@ -523,7 +527,12 @@ void main() {
         vec3 mult = paper * mix(vec3(1.0), t1, m1 * density) * mix(vec3(1.0), t2, m2 * 0.85);
         vec3 opaque = mix(mix(paper, lin(u_inkB), m2 * 0.85), lin(ink), m1);
         rgb = enc(mix(mult, opaque, u_inkOpacity));
+        cov = 1.0 - (1.0 - m1 * mix(density, 1.0, u_inkOpacity)) * (1.0 - m2 * 0.85);
     }
     rgb += lamp;
-    fragColor = vec4(rgb, 1.0);
+    // alpha key: straight alpha (context is premultipliedAlpha:false); un-mix the keyed colour out of edge pixels
+    float a = 1.0;
+    if (u_alphaMode == 1) { a = cov;       rgb = clamp((rgb - u_shadowColor * (1.0 - a)) / max(a, 1e-3), 0.0, 1.0); }
+    else if (u_alphaMode == 2) { a = 1.0 - cov; rgb = clamp((rgb - ink * (1.0 - a)) / max(a, 1e-3), 0.0, 1.0); }
+    fragColor = vec4(rgb, a);
 }
