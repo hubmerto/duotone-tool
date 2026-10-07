@@ -60,6 +60,8 @@ const params = {
   colorModel: 0,          // 0 replace, 1 ink over paper, 2 duotone, 3 riso
   alphaMode: 0,           // 0 opaque, 1 key paper (keep ink), 2 key ink (keep paper)
   inkB: '#1a1a1a', inkOpacity: 1, misregPx: 0,
+  // depth (Depth Anything on the picture): the threshold becomes a field over the scene
+  depthOn: false, depthAmt: 0.35, depthMid: 0.5, depthInvert: false, depthView: false, depthSize: 378,
   ...PRESETS[DEFAULT_PRESET],
 };
 // Format is the single primary control; engine is derived from it.
@@ -337,6 +339,17 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
 gl.activeTexture(gl.TEXTURE0);  // for static images: write to all layers once
 
+// depth map (unit 4): R8 linear, one map for the current picture; see computeDepth()
+const depthTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE4);
+gl.bindTexture(gl.TEXTURE_2D, depthTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([128]));
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.activeTexture(gl.TEXTURE0);
+
 // rVFC fires once per real video frame (vs rAF which fires per display frame).
 // Using rVFC means the offset slider counts in *video* frames, which is what
 // the user thinks about. Older Firefox (<113) lacks it — fall back to rAF.
@@ -378,6 +391,7 @@ for (const name of [
   'u_bufferSize','u_bufferWriteIndex','u_fit',
   'u_twoLayerEnabled','u_layerBlendMode','u_layerBlendBalance',
   'u_isCatchupActive','u_trailSampleCount','u_trailStyle',
+  'u_depth','u_depthOn','u_depthAmt','u_depthMid','u_depthView',
 ]) U[name] = gl.getUniformLocation(program, name);
 
 // -----------------------------------------------------------------------------
@@ -463,6 +477,7 @@ function _loadBothVideos(srcURL, isBlob) {
   currentSource     = 'video';
   videoADirty       = true;
   videoBDirty       = true;
+  clearDepth();
   restartEffect();
   bufferWriteIndex  = 0;
   imageBufferFilled = false;
@@ -495,6 +510,12 @@ async function loadImageFromFile(file) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageEl);
   texStateA.w = imageEl.naturalWidth;
   texStateA.h = imageEl.naturalHeight;
+  // layer B too: Two Layer multiplies A with B, and a still has no second playhead to fill it
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, textureB);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imageEl);
+  texStateB.w = imageEl.naturalWidth; texStateB.h = imageEl.naturalHeight;
+  gl.activeTexture(gl.TEXTURE0);
 
   // pause & detach video so we don't keep blitting black frames over the image
   video.pause();
@@ -505,8 +526,64 @@ async function loadImageFromFile(file) {
   currentSource = 'image';
   clock.setMedia(null);
   imageBufferFilled = false;          // re-fill ring buffer on next tick
+  clearDepth();
   restartEffect();
   resize();
+  if (params.depthOn) computeDepth();
+}
+
+// -----------------------------------------------------------------------------
+// Depth: Depth Anything V2 small in a module worker (the Cuntfetti path). One map for the current
+// picture: stills compute on load, a video frame on demand. Normalised 0 far .. 1 near, R8 on unit 4.
+// -----------------------------------------------------------------------------
+const DEPTH_MODEL = 'onnx-community/depth-anything-v2-small';
+const depth = { worker: null, workerReady: false, inflight: false, pending: false, ready: false, id: 0, w: 0, h: 0, raw: null, u8: null, ms: 0, status: '', device: '' };
+let depthStatusEl = null;
+function depthStatus(s) { depth.status = s; if (depthStatusEl) depthStatusEl.set(s); }
+function clearDepth() { depth.ready = false; depth.raw = null; depth.u8 = null; depth.pending = false; if (params.depthOn) depthStatus(''); }
+function initDepthWorker() { if (!depth.worker) startDepthWorker(('gpu' in navigator) ? 'webgpu' : 'wasm'); }
+function startDepthWorker(device) {
+  if (depth.worker) { depth.worker.terminate(); depth.worker = null; }
+  depth.device = device; depth.workerReady = false; depth.inflight = false;
+  const w = depth.worker = new Worker('/depth-worker.js', { type: 'module' });
+  depthStatus('loading ' + DEPTH_MODEL.split('/')[1] + ' (' + device + ')…');
+  w.onmessage = (e) => {
+    const m = e.data; if (w !== depth.worker) return;
+    if (m.type === 'progress') depthStatus('downloading ' + (m.file || '') + ' ' + Math.round(m.p || 0) + '%');
+    else if (m.type === 'ready') { depth.workerReady = true; depthStatus('ready · ' + m.device); if (depth.pending) { depth.pending = false; computeDepth(true); } }
+    else if (m.type === 'error') { depth.inflight = false; if (m.fatal && device === 'webgpu') startDepthWorker('wasm'); else depthStatus('depth: ' + m.msg); }
+    else if (m.type === 'depth') { depth.inflight = false; depth.ms = m.ms; setDepthFromModel(m.data, m.w, m.h); depthStatus(m.w + '×' + m.h + ' · ' + Math.round(m.ms) + ' ms · ' + device); }
+  };
+  w.onerror = (e) => { depth.inflight = false; depthStatus('depth worker: ' + (e && e.message || 'failed')); };
+  w.postMessage({ type: 'init', model: DEPTH_MODEL, device, dtype: device === 'webgpu' ? 'fp16' : 'q8', size: params.depthSize | 0 });
+}
+// the model gives affine-invariant inverse depth: min-max normalise per map (near = 1), optionally inverted
+function setDepthFromModel(data, w, h) {
+  depth.raw = data; depth.w = w; depth.h = h;
+  let mn = Infinity, mx = -Infinity; for (let i = 0; i < data.length; i++) { const v = data[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const rng = Math.max(1e-6, mx - mn); const u8 = new Uint8Array(w * h); const inv = !!params.depthInvert;
+  for (let i = 0; i < data.length; i++) { const n = (data[i] - mn) / rng; u8[i] = Math.round((inv ? 1 - n : n) * 255); }
+  setDepthMap(u8, w, h);
+}
+// upload a 0..255 map (row 0 = top of the picture); exposed for tests and for maps baked elsewhere
+function setDepthMap(u8, w, h) {
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, depthTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4); gl.activeTexture(gl.TEXTURE0);
+  depth.u8 = u8; depth.w = w; depth.h = h; depth.ready = true;
+}
+async function computeDepth(force) {
+  if (!params.depthOn && !force) return false;
+  if (!depth.worker) initDepthWorker();
+  if (!depth.workerReady || depth.inflight) { depth.pending = true; return false; }
+  const el = currentSource === 'image' ? imageEl : video;
+  if (currentSource === 'image' ? !imageEl.naturalWidth : video.readyState < 2) { depthStatus('no picture yet'); return false; }
+  depth.inflight = true; depthStatus('computing…');
+  const w = params.depthSize | 0, h = Math.max(8, Math.round(w / srcAspect()));
+  try { const bmp = await createImageBitmap(el, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' }); depth.worker.postMessage({ type: 'frame', id: ++depth.id, bitmap: bmp }, [bmp]); }
+  catch (e) { depth.inflight = false; depthStatus('depth: ' + (e && e.message || e)); return false; }
+  return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -778,6 +855,11 @@ function renderOnce(tOv, dtOv) {
   // research modes
   gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, blueTex); gl.activeTexture(gl.TEXTURE0);
   gl.uniform1i(U.u_blueNoise, 3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, depthTex); gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1i(U.u_depth, 4);
+  gl.uniform1i(U.u_depthOn, (params.depthOn && depth.ready) ? 1 : 0);
+  gl.uniform1f(U.u_depthAmt, lp.depthAmt ?? 0); gl.uniform1f(U.u_depthMid, lp.depthMid ?? 0.5);
+  gl.uniform1i(U.u_depthView, (params.depthView && params.depthOn && depth.ready) ? 1 : 0);
   gl.uniform1i(U.u_lumaMode,   params.lumaMode | 0);
   gl.uniform1i(U.u_ditherMode, params.ditherMode | 0);
   // boil hold: N frames per drawing on a 24 fps clock; ditherSpeed 1 = on 2s, 0.67 = on 3s, 0 = frozen
@@ -1101,7 +1183,7 @@ let updateColorVis = () => {};
 let updateColorVis0 = () => {};
 
 // --- Looks: built-in recipes as swatch tiles plus user presets saved with a thumbnail ---
-const LOOK_EXCLUDE = ['source.loop', 'modulation.', 'modAudio.', 'modCamera.'];
+const LOOK_EXCLUDE = ['source.loop', 'modulation.', 'modAudio.', 'modCamera.', 'params.depthView', 'params.depthSize'];
 {
   const f = pane.addFolder({ title: 'Looks', expanded: true });
   const grid = f.addPresets(Object.keys(PRESETS).filter((k) => k !== 'default'), { cols: 3, thumbs: true, aspect: '16/9', thumbWidth: 192, thumbHeight: 108 });
@@ -1242,6 +1324,20 @@ let updateSpeedVis = () => {};
       return [sm((L - (T - w)) / (2 * w)), sm((L - (T + P.thresholdLFOAmp - w)) / (2 * w))]; } });
   f.body.insertBefore(cutCurve.element, f.body.firstChild);
   f.addBinding(params, 'lumaMode', { label: 'luma', options: [{ text: "Y' (legacy)", value: 0 }, { text: 'L* perceptual', value: 1 }] }).on('change', () => {  });
+}
+
+// --- Depth ---
+{
+  const f = pane.addFolder({ title: 'Depth', expanded: false, cols: 2 });
+  f.addBinding(params, 'depthOn', { label: 'depth' }).on('change', (ev) => { if (ev.value) computeDepth(); });
+  f.addBinding(params, 'depthAmt', { label: 'threshold by depth', min: -1, max: 1, step: 0.01 });
+  f.addBinding(params, 'depthMid', { label: 'pivot', min: 0, max: 1, step: 0.01 });
+  f.addBinding(params, 'depthInvert', { label: 'invert' }).on('change', () => { if (depth.raw) setDepthFromModel(depth.raw, depth.w, depth.h); });
+  f.addBinding(params, 'depthView', { label: 'show depth' });
+  f.addBinding(params, 'depthSize', { label: 'quality', options: [{ text: '252 fast', value: 252 }, { text: '378', value: 378 }, { text: '518 sharp', value: 518 }] })
+    .on('change', (ev) => { if (depth.worker) depth.worker.postMessage({ type: 'size', size: ev.value | 0 }); if (params.depthOn) computeDepth(); });
+  f.addButton({ title: 'Compute for this frame', id: 'bDepth' }).on('click', () => computeDepth(true));
+  depthStatusEl = f.addStatus('');
 }
 
 // --- Intro ---
@@ -1733,8 +1829,12 @@ pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.
 pane.addRandomise();
 pane.addHistory();
 if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const CHANGELOG = [
+  { version: '1.2.0', date: '2026-10-07', notes: [
+    'Depth folder: Depth Anything on the picture turns the threshold into a field. Near ink or far ink by the sign of the amount, a pivot, invert, a depth view. Stills compute on load; a video frame on demand.',
+    'Footer rows regrouped; filler text and the drop hint box removed.',
+  ] },
   { version: '1.1.0', date: '2026-10-07', notes: [
     'Frames are the truth: the clock always sits on a whole frame, so seeking to a frame and playing into it evaluate keys and modulation identically.',
     'Graph editor in the keys strip (alt+G): the lane as a curve with draggable keys and bezier handles, plus a speed view.',
@@ -1866,6 +1966,7 @@ if (typeof window !== 'undefined') {
     params, sourceState, modulation, exportSettings, monitor,
     pane, mediaPicker, audioPicker, presetPicker, project,
     clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, pins, sig, resetLooks, appApi,
+    depth: { state: depth, compute: computeDepth, setMap: setDepthMap, init: initDepthWorker },
     PRESETS,
     loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
     setPreset(name) {

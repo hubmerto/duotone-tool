@@ -63,6 +63,13 @@ uniform float u_thresholdBase;
 uniform float u_thresholdLFOAmp;
 uniform float u_thresholdLFOFreq;
 
+// ----- depth (Depth Anything map of the picture, 0 far .. 1 near) ---------------
+uniform sampler2D u_depth;
+uniform int   u_depthOn;
+uniform float u_depthAmt;             // threshold swing between far and near (positive: near ink, far paper)
+uniform float u_depthMid;             // the depth that leaves the threshold untouched
+uniform int   u_depthView;            // 1: show the depth map instead of the picture
+
 // ----- intro (4 modes) ----------------------------------------------------------
 uniform int   u_introMode;            // 0=develop, 1=radiance, 2=aperture, 3=scanline
 uniform int   u_introModel;           // 0 legacy, 1 physical (develop curve, round iris in px, scanner lamp)
@@ -474,6 +481,11 @@ void main() {
     float tq = (u_boilHold > 0) ? floor(u_time * 24.0 / float(u_boilHold)) * float(u_boilHold) / 24.0 : u_time;
     float lfo = u_thresholdLFOAmp * sin(TAU * u_thresholdLFOFreq * tq);
     float Tslow = u_thresholdBase + lfo + slowField * u_slowAmp;
+    if (u_depthOn == 1) {                                   // threshold as a field: the cut follows the scene's depth
+        float depthV = texture(u_depth, warpedUV).r;
+        if (u_depthView == 1) { fragColor = vec4(vec3(depthV), 1.0); return; }
+        Tslow -= (depthV - u_depthMid) * u_depthAmt;      // ink lives above the threshold, so near lowers it
+    }
     float Tfull;
     if (u_ditherMode == 0 && u_boilHold == 0) {
         float ditherTime = float(u_frame) * PHI * u_ditherSpeed;
