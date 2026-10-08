@@ -135,14 +135,16 @@ const clock = new window.LabUI.Clock({ fps: 30, length: 10 });
 const head = { sim: false, A: 0, B: 0, rateA: 1, rateB: 1 };
 const offline = { job: null };
 const fitPreview = { aspect: null, mode: 'cover' };   // a placement previewed live: canvas ratio + fit
-function posOf(side) { return head.sim ? head[side] : (side === 'A' ? video : videoB).currentTime; }
-function setPos(side, t) { if (head.sim) head[side] = t; else (side === 'A' ? video : videoB).currentTime = t; }
-function setRate(side, r) { if (head.sim) head['rate' + side] = Math.max(0, Math.min(16, r)); else _setRate(side === 'A' ? video : videoB, r); }
+const headed = () => head.sim || currentSource === 'gif';   // simulated playheads: offline runs, and animated images live
+function posOf(side) { return headed() ? head[side] : (side === 'A' ? video : videoB).currentTime; }
+function setPos(side, t) { if (headed()) head[side] = t; else (side === 'A' ? video : videoB).currentTime = t; }
+function setRate(side, r) { if (headed()) head['rate' + side] = Math.max(0, Math.min(16, r)); else _setRate(side === 'A' ? video : videoB, r); }
+function srcDuration() { return currentSource === 'gif' ? gif.duration : (isFinite(video.duration) ? video.duration : 0); }
 function restartEffect() { clock.seek(0); frameCount = 0; }
 // Modulation goes through the kit's matrix: sources are the analyser signals (live) or baked tracks (offline),
 // routes add to the params at draw time. The old fixed table lives on as the default routes.
 /* the modulation matrix is created with the pane below */
-function srcAspect() { return currentSource === 'image' && imageEl.naturalWidth ? imageEl.naturalWidth / imageEl.naturalHeight : (video.videoWidth > 0 ? video.videoWidth / video.videoHeight : 16 / 9); }
+function srcAspect() { return currentSource === 'image' && imageEl.naturalWidth ? imageEl.naturalWidth / imageEl.naturalHeight : currentSource === 'gif' && gif.h ? gif.w / gif.h : (video.videoWidth > 0 ? video.videoWidth / video.videoHeight : 16 / 9); }
 
 // -----------------------------------------------------------------------------
 // DOM
@@ -404,6 +406,8 @@ function resize() {
   if (currentSource === 'image' && imageEl.naturalWidth > 0) {
     vw = imageEl.naturalWidth;
     vh = imageEl.naturalHeight;
+  } else if (currentSource === 'gif' && gif.w > 0) {
+    vw = gif.w; vh = gif.h;
   } else if (video.videoWidth > 0) {
     vw = video.videoWidth;
     vh = video.videoHeight;
@@ -465,6 +469,7 @@ function _loadBothVideos(srcURL, isBlob) {
   }
   if (imageEl.src && imageEl.src.startsWith('blob:')) URL.revokeObjectURL(imageEl.src);
   imageEl.removeAttribute('src');
+  clearGif();
 
   video.src  = srcURL;
   videoB.src = srcURL;
@@ -523,6 +528,7 @@ async function loadImageFromFile(file) {
   video.removeAttribute('src');
   video.load();
 
+  clearGif();
   currentSource = 'image';
   clock.setMedia(null);
   imageBufferFilled = false;          // re-fill ring buffer on next tick
@@ -531,6 +537,59 @@ async function loadImageFromFile(file) {
   resize();
   if (params.depthOn) computeDepth();
 }
+
+// -----------------------------------------------------------------------------
+// Animated images (GIF, animated WebP, APNG): every frame decoded once through ImageDecoder, then played on the
+// same simulated playheads the offline renderer uses, so Two Layer, speed staging and exports work unchanged.
+// Browsers without ImageDecoder get the first frame as a still.
+// -----------------------------------------------------------------------------
+const gif = { frames: [], duration: 0, w: 0, h: 0, lastA: -1, lastB: -1, name: '' };
+const ANIMATED_TYPES = /^image\/(gif|webp|apng)$/;
+function clearGif() { gif.frames.forEach((f) => { try { f.bmp.close(); } catch (_) {} }); gif.frames = []; gif.duration = 0; gif.w = gif.h = 0; gif.lastA = gif.lastB = -1; gif.name = ''; }
+function gifFrameIndex(t) {
+  const n = gif.frames.length; if (!n) return -1; const d = gif.duration || 1;
+  const x = sourceState.loop ? ((t % d) + d) % d : Math.min(Math.max(0, t), d - 1e-6);
+  let lo = 0, hi = n - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (gif.frames[mid].t <= x) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+async function decodeAnimatedImage(file) {
+  if (typeof ImageDecoder === 'undefined') return null;
+  const type = file.type || 'image/gif';
+  if (!(await ImageDecoder.isTypeSupported(type))) return null;
+  const dec = new ImageDecoder({ data: await file.arrayBuffer(), type });
+  try {
+    await dec.tracks.ready; const track = dec.tracks.selectedTrack; if (!track) return null;
+    await dec.completed; const n = track.frameCount; if (n <= 1) return null;
+    const frames = []; let t = 0;
+    for (let i = 0; i < n; i++) {
+      const { image } = await dec.decode({ frameIndex: i });
+      let dur = (image.duration || 0) / 1e6; if (dur <= 0.011) dur = 0.1;   // GIF delays of 0 or 1 cs: browsers show them at 10 fps
+      const bmp = await createImageBitmap(image); image.close();
+      frames.push({ bmp, t, dur }); t += dur;
+    }
+    return { frames, duration: t, w: frames[0].bmp.width, h: frames[0].bmp.height };
+  } finally { try { dec.close(); } catch (_) {} }
+}
+async function loadGifFromFile(file) {
+  let dec = null; try { dec = await decodeAnimatedImage(file); } catch (e) { console.warn('animated image decode:', e); }
+  if (!dec) return loadImageFromFile(file);   // one frame, or no decoder here: a still
+  video.pause(); if (video.src && video.src.startsWith('blob:')) URL.revokeObjectURL(video.src); video.removeAttribute('src'); video.load();
+  videoB.pause(); videoB.removeAttribute('src'); videoB.load();
+  if (imageEl.src && imageEl.src.startsWith('blob:')) URL.revokeObjectURL(imageEl.src); imageEl.removeAttribute('src');
+  clearGif(); Object.assign(gif, dec); gif.name = file.name;
+  currentSource = 'gif';
+  texStateA.w = texStateA.h = 1; texStateB.w = texStateB.h = 1;
+  head.A = head.B = 0; head.rateA = head.rateB = 1;
+  clock.setMedia({ duration: gif.duration });
+  bufferWriteIndex = 0; imageBufferFilled = false;
+  Object.assign(twoLayer, { phase: 'sync', nextPhaseAt: clock.t * 1000 + 1500, holdSide: 'A', isCatchup: false, catchupHoldPosA: 0, catchupTargetPos: 0 });
+  clearDepth(); restartEffect(); resize();
+  if (project) project.updateSource({ w: gif.w, h: gif.h, duration: gif.duration });
+  if (params.depthOn) computeDepth();
+  return true;
+}
+// a picture file: animated kinds go through the decoder, the rest are stills
+function loadPictureFile(file) { return ANIMATED_TYPES.test(file.type) ? loadGifFromFile(file) : loadImageFromFile(file); }
 
 // -----------------------------------------------------------------------------
 // Depth: Depth Anything V2 small in a module worker (the Cuntfetti path). One map for the current
@@ -577,8 +636,8 @@ async function computeDepth(force) {
   if (!params.depthOn && !force) return false;
   if (!depth.worker) initDepthWorker();
   if (!depth.workerReady || depth.inflight) { depth.pending = true; return false; }
-  const el = currentSource === 'image' ? imageEl : video;
-  if (currentSource === 'image' ? !imageEl.naturalWidth : video.readyState < 2) { depthStatus('no picture yet'); return false; }
+  const el = currentSource === 'image' ? imageEl : currentSource === 'gif' ? (gif.frames[Math.max(0, gifFrameIndex(head.A))] || {}).bmp : video;
+  if (currentSource === 'image' ? !imageEl.naturalWidth : currentSource === 'gif' ? !el : video.readyState < 2) { depthStatus('no picture yet'); return false; }
   depth.inflight = true; depthStatus('computing…');
   const w = params.depthSize | 0, h = Math.max(8, Math.round(w / srcAspect()));
   try { const bmp = await createImageBitmap(el, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' }); depth.worker.postMessage({ type: 'frame', id: ++depth.id, bitmap: bmp }, [bmp]); }
@@ -718,6 +777,11 @@ function renderOnce(tOv, dtOv) {
     // offline: decoded frames for the simulated playheads; the ring buffer takes every A frame
     if (offline.frameA) { uploadVideoFrame(gl.TEXTURE0, texture, texStateA, offline.frameA); if (offline.first) { fillRing(offline.frameA); offline.first = false; } else onVideoFrameWrite(offline.frameA); }
     if (offline.frameB && params.twoLayerEnabled) uploadVideoFrame(gl.TEXTURE2, textureB, texStateB, offline.frameB);
+  } else if (currentSource === 'gif' && gif.frames.length) {
+    // animated image live: the frame under each simulated playhead; A's frames feed the ring like a video's
+    const ia = gifFrameIndex(head.A);
+    if (ia !== gif.lastA) { const f = gif.frames[ia]; uploadVideoFrame(gl.TEXTURE0, texture, texStateA, f.bmp); if (gif.lastA < 0) fillRing(f.bmp); else onVideoFrameWrite(f.bmp); gif.lastA = ia; }
+    if (params.twoLayerEnabled) { const ib = gifFrameIndex(head.B); if (ib !== gif.lastB) { uploadVideoFrame(gl.TEXTURE2, textureB, texStateB, gif.frames[ib].bmp); gif.lastB = ib; } }
   } else if (currentSource === 'video'
       && (videoADirty || !HAS_RVFC)
       && video.readyState >= video.HAVE_CURRENT_DATA
@@ -727,7 +791,7 @@ function renderOnce(tOv, dtOv) {
   }
 
   // ensure backing-store size matches latest source dims
-  const srcW = currentSource === 'image' ? (imageEl.naturalWidth || 0) : (video.videoWidth || 0);
+  const srcW = currentSource === 'image' ? (imageEl.naturalWidth || 0) : currentSource === 'gif' ? gif.w : (video.videoWidth || 0);
   if (srcW > 0 && (canvas.width === 1 || canvas.height === 1)) {
     resize();
   }
@@ -773,6 +837,10 @@ function renderOnce(tOv, dtOv) {
   liveDtMs = dt * 1000;
   if (!head.sim) tickModulators(liveDtMs);
   lastFrameMs = performance.now();
+  if (currentSource === 'gif' && !head.sim && clock.playing) {   // the playheads of an animated image run on the live clock
+    const d = gif.duration || 1; head.A += dt * head.rateA; head.B += dt * head.rateB;
+    if (sourceState.loop) { head.A = ((head.A % d) + d) % d; head.B = ((head.B % d) + d) % d; } else { head.A = Math.min(head.A, d); head.B = Math.min(head.B, d); }
+  }
 
   // ----- playback rate ---------------------------------------------------------
   if (params.lockNormalSpeed && currentSource === 'video') {
@@ -784,7 +852,7 @@ function renderOnce(tOv, dtOv) {
       if (params.twoLayerEnabled) {
         setRate('B', 1);
         // two <video> elements drift apart over minutes; snap B when it strays
-        if ((head.sim || videoB.duration > 0) && Math.abs(posOf('B') - posOf('A')) > 0.1) {
+        if ((headed() || videoB.duration > 0) && Math.abs(posOf('B') - posOf('A')) > 0.1) {
           setPos('B', posOf('A'));
         }
       }
@@ -949,7 +1017,7 @@ function renderOnce(tOv, dtOv) {
 // The buffer fills fastest during catch-up (when A's playbackRate is high),
 // which is exactly when the shader needs the recent-frame trail.
 function onVideoFrameWrite(srcEl) {
-  if (currentSource !== 'video') return;
+  if (currentSource !== 'video' && currentSource !== 'gif') return;
   if (!srcEl) { if (!(video.readyState >= 2 && video.videoWidth > 0)) return; srcEl = video; }
   if (!params.twoLayerEnabled) return;
 
@@ -1016,9 +1084,9 @@ function updateSpeed(t, dt) {
   _currentSpeed += (target - _currentSpeed) * k;
 
   // Two Layer owns playback rate when enabled — don't fight it.
-  if (currentSource === 'video' && (head.sim || video.duration > 0) && !params.twoLayerEnabled) {
+  if ((currentSource === 'video' || currentSource === 'gif') && (headed() || video.duration > 0) && !params.twoLayerEnabled) {
     const clamped = Math.max(0.1, Math.min(2.0, _currentSpeed));
-    if (head.sim) { head.rateA = clamped; head.rateB = clamped; }
+    if (headed()) { head.rateA = clamped; head.rateB = clamped; }
     else if (Math.abs(video.playbackRate - clamped) > 0.005) video.playbackRate = clamped;
   }
   return _currentSpeed;
@@ -1037,7 +1105,7 @@ function hash01(x) {
 // disabled (or source is image), it does nothing and updateSpeed() owns
 // playback rate as before.
 function twoLayerAdvance(nowMs) {
-  if (currentSource !== 'video' || !params.twoLayerEnabled) {
+  if ((currentSource !== 'video' && currentSource !== 'gif') || !params.twoLayerEnabled) {
     twoLayer.phase = 'sync';
     twoLayer.isCatchup = false;
     return;
@@ -1202,7 +1270,8 @@ let updateSpeedVis = () => {};
   // point ('song start'), intro replayed — a live preview of exactly what an
   // export will capture.
   f.addButton({ title: '↺ Start over (video + song)', id: 'bStartOver' }).on('click', () => {
-    if (currentSource === 'video') {
+    if (currentSource === 'gif') { head.A = head.B = 0; gif.lastA = gif.lastB = -1; }
+    if (currentSource === 'video' || currentSource === 'gif') {
       video.currentTime  = 0;
       videoB.currentTime = 0;
       if (sourceState.playing) { video.play().catch(() => {}); videoB.play().catch(() => {}); }
@@ -1623,6 +1692,7 @@ let updateSpeedVis = () => {};
         fps: exportSettings.fps,
         durationSeconds: exportSettings.durationSeconds,
       };
+      if (currentSource === 'gif' && gif.duration > 0) { opts.durationSeconds = gif.duration; head.A = head.B = 0; gif.lastA = gif.lastB = -1; twoLayer.phase = 'sync'; twoLayer.nextPhaseAt = clock.t * 1000 + 1500; twoLayer.isCatchup = false; restartEffect(); }
       if (currentSource === 'video' && isFinite(video.duration) && video.duration > 0) {
         opts.durationSeconds = video.duration;
         video.currentTime  = 0;
@@ -1729,7 +1799,7 @@ mediaPicker.addEventListener('change', () => {
     if (isProject) return;
     if (project) project.setSource({}, f);
     if (f.type.startsWith('video/'))      loadVideoFromFile(f);
-    else if (f.type.startsWith('image/')) loadImageFromFile(f);
+    else if (f.type.startsWith('image/')) loadPictureFile(f);
   });
 });
 audioPicker.addEventListener('change', async () => {
@@ -1788,7 +1858,7 @@ window.addEventListener('drop', (e) => {
     loadVideoFromFile(file);
   } else if (file.type.startsWith('image/')) {
     if (project) project.setSource({}, file);
-    loadImageFromFile(file);
+    loadPictureFile(file);
   } else if (file.type.startsWith('audio/')) {
     audioMod.loadFile(file).then(() => {
       audioMod.setVolume(modulation.audio.volume);
@@ -1828,9 +1898,12 @@ const IDENTITY = {
 pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.title]); });
 pane.addRandomise();
 pane.addHistory();
-if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
-const APP_VERSION = '1.2.0';
+if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : currentSource === 'gif' && gif.frames.length ? { el: gif.frames[Math.max(0, gif.lastA)].bmp, w: gif.w, h: gif.h } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
+const APP_VERSION = '1.3.0';
 const CHANGELOG = [
+  { version: '1.3.0', date: '2026-10-08', notes: [
+    'GIFs play. Animated GIF, WebP and APNG files load as sources with their own frame timing, loop, and run on both playheads, so Two Layer, speed staging and exports treat them like a clip.',
+  ] },
   { version: '1.2.0', date: '2026-10-07', notes: [
     'Depth folder: Depth Anything on the picture turns the threshold into a field. Near ink or far ink by the sign of the amount, a pivot, invert, a depth view. Stills compute on load; a video frame on demand.',
     'Footer rows regrouped; filler text and the drop hint box removed.',
@@ -1854,7 +1927,7 @@ const CHANGELOG = [
 ];
 const project = app ? new window.LabUI.Project(pane, { tool: 'boiler', app: 'Boiler Eggs', shell: app, lookExclude: LOOK_EXCLUDE, version: APP_VERSION, onNew: () => { clock.clearRange(); clock.setFps(window.LabUI.prefs ? window.LabUI.prefs.get('fps') : 30); restartEffect(); },
   source: {
-    restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadImageFromFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
+    restore: (d, f) => { if (d.kind === 'file' && f) { if (f.type.startsWith('image/')) loadPictureFile(f); else loadVideoFromFile(f); if (app.docRef) app.docRef.setTitle('Boiler Eggs – ' + f.name); } else if (d.kind === 'sample') loadVideoFromUrl('/samples/sample.mp4'); },
     label: (d) => (d.name || d.kind) + (d.w ? ` (${d.w}×${d.h}${d.duration ? ' · ' + d.duration.toFixed(1) + 's' : ''})` : ''),
   } }) : null;
 
@@ -1874,7 +1947,7 @@ const renderer_ = {
   async prepare(job) {
     await mod.ensureBaked({ force: modulation.mode === 'audio' });
     clock.pause(); clock.offline = true; offline.job = job; head.sim = true;
-    offline.saved = { phase: { ...twoLayer }, bufferWriteIndex, catchupStartWrite, speed: _currentSpeed, kick: lastKickEffectTime, A: video.currentTime, B: videoB.currentTime, t: clock.t, frame: frameCount };
+    offline.saved = { phase: { ...twoLayer }, bufferWriteIndex, catchupStartWrite, speed: _currentSpeed, kick: lastKickEffectTime, A: currentSource === 'gif' ? head.A : video.currentTime, B: currentSource === 'gif' ? head.B : videoB.currentTime, t: clock.t, frame: frameCount };
     head.A = head.B = job.in; head.rateA = head.rateB = 1;   // both axes start together at the in point
     Object.assign(twoLayer, { phase: 'sync', nextPhaseAt: job.in * 1000 + 1500, holdSide: 'A', isCatchup: false, catchupHoldPosA: 0, catchupTargetPos: 0, triggerNow: false });
     _currentSpeed = params.staticSpeed ?? 1.0; lastKickEffectTime = -1; bufferWriteIndex = 0; catchupStartWrite = 0; frameCount = 0;
@@ -1888,6 +1961,9 @@ const renderer_ = {
       const dur = job.src.duration, wrap = (x) => sourceState.loop ? ((x % dur) + dur) % dur : Math.min(x, dur - 1e-3);
       offline.frameA = await offline.cA.at(wrap(head.A));
       if (offline.cB) offline.frameB = await offline.cB.at(wrap(head.B));
+    } else if (currentSource === 'gif' && gif.frames.length) {
+      offline.frameA = gif.frames[gifFrameIndex(head.A)].bmp;
+      offline.frameB = params.twoLayerEnabled ? gif.frames[gifFrameIndex(head.B)].bmp : null;
     }
     clock.t = t;
     renderOnce(t, 1 / job.fps);
@@ -1897,6 +1973,7 @@ const renderer_ = {
     const s = offline.saved; offline.job = null; head.sim = false; offline.cA = offline.cB = null; offline.frameA = offline.frameB = null;
     Object.assign(twoLayer, s.phase); bufferWriteIndex = s.bufferWriteIndex; catchupStartWrite = s.catchupStartWrite; _currentSpeed = s.speed; lastKickEffectTime = s.kick; clock.t = s.t; frameCount = s.frame;
     texStateA.w = texStateA.h = 1; texStateB.w = texStateB.h = 1;
+    if (currentSource === 'gif') { head.A = s.A; head.B = s.B; head.rateA = head.rateB = 1; gif.lastA = gif.lastB = -1; }
     if (currentSource === 'video') { try { video.currentTime = s.A; videoB.currentTime = s.B; } catch (_) {} videoADirty = videoBDirty = true; if (sourceState.playing) { video.play().catch(() => {}); videoB.play().catch(() => {}); } }
     imageBufferFilled = false; clock.offline = false; resize();
   },
@@ -1968,7 +2045,7 @@ if (typeof window !== 'undefined') {
     clock, head, renderer: renderer_, renderUI, offline, timeline, mod, midi, palette, pins, sig, resetLooks, appApi,
     depth: { state: depth, compute: computeDepth, setMap: setDepthMap, init: initDepthWorker },
     PRESETS,
-    loadVideoFromFile, loadImageFromFile, loadVideoFromUrl,
+    loadVideoFromFile, loadImageFromFile, loadVideoFromUrl, loadGifFromFile, loadPictureFile, gif, head,
     setPreset(name) {
       if (!PRESETS[name]) return false;
       applyPreset(params, PRESETS[name]);
