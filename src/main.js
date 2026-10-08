@@ -61,7 +61,7 @@ const params = {
   alphaMode: 0,           // 0 opaque, 1 key paper (keep ink), 2 key ink (keep paper)
   inkB: '#1a1a1a', inkOpacity: 1, misregPx: 0,
   // depth (Depth Anything on the picture): the threshold becomes a field over the scene
-  depthOn: false, depthAmt: 0.35, depthMid: 0.5, depthInvert: false, depthView: false, depthSize: 378,
+  depthOn: false, depthAmt: 0.35, depthMid: 0.5, depthInvert: false, depthView: false, depthSize: 378, depthModel: 'da3',
   ...PRESETS[DEFAULT_PRESET],
 };
 // Format is the single primary control; engine is derived from it.
@@ -603,23 +603,37 @@ function loadPictureFile(file) { return ANIMATED_TYPES.test(file.type) ? loadGif
 // picture: stills compute on load, a video frame on demand. Normalised 0 far .. 1 near, R8 on unit 4.
 // -----------------------------------------------------------------------------
 const DEPTH_MODEL = 'onnx-community/depth-anything-v2-small';
-const depth = { worker: null, workerReady: false, inflight: false, pending: false, ready: false, id: 0, w: 0, h: 0, raw: null, u8: null, ms: 0, status: '', device: '' };
+const depth = { worker: null, workerReady: false, inflight: false, pending: false, ready: false, id: 0, w: 0, h: 0, raw: null, u8: null, ms: 0, status: '', device: '', model: 'da3' };   // model: 'da3' (ours, lab-depth.js) or 'v2' (hub, depth-worker.js)
 let depthStatusEl = null;
 function depthStatus(s) { depth.status = s; if (depthStatusEl) depthStatusEl.set(s); }
 function clearDepth() { depth.ready = false; depth.raw = null; depth.u8 = null; depth.pending = false; if (params.depthOn) depthStatus(''); }
-function initDepthWorker() { if (!depth.worker) startDepthWorker(('gpu' in navigator) ? 'webgpu' : 'wasm'); }
+function initDepthWorker() { if (!depth.worker) { depth.model = params.depthModel === 'v2' ? 'v2' : 'da3'; startDepthWorker(('gpu' in navigator) ? 'webgpu' : 'wasm'); } }
 function startDepthWorker(device) {
   if (depth.worker) { depth.worker.terminate(); depth.worker = null; }
   depth.device = device; depth.workerReady = false; depth.inflight = false;
-  const w = depth.worker = new Worker('/depth-worker.js', { type: 'module' });
-  depthStatus('loading ' + DEPTH_MODEL.split('/')[1] + ' (' + device + ')…');
-  w.onmessage = (e) => {
-    const m = e.data; if (w !== depth.worker) return;
+  const own = depth.model !== 'v2' && window.LabUI && window.LabUI.Depth && window.LabUI.Depth.supported();
+  let w = null;
+  const handle = (m) => {
+    if (w !== depth.worker) return;
     if (m.type === 'progress') depthStatus('downloading ' + (m.file || '') + ' ' + Math.round(m.p || 0) + '%');
-    else if (m.type === 'ready') { depth.workerReady = true; depthStatus('ready · ' + m.device); if (depth.pending) { depth.pending = false; computeDepth(true); } }
-    else if (m.type === 'error') { depth.inflight = false; if (m.fatal && device === 'webgpu') startDepthWorker('wasm'); else depthStatus('depth: ' + m.msg); }
-    else if (m.type === 'depth') { depth.inflight = false; depth.ms = m.ms; setDepthFromModel(m.data, m.w, m.h); depthStatus(m.w + '×' + m.h + ' · ' + Math.round(m.ms) + ' ms · ' + device); }
+    else if (m.type === 'ready') { depth.workerReady = true; depthStatus('ready · ' + (own ? 'DA3 small int8' : 'V2 small') + ' · ' + m.device); if (depth.pending) { depth.pending = false; computeDepth(true); } }
+    else if (m.type === 'error') {
+      depth.inflight = false;
+      if (m.fatal && own) { depth.model = 'v2'; startDepthWorker(device); }                 // our runtime failed here: the hub model still works
+      else if (m.fatal && device === 'webgpu') startDepthWorker('wasm');
+      else depthStatus('depth: ' + m.msg);
+    }
+    else if (m.type === 'depth') { depth.inflight = false; depth.ms = m.ms; setDepthFromModel(m.data, m.w, m.h); depthStatus(m.w + '×' + m.h + ' · ' + Math.round(m.ms) + ' ms · ' + (own ? 'DA3' : 'V2') + ' · ' + device); }
   };
+  if (own) {
+    // Depth Anything 3 small, our int8 weights, ONNX Runtime Web (lab-ui/lab-depth.js)
+    depthStatus('loading Depth Anything 3 small (' + device + ', int8)…');
+    const run = window.LabUI.Depth.start({ model: 'da3-small', device, size: params.depthSize | 0, onMessage: handle, onError: (e) => { depth.inflight = false; handle({ type: 'error', msg: (e && e.message) || 'worker failed', fatal: true }); } });
+    w = depth.worker = run.worker; return;
+  }
+  w = depth.worker = new Worker('/depth-worker.js', { type: 'module' });
+  depthStatus('loading ' + DEPTH_MODEL.split('/')[1] + ' (' + device + ')…');
+  w.onmessage = (e) => handle(e.data);
   w.onerror = (e) => { depth.inflight = false; depthStatus('depth worker: ' + (e && e.message || 'failed')); };
   w.postMessage({ type: 'init', model: DEPTH_MODEL, device, dtype: device === 'webgpu' ? 'fp16' : 'q8', size: params.depthSize | 0 });
 }
@@ -1258,7 +1272,7 @@ let updateColorVis = () => {};
 let updateColorVis0 = () => {};
 
 // --- Looks: built-in recipes as swatch tiles plus user presets saved with a thumbnail ---
-const LOOK_EXCLUDE = ['source.loop', 'modulation.', 'modAudio.', 'modCamera.', 'params.depthView', 'params.depthSize'];
+const LOOK_EXCLUDE = ['source.loop', 'modulation.', 'modAudio.', 'modCamera.', 'params.depthView', 'params.depthSize', 'params.depthModel'];
 {
   const f = pane.addFolder({ title: 'Looks', expanded: true });
   const grid = f.addPresets(Object.keys(PRESETS).filter((k) => k !== 'default'), { cols: 3, thumbs: true, aspect: '16/9', thumbWidth: 192, thumbHeight: 108 });
@@ -1410,6 +1424,8 @@ let updateSpeedVis = () => {};
   f.addBinding(params, 'depthMid', { label: 'pivot', min: 0, max: 1, step: 0.01 });
   f.addBinding(params, 'depthInvert', { label: 'invert' }).on('change', () => { if (depth.raw) setDepthFromModel(depth.raw, depth.w, depth.h); });
   f.addBinding(params, 'depthView', { label: 'show depth' });
+  f.addBinding(params, 'depthModel', { label: 'model', options: [{ text: 'Depth Anything 3 small · ours, int8', value: 'da3' }, { text: 'Depth Anything V2 small · hub', value: 'v2' }] })
+    .on('change', (ev) => { depth.model = ev.value === 'v2' ? 'v2' : 'da3'; if (depth.worker) { startDepthWorker(depth.device || (('gpu' in navigator) ? 'webgpu' : 'wasm')); if (params.depthOn) computeDepth(); } });
   f.addBinding(params, 'depthSize', { label: 'quality', options: [{ text: '252 fast', value: 252 }, { text: '378', value: 378 }, { text: '518 sharp', value: 518 }] })
     .on('change', (ev) => { if (depth.worker) depth.worker.postMessage({ type: 'size', size: ev.value | 0 }); if (params.depthOn) computeDepth(); });
   f.addButton({ title: 'Compute for this frame', id: 'bDepth' }).on('click', () => computeDepth(true));
@@ -1906,8 +1922,11 @@ pane.folders().forEach((f) => { if (IDENTITY[f.title]) f.setIdentity(IDENTITY[f.
 pane.addRandomise();
 pane.addHistory();
 if (app) app.viewer.attach(canvas, { pane, hPan: true, source: () => currentSource === 'image' && imageEl.naturalWidth ? { el: imageEl, w: imageEl.naturalWidth, h: imageEl.naturalHeight } : currentSource === 'gif' && gif.frames.length ? { el: gif.frames[Math.max(0, gif.lastA)].bmp, w: gif.w, h: gif.h } : video.videoWidth ? { el: video, w: video.videoWidth, h: video.videoHeight } : null, fit: () => 'contain', label: () => sourceState.preset || 'current' });
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const CHANGELOG = [
+  { version: '1.4.0', date: '2026-10-08', notes: [
+    'Depth Anything 3 small is the default depth model, served as our own int8 weights through ONNX Runtime Web: no model hub at runtime. V2 stays selectable under model.',
+  ] },
   { version: '1.3.0', date: '2026-10-08', notes: [
     'GIFs play. Animated GIF, WebP and APNG files load as sources with their own frame timing, loop, and run on both playheads, so Two Layer, speed staging and exports treat them like a clip.',
   ] },
