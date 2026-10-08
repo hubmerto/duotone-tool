@@ -286,10 +286,17 @@ const texStateB = { w: 1, h: 1 };
 let videoADirty = true;
 let videoBDirty = true;
 
+// ImageBitmap uploads ignore UNPACK_FLIP_Y_WEBGL in Chromium, so a decoded GIF frame goes through a 2D canvas
+// like the ring buffer does: that upload honours the flip and the picture sits upright like a video frame
+const blitCanvas = document.createElement('canvas'); const blitCtx = blitCanvas.getContext('2d');
 function uploadVideoFrame(unit, tex, state, vid) {
   gl.activeTexture(unit);
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  if (typeof ImageBitmap !== 'undefined' && vid instanceof ImageBitmap) {
+    if (blitCanvas.width !== vid.width || blitCanvas.height !== vid.height) { blitCanvas.width = vid.width; blitCanvas.height = vid.height; }
+    blitCtx.drawImage(vid, 0, 0); vid = blitCanvas;
+  }
   const vw = vid.videoWidth || vid.width, vh = vid.videoHeight || vid.height;
   if (state.w !== vw || state.h !== vh) {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vid);
